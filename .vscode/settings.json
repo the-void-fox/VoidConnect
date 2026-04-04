@@ -1,0 +1,14 @@
+{
+    "nixEnvSelector.suggestion": false,
+    "nixEnvSelector.nixFile": "${workspaceFolder}/shell.nix",
+    "cSpell.words": [
+        "Behaviour",
+        "Gossipsub",
+        "keypair",
+        "libp",
+        "mdns",
+        "nodelay",
+        "REUSEADDR",
+        "yamux"
+    ]
+}
