@@ -1,0 +1,19 @@
+[package]
+name = "void-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+void-core    = { path = "../crates/core" }
+void-discovery = { path = "../crates/discovery" }
+
+# Зависимости из workspace
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "void-discovery"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+void-core = { path = "../core" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+mdns-sd = "0.10"
