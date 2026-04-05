@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 void-core    = { path = "../crates/core" }
 void-discovery = { path = "../crates/discovery" }
+void-chat = { path = "../crates/chat" }
 
 # Зависимости из workspace
 tokio = { workspace = true }

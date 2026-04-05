@@ -10,6 +10,7 @@ members = [
     "crates/web",
     "crates/reputation",
     "app",
+    "ui"
 ]
 resolver = "2"
 
@@ -49,3 +50,8 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 base64 = "0.21"
 rand = "0.8"
+
+#egui
+eframe = { version = "0.27", features = ["default"] }
+egui = "0.27"
+egui_extras = { version = "0.27", features = ["image"] }

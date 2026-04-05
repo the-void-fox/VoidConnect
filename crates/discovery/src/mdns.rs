@@ -14,34 +14,18 @@ use tracing::{debug, error, info, warn};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, Service};
 
-/// Имя сервиса в mDNS. Все узлы Void Connect регистрируются под этим именем.
-/// Формат: _<protocol>._<transport>.local.
 const SERVICE_TYPE: &str = "_void-connect._tcp.local.";
-
-/// Версия протокола — чтобы разные версии не мешали друг другу
 const PROTOCOL_VERSION: &str = "1";
 
-/// Запускает mDNS: регистрирует текущий узел и начинает слушать сеть.
-///
-/// # Аргументы
-/// - `my_peer` — информация о текущем узле (наш ID, имя, порт)
-/// - `peer_list` — разделяемый список узлов, куда добавляем найденных
-///
-/// Функция запускает два асинхронных таска и возвращает управление.
-/// Таски живут до конца программы.
 pub async fn start_mdns(
     my_peer: PeerInfo,
     peer_list: PeerList,
 ) -> Result<(), DiscoveryError> {
-    // ServiceDaemon — основной объект mdns-sd.
-    // Он работает в фоновом потоке и управляет mDNS multicast.
     let mdns = ServiceDaemon::new()
         .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
 
-    // Регистрируем себя в сети
     register_self(&mdns, &my_peer)?;
 
-    // Запускаем прослушивание в отдельном таске Tokio
     let peer_list_clone = peer_list.clone();
     let mdns_clone = mdns.clone();
     tokio::spawn(async move {
@@ -50,11 +34,8 @@ pub async fn start_mdns(
         }
     });
 
-    // Периодически чистим "мёртвые" узлы
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(30)
-        );
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             peer_list.prune_stale().await;
@@ -62,45 +43,27 @@ pub async fn start_mdns(
         }
     });
 
-    info!(
-        "mDNS started. Node: {} ({}:{})",
-        my_peer.name, my_peer.ip, my_peer.port
-    );
-
+    info!("mDNS started. Node: {} ({}:{})", my_peer.name, my_peer.ip, my_peer.port);
     Ok(())
 }
 
-/// Регистрирует текущий узел в mDNS, чтобы другие его нашли.
-fn register_self(
-    mdns: &ServiceDaemon,
-    peer: &PeerInfo,
-) -> Result<(), DiscoveryError> {
-    // TXT-записи — метаданные сервиса.
-    // Другие узлы прочитают их при обнаружении.
+fn register_self(mdns: &ServiceDaemon, peer: &PeerInfo) -> Result<(), DiscoveryError> {
     let mut properties = HashMap::new();
     properties.insert("id".to_string(), peer.id.as_str().to_string());
     properties.insert("name".to_string(), peer.name.clone());
     properties.insert("version".to_string(), PROTOCOL_VERSION.to_string());
+    // Передаём chat_port явно — получатель не должен угадывать его сам
+    properties.insert("chat_port".to_string(), peer.chat_port.to_string());
 
-    // Список сервисов — через запятую
-    let services_str: Vec<&str> = peer
-        .services
-        .iter()
-        .map(|s| match s {
-            Service::Chat => "chat",
-            Service::Storage => "storage",
-            Service::Web => "web",
-            Service::Bootstrap => "bootstrap",
-        })
-        .collect();
+    let services_str: Vec<&str> = peer.services.iter().map(|s| match s {
+        Service::Chat      => "chat",
+        Service::Storage   => "storage",
+        Service::Web       => "web",
+        Service::Bootstrap => "bootstrap",
+    }).collect();
     properties.insert("services".to_string(), services_str.join(","));
 
-    // Имя инстанса должно быть уникальным в сети.
-    // Используем первые 8 символов ID — коллизия маловероятна.
-    let instance_name = format!(
-        "void-{}", 
-        &peer.id.as_str()[..peer.id.as_str().len().min(8)]
-    );
+    let instance_name = format!("void-{}", &peer.id.as_str()[..peer.id.as_str().len().min(8)]);
 
     let ip_str = peer.ip.to_string();
     let ip_list: Vec<&str> = vec![&ip_str];
@@ -112,35 +75,22 @@ fn register_self(
         ip_list.as_slice(),
         peer.port,
         Some(properties),
-    )
-    .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
+    ).map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
 
     mdns.register(service_info)
         .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
 
-    info!("Registered in mDNS as '{}'", instance_name);
+    info!("Registered in mDNS as '{}' (chat_port={})", instance_name, peer.chat_port);
     Ok(())
 }
 
-/// Слушает mDNS-события и обновляет peer list.
-///
-/// События бывают трёх типов:
-/// - `ServiceResolved` — нашли новый узел
-/// - `ServiceRemoved` — узел ушёл из сети
-/// - остальные — служебные, игнорируем
-async fn listen_for_peers(
-    mdns: ServiceDaemon,
-    peer_list: PeerList,
-) -> Result<(), DiscoveryError> {
-    // Подписываемся на события для нашего типа сервиса
+async fn listen_for_peers(mdns: ServiceDaemon, peer_list: PeerList) -> Result<(), DiscoveryError> {
     let receiver = mdns
         .browse(SERVICE_TYPE)
         .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
 
     info!("Listening for peers via mDNS...");
 
-    // mdns-sd использует std::sync::mpsc, поэтому блокирующий recv
-    // запускаем в spawn_blocking, чтобы не блокировать async runtime
     loop {
         let event = tokio::task::spawn_blocking({
             let receiver = receiver.clone();
@@ -156,20 +106,15 @@ async fn listen_for_peers(
             Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                 handle_removed(&peer_list, &fullname).await;
             }
-            Ok(_) => {
-                // SearchStarted, SearchStopped — не интересны
-            }
+            Ok(_) => {}
             Err(e) => {
                 warn!("mDNS receive error: {:?}", e);
-                // Не прерываем цикл — временные ошибки случаются
             }
         }
     }
 }
 
-/// Обрабатываем найденный узел: парсим TXT-записи и добавляем в peer list.
 async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo) {
-    // Получаем IP-адреса из записи
     let addresses: Vec<IpAddr> = info.get_addresses().iter().cloned().collect();
     let ip = match addresses.first() {
         Some(ip) => *ip,
@@ -179,7 +124,6 @@ async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo) {
         }
     };
 
-    // Читаем TXT-свойства
     let props = info.get_properties();
 
     let id_str = match props.get("id") {
@@ -190,11 +134,7 @@ async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo) {
         }
     };
 
-    // Проверяем версию протокола
-    let version = props
-        .get("version")
-        .map(|v| v.val_str().to_string())
-        .unwrap_or_default();
+    let version = props.get("version").map(|v| v.val_str().to_string()).unwrap_or_default();
     if version != PROTOCOL_VERSION {
         warn!(
             "Peer '{}' uses protocol v{}, we need v{}. Skipping.",
@@ -203,33 +143,35 @@ async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo) {
         return;
     }
 
-    let name = props
-        .get("name")
+    let name = props.get("name")
         .map(|v| v.val_str().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let services = parse_services(
-        props.get("services").map(|v| v.val_str()).unwrap_or("")
-    );
+    // Читаем chat_port из TXT; если нет — fallback: основной порт + 2
+    let chat_port = props.get("chat_port")
+        .and_then(|v| v.val_str().parse::<u16>().ok())
+        .unwrap_or_else(|| info.get_port() + 2);
+
+    let services = parse_services(props.get("services").map(|v| v.val_str()).unwrap_or(""));
 
     let peer = PeerInfo {
         id: NodeId(id_str.clone()),
         name: name.clone(),
         ip,
         port: info.get_port(),
+        chat_port,
         services,
         last_seen: chrono::Utc::now().timestamp(),
     };
 
-    info!("Discovered peer: {} ({}) at {}", name, &id_str[..8.min(id_str.len())], ip);
+    info!(
+        "Discovered peer: {} ({}) at {} chat_port={}",
+        name, &id_str[..8.min(id_str.len())], ip, chat_port
+    );
     peer_list.upsert(peer).await;
 }
 
-/// Обрабатываем уход узла из сети.
-/// fullname имеет формат "void-abc12345._void-connect._tcp.local."
 async fn handle_removed(peer_list: &PeerList, fullname: &str) {
-    // Ищем узел по полному имени — сравниваем с адресами в peer list
-    // Проще всего найти через полный список и сравнить по имени
     let peers = peer_list.all().await;
     for peer in peers {
         let instance = format!(
@@ -245,19 +187,13 @@ async fn handle_removed(peer_list: &PeerList, fullname: &str) {
     debug!("Received remove for unknown peer: {}", fullname);
 }
 
-/// Разбираем строку сервисов "chat,storage,web" в Vec<Service>
 fn parse_services(s: &str) -> Vec<Service> {
-    s.split(',')
-        .filter_map(|part| match part.trim() {
-            "chat" => Some(Service::Chat),
-            "storage" => Some(Service::Storage),
-            "web" => Some(Service::Web),
-            "bootstrap" => Some(Service::Bootstrap),
-            "" => None,
-            unknown => {
-                debug!("Unknown service type: '{}'", unknown);
-                None
-            }
-        })
-        .collect()
+    s.split(',').filter_map(|part| match part.trim() {
+        "chat"      => Some(Service::Chat),
+        "storage"   => Some(Service::Storage),
+        "web"       => Some(Service::Web),
+        "bootstrap" => Some(Service::Bootstrap),
+        ""          => None,
+        unknown     => { debug!("Unknown service type: '{}'", unknown); None }
+    }).collect()
 }

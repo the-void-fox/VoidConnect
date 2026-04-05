@@ -25,6 +25,11 @@ pub struct PeerInfo {
     pub ip: IpAddr,
     pub port: u16,
 
+    /// Порт TCP-сервера общего чата.
+    /// Обычно port + 2, но может быть любым — передаётся явно
+    /// чтобы несколько экземпляров на одной машине не конфликтовали.
+    pub chat_port: u16,
+
     /// Список активных сервисов этого узла
     pub services: Vec<Service>,
 
@@ -36,6 +41,11 @@ impl PeerInfo {
     /// Адрес для подключения в формате "ip:port"
     pub fn addr(&self) -> String {
         format!("{}:{}", self.ip, self.port)
+    }
+
+    /// Адрес чат-сервера в формате "ip:chat_port"
+    pub fn chat_addr(&self) -> String {
+        format!("{}:{}", self.ip, self.chat_port)
     }
 
     /// Считаем узел живым, если он был виден не позже 60 секунд назад

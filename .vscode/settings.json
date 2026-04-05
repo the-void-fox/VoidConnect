@@ -1,12 +1,19 @@
 {
     "nixEnvSelector.suggestion": false,
-    "nixEnvSelector.nixFile": "${workspaceFolder}/shell.nix",
     "cSpell.words": [
+        "дедупликации",
         "инстанса",
         "парсим",
+        "префиксирована",
         "продакшне",
+        "резолвинге",
+        "Сериализуется",
+        "скролла",
         "Behaviour",
         "chrono",
+        "conv",
+        "eframe",
+        "egui",
         "Gossipsub",
         "keypair",
         "libp",
@@ -19,5 +26,6 @@
         "thiserror",
         "tungstenite",
         "yamux"
-    ]
+    ],
+    "nixEnvSelector.nixFile": "${workspaceFolder}/shell.nix"
 }

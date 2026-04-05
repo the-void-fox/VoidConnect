@@ -5,7 +5,9 @@
 //! 1. Каждые N секунд рассылает UDP-пакет на 255.255.255.255
 //! 2. Слушает входящие broadcast-пакеты от других узлов
 //!
-//! Формат пакета: JSON с PeerInfo
+//! При запуске нескольких экземпляров на одной машине listener
+//! привязывается к base_port + 1, чтобы не конфликтовать.
+//! В реальной сети все узлы используют одинаковый BROADCAST_PORT.
 
 use crate::{DiscoveryError, PeerList};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -13,19 +15,25 @@ use tracing::{debug, error, info, warn};
 use void_core::peer::PeerInfo;
 use std::sync::Arc;
 
-
-/// Порт для UDP broadcast. Должен совпадать на всех узлах.
+/// Стандартный порт broadcast в реальной сети (одно устройство = один экземпляр)
 const BROADCAST_PORT: u16 = 7701;
 
 /// Интервал между рассылками (секунды)
 const BROADCAST_INTERVAL_SECS: u64 = 10;
 
-/// Запускает UDP broadcast: периодическую рассылку и прослушивание.
+/// Запускает UDP broadcast.
+///
+/// `base_port` — основной порт узла. Listener привязывается к
+/// `base_port + 1`, отправка всегда идёт на стандартный BROADCAST_PORT.
+/// Это позволяет запустить два экземпляра на одной машине без конфликта.
 pub async fn start_udp_broadcast(
     my_peer: PeerInfo,
     peer_list: PeerList,
+    base_port: u16,
 ) -> Result<(), DiscoveryError> {
-    // Запускаем отправку в фоне
+    let listen_port = base_port + 1;
+
+    // Отправка
     let my_peer_clone = my_peer.clone();
     tokio::spawn(async move {
         if let Err(e) = broadcast_loop(my_peer_clone).await {
@@ -33,18 +41,17 @@ pub async fn start_udp_broadcast(
         }
     });
 
-    // Запускаем приём в фоне
+    // Приём
     tokio::spawn(async move {
-        if let Err(e) = listen_loop(peer_list).await {
+        if let Err(e) = listen_loop(peer_list, listen_port).await {
             error!("UDP broadcast listener error: {}", e);
         }
     });
 
-    info!("UDP broadcast started on port {}", BROADCAST_PORT);
+    info!("UDP broadcast started (sending to :{}, listening on :{})", BROADCAST_PORT, listen_port);
     Ok(())
 }
 
-/// Каждые BROADCAST_INTERVAL_SECS отправляем свои данные в сеть
 async fn broadcast_loop(my_peer: PeerInfo) -> Result<(), DiscoveryError> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
     socket.set_broadcast(true)?;
@@ -64,48 +71,44 @@ async fn broadcast_loop(my_peer: PeerInfo) -> Result<(), DiscoveryError> {
     loop {
         interval.tick().await;
 
-        // Клонируем Arc для каждой итерации
         let socket_clone = Arc::clone(&socket);
         let payload_clone = payload.clone();
-        
+
         let result = tokio::task::spawn_blocking(move || {
             socket_clone.send_to(&payload_clone, broadcast_addr)
-        })
-        .await;
+        }).await;
 
         match result {
             Ok(Ok(bytes)) => debug!("Broadcast sent ({} bytes)", bytes),
-            Ok(Err(e)) => warn!("Broadcast send error: {}", e),
-            Err(e) => warn!("spawn_blocking error: {}", e),
+            Ok(Err(e))    => warn!("Broadcast send error: {}", e),
+            Err(e)        => warn!("spawn_blocking error: {}", e),
         }
     }
 }
 
-/// Слушаем входящие broadcast-пакеты и добавляем узлы в peer list
-async fn listen_loop(peer_list: PeerList) -> Result<(), DiscoveryError> {
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", BROADCAST_PORT))?;
+async fn listen_loop(peer_list: PeerList, listen_port: u16) -> Result<(), DiscoveryError> {
+    let bind_addr = format!("0.0.0.0:{}", listen_port);
+    let socket = UdpSocket::bind(&bind_addr)?;
     socket.set_broadcast(true)?;
 
-    info!("UDP broadcast listener on 0.0.0.0:{}", BROADCAST_PORT);
+    info!("UDP broadcast listener on {}", bind_addr);
+
+    // Один клон делаем заранее — не клонируем на каждой итерации
+    let socket = Arc::new(socket);
 
     loop {
-        // recv_from — блокирующий, используем spawn_blocking
-        let socket_clone = socket.try_clone()?;
+        let socket_clone = Arc::clone(&socket);
         let result = tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
             socket_clone.recv_from(&mut buf).map(|(n, addr)| (buf, n, addr))
-        })
-        .await;
+        }).await;
 
         match result {
             Ok(Ok((data, n, from_addr))) => {
                 match serde_json::from_slice::<PeerInfo>(&data[..n]) {
                     Ok(mut peer) => {
-                        // Обновляем IP из реального адреса источника пакета
-                        // (на случай если узел не знает свой внешний IP)
                         peer.ip = from_addr.ip();
                         peer.last_seen = chrono::Utc::now().timestamp();
-
                         debug!("UDP broadcast from: {} ({})", peer.name, from_addr);
                         peer_list.upsert(peer).await;
                     }
@@ -115,7 +118,7 @@ async fn listen_loop(peer_list: PeerList) -> Result<(), DiscoveryError> {
                 }
             }
             Ok(Err(e)) => warn!("UDP recv error: {}", e),
-            Err(e) => warn!("spawn_blocking error: {}", e),
+            Err(e)     => warn!("spawn_blocking error: {}", e),
         }
     }
 }
