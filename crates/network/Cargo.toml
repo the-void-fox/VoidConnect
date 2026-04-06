@@ -4,3 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+void-core = { path = "../core" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# WebSocket
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+
+# Сериализация
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Ошибки
+thiserror = { workspace = true }
+
+# Логирование
+tracing = { workspace = true }
