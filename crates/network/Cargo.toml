@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 void-core = { path = "../core" }
+void-discovery = { path = "../discovery" }
 
 # Async runtime
 tokio = { workspace = true }

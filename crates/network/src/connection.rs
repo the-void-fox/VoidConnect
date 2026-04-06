@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use void_core::identity::NodeId;
 use void_core::message::NetworkMessage;
+use void_core::peer::PeerInfo;
 
 use crate::error::NetworkError;
 use crate::rate_limit::RateLimiter;
@@ -31,9 +32,9 @@ const INBOUND_BUFFER: usize = 256;
 /// Событие, которое ConnectionManager отправляет наружу через mpsc-канал.
 #[derive(Debug)]
 pub enum ConnectionEvent {
-    /// Новое соединение установлено
+    /// Новое соединение установлено; содержит полный PeerInfo для обновления PeerList
     Connected {
-        peer_id: NodeId,
+        peer_info: PeerInfo,
         addr: SocketAddr,
     },
     /// Соединение закрыто
@@ -86,13 +87,13 @@ pub struct ConnectionManager {
     event_tx: mpsc::Sender<ConnectionEvent>,
     /// Rate limiter
     rate_limiter: Arc<RateLimiter>,
-    /// Наш собственный NodeId
-    local_id: NodeId,
+    /// Полные данные о нашем узле — используются в handshake
+    my_peer: Arc<PeerInfo>,
 }
 
 impl ConnectionManager {
     pub fn new(
-        local_id: NodeId,
+        my_peer: PeerInfo,
         rate_limiter: Arc<RateLimiter>,
         event_tx: mpsc::Sender<ConnectionEvent>,
     ) -> Self {
@@ -100,7 +101,7 @@ impl ConnectionManager {
             connections: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             rate_limiter,
-            local_id,
+            my_peer: Arc::new(my_peer),
         }
     }
 
@@ -237,11 +238,11 @@ impl ConnectionManager {
         let event_tx = self.event_tx.clone();
         let connections = self.connections.clone();
         let rate_limiter = self.rate_limiter.clone();
-        let local_id = self.local_id.clone();
+        let my_peer = self.my_peer.clone();
 
         tokio::spawn(async move {
-            // Шаг 1: Handshake — обмен NodeId
-            let peer_id = match perform_handshake(&mut transport, &local_id).await {
+            // Шаг 1: Handshake — обмен полными PeerInfo
+            let peer_id = match perform_handshake(&mut transport, &my_peer).await {
                 Ok(id) => id,
                 Err(e) => {
                     warn!("Handshake failed with {}: {}", peer_addr, e);
@@ -249,26 +250,27 @@ impl ConnectionManager {
                 }
             };
 
-            info!("Handshake complete with {} ({})", peer_id, peer_addr);
+            info!("Handshake complete with {} ({})", peer_id.id, peer_addr);
 
             // Шаг 2: Регистрируем соединение
+            let node_id = peer_id.id.clone();
             let (outbound_tx, mut outbound_rx) = mpsc::channel::<NetworkMessage>(INBOUND_BUFFER);
             let last_seen = Arc::new(Mutex::new(Instant::now()));
 
             let handle = ConnectionHandle {
-                peer_id: peer_id.clone(),
+                peer_id: node_id.clone(),
                 addr: peer_addr,
                 tx: outbound_tx,
                 connected_at: Instant::now(),
                 last_seen: last_seen.clone(),
             };
 
-            connections.write().await.insert(peer_id.clone(), handle);
+            connections.write().await.insert(node_id.clone(), handle);
 
-            // Шаг 3: Уведомляем Router о новом соединении
+            // Шаг 3: Уведомляем Router — передаём полный PeerInfo для обновления PeerList
             let _ = event_tx
                 .send(ConnectionEvent::Connected {
-                    peer_id: peer_id.clone(),
+                    peer_info: peer_id,
                     addr: peer_addr,
                 })
                 .await;
@@ -286,31 +288,30 @@ impl ConnectionManager {
                             Ok(frame) => {
                                 *last_seen.lock().await = Instant::now();
 
-                                // Десериализуем сообщение
                                 match serde_json::from_slice::<NetworkMessage>(&frame.payload) {
                                     Ok(NetworkMessage::Pong) => {
                                         last_pong = Instant::now();
                                     }
                                     Ok(msg) => {
                                         // Rate limiting
-                                        if rate_limiter.check(&peer_id).await {
+                                        if rate_limiter.check(&node_id).await {
                                             let _ = event_tx
                                                 .send(ConnectionEvent::Message {
-                                                    from: peer_id.clone(),
+                                                    from: node_id.clone(),
                                                     message: msg,
                                                 })
                                                 .await;
                                         } else {
-                                            warn!("Rate limit exceeded for {}", peer_id);
+                                            warn!("Rate limit exceeded for {}", node_id);
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Failed to deserialize message from {}: {}", peer_id, e);
+                                        warn!("Failed to deserialize message from {}: {}", node_id, e);
                                     }
                                 }
                             }
                             Err(NetworkError::Disconnected) | Err(_) => {
-                                info!("Connection closed with {}", peer_id);
+                                info!("Connection closed with {}", node_id);
                                 break;
                             }
                         }
@@ -321,7 +322,7 @@ impl ConnectionManager {
                         match serde_json::to_vec(&msg) {
                             Ok(payload) => {
                                 if let Err(e) = transport.send(Frame::new(payload)).await {
-                                    warn!("Send error to {}: {}", peer_id, e);
+                                    warn!("Send error to {}: {}", node_id, e);
                                     break;
                                 }
                             }
@@ -333,15 +334,14 @@ impl ConnectionManager {
 
                     // Keepalive ping
                     _ = ping_interval.tick() => {
-                        // Проверяем таймаут pong
                         if last_pong.elapsed() > PONG_TIMEOUT {
-                            warn!("Pong timeout for {}", peer_id);
+                            warn!("Pong timeout for {}", node_id);
                             break;
                         }
 
                         let payload = serde_json::to_vec(&NetworkMessage::Ping).unwrap_or_default();
                         if let Err(e) = transport.send(Frame::new(payload)).await {
-                            warn!("Ping failed to {}: {}", peer_id, e);
+                            warn!("Ping failed to {}: {}", node_id, e);
                             break;
                         }
                     }
@@ -349,40 +349,29 @@ impl ConnectionManager {
             }
 
             // Шаг 6: Очищаем соединение
-            connections.write().await.remove(&peer_id);
+            connections.write().await.remove(&node_id);
             let _ = event_tx
                 .send(ConnectionEvent::Disconnected {
-                    peer_id: peer_id.clone(),
+                    peer_id: node_id.clone(),
                 })
                 .await;
 
-            info!("Connection task ended for {}", peer_id);
+            info!("Connection task ended for {}", node_id);
         });
     }
 }
 
 // ─── Handshake ────────────────────────────────────────────────────────────────
 
-/// Простой handshake: отправляем Announce, получаем Announce от собеседника.
-/// Возвращает NodeId удалённого узла.
+/// Handshake: обмениваемся полными PeerInfo через Announce.
+/// Возвращает PeerInfo удалённого узла — Router сразу передаст его в PeerList.
 async fn perform_handshake(
     transport: &mut Transport,
-    local_id: &NodeId,
-) -> Result<NodeId, NetworkError> {
-    use void_core::peer::PeerInfo;
-
-    // Отправляем наш Announce (минимальный, без полных данных)
-    // В реальности PeerInfo берётся из конфига приложения
+    my_peer: &PeerInfo,
+) -> Result<PeerInfo, NetworkError> {
+    // Отправляем полный Announce с реальными данными
     let announce = NetworkMessage::Announce {
-        peer: PeerInfo {
-            id: local_id.clone(),
-            name: String::new(),
-            ip: "0.0.0.0".parse().unwrap(),
-            port: 0,
-            chat_port: 0,
-            services: vec![],
-            last_seen: 0,
-        },
+        peer: my_peer.clone(),
     };
 
     let payload = serde_json::to_vec(&announce)
@@ -395,7 +384,7 @@ async fn perform_handshake(
         .map_err(|e| NetworkError::Serialization(e.to_string()))?;
 
     match msg {
-        NetworkMessage::Announce { peer } => Ok(peer.id),
+        NetworkMessage::Announce { peer } => Ok(peer),
         _ => Err(NetworkError::Protocol(
             "Expected Announce as first message".into(),
         )),

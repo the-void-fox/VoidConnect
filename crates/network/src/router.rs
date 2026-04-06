@@ -7,6 +7,8 @@ use tracing::{debug, info, warn};
 
 use void_core::identity::NodeId;
 use void_core::message::NetworkMessage;
+use void_core::peer::PeerInfo;
+use void_discovery::PeerList;
 
 use crate::connection::{ConnectionEvent, ConnectionManager};
 use crate::error::NetworkError;
@@ -50,19 +52,24 @@ pub struct Router {
     subscribers: Arc<RwLock<HashMap<MessageKind, Vec<mpsc::Sender<RouterEvent>>>>>,
     /// ConnectionManager для ответных отправок
     conn_manager: Arc<ConnectionManager>,
+    /// Общий список узлов — обновляется при connect/disconnect
+    peer_list: PeerList,
 }
 
 impl Router {
     /// Создаёт Router и запускает фоновую задачу обработки событий.
     ///
     /// `event_rx` — приёмная сторона канала из ConnectionManager.
+    /// `peer_list` — разделяемый список узлов из крейта discovery.
     pub fn new(
         conn_manager: Arc<ConnectionManager>,
+        peer_list: PeerList,
         mut event_rx: mpsc::Receiver<ConnectionEvent>,
     ) -> Self {
         let router = Self {
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             conn_manager,
+            peer_list,
         };
 
         let r = router.clone();
@@ -133,26 +140,39 @@ impl Router {
 
     async fn handle_event(&self, event: ConnectionEvent) {
         match event {
-            ConnectionEvent::Connected { peer_id, addr } => {
-                info!("Peer connected: {} at {}", peer_id, addr);
+            ConnectionEvent::Connected { peer_info, addr } => {
+                info!("Peer connected: {} at {}", peer_info.id, addr);
 
-                // Автоматически запрашиваем список узлов у нового пира
+                // Обновляем PeerList реальными данными из handshake.
+                // Это единственный авторитетный источник для TCP-соединений —
+                // mDNS/UDP мог ещё не успеть получить этот узел.
+                self.peer_list.upsert(peer_info.clone()).await;
+
+                // Запрашиваем список узлов у нового пира
                 let _ = self
                     .conn_manager
-                    .send_to(&peer_id, NetworkMessage::GetPeers)
+                    .send_to(&peer_info.id, NetworkMessage::GetPeers)
                     .await;
             }
 
             ConnectionEvent::Disconnected { peer_id } => {
                 info!("Peer disconnected: {}", peer_id);
-                // Подписчики узнают об этом косвенно — через отсутствие сообщений
-                // или через отдельный канал состояния (можно добавить позже)
+                // Удаляем из PeerList — prune_stale тоже уберёт его со временем,
+                // но явное удаление даёт немедленную согласованность.
+                self.peer_list.remove(&peer_id).await;
             }
 
             ConnectionEvent::Message { from, message } => {
                 debug!("Message from {}: {:?}", from, message);
 
-                // Автоматически обрабатываем Ping на уровне роутера
+                // Обновляем last_seen при любом входящем сообщении,
+                // чтобы prune_stale не удалил активный узел.
+                if let Some(mut peer) = self.peer_list.get(&from).await {
+                    peer.last_seen = chrono::Utc::now().timestamp();
+                    self.peer_list.upsert(peer).await;
+                }
+
+                // Ping обрабатываем здесь же, не гоняем по подписчикам
                 if matches!(message, NetworkMessage::Ping) {
                     let _ = self
                         .conn_manager
@@ -161,15 +181,19 @@ impl Router {
                     return;
                 }
 
-                // Определяем тип сообщения
+                // Peers { peers } — сразу добавляем в PeerList,
+                // не требуя отдельного подписчика для этого.
+                if let NetworkMessage::Peers { ref peers } = message {
+                    for peer in peers {
+                        // Не перезаписываем уже подключённых — у них актуальный IP
+                        if self.peer_list.get(&peer.id).await.is_none() {
+                            self.peer_list.upsert(peer.clone()).await;
+                        }
+                    }
+                }
+
                 let kind = classify_message(&message);
-
-                // Рассылаем подписчикам
-                let event = RouterEvent {
-                    from,
-                    message,
-                };
-
+                let event = RouterEvent { from, message };
                 self.dispatch(kind, event).await;
             }
         }
