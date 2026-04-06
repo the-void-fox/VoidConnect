@@ -4,3 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Внутренние крейты
+void-core    = { path = "../core" }
+void-crypto  = { path = "../crypto" }
+void-db      = { path = "../db" }
+void-network = { path = "../network" }
+
+# Async
+tokio = { workspace = true }
+
+# Сериализация
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Утилиты
+chrono     = { workspace = true }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }

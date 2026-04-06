@@ -1,0 +1,178 @@
+/// events.rs — события влияющие на репутацию.
+///
+/// ReputationEvent описывает всё что может изменить score узла.
+/// EventProcessor подписывается на Router и применяет события автоматически.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
+
+use tokio::sync::Mutex;
+use tokio::time::interval;
+use tracing::{debug, info, warn};
+
+use void_core::identity::NodeId;
+use void_network::rate_limit::RateLimiter;
+
+use crate::error::ReputationError;
+use crate::score::ScoreManager;
+
+// ─── Константы ───────────────────────────────────────────────────────────────
+
+/// Интервал начисления аптайм-бонуса.
+const UPTIME_TICK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Через сколько секунд без активности считать узел offline
+/// (для упрощения — ориентируемся на Router events, не на самостоятельный пинг).
+const BOOTSTRAP_BONUS_PER_ASSIST: f64 = 5.0;
+
+// ─── Тип события ──────────────────────────────────────────────────────────────
+
+/// Всё, что может повлиять на репутацию узла.
+#[derive(Debug, Clone)]
+pub enum ReputationEvent {
+    /// Узел успешно передал чанк нужного размера.
+    ValidChunk {
+        peer_id: NodeId,
+        size_bytes: i64,
+    },
+    /// Узел передал чанк, не прошедший SHA-256 верификацию.
+    BadChunk {
+        peer_id: NodeId,
+    },
+    /// Узел превысил rate limit (спам/флуд).
+    SpamStrike {
+        peer_id: NodeId,
+    },
+    /// Bootstrap-узел помог новому участнику подключиться к сети.
+    BootstrapAssist {
+        peer_id: NodeId,
+    },
+    /// Узел подключился (начало отсчёта аптайма).
+    PeerConnected {
+        peer_id: NodeId,
+    },
+    /// Узел отключился (конец аптайма для текущей сессии).
+    PeerDisconnected {
+        peer_id: NodeId,
+    },
+}
+
+// ─── EventProcessor ───────────────────────────────────────────────────────────
+
+/// Принимает ReputationEvent и применяет их к ScoreManager.
+/// Также ведёт учёт аптайма для подключённых узлов.
+#[derive(Clone)]
+pub struct EventProcessor {
+    score_manager: ScoreManager,
+    /// Время подключения для подсчёта аптайма: peer_id → connected_at
+    online_since: Arc<Mutex<HashMap<NodeId, Instant>>>,
+    /// Rate limiter — для принудительной блокировки после спам-страйков.
+    rate_limiter: Arc<RateLimiter>,
+}
+
+impl EventProcessor {
+    pub fn new(score_manager: ScoreManager, rate_limiter: Arc<RateLimiter>) -> Self {
+        let processor = Self {
+            score_manager,
+            online_since: Arc::new(Mutex::new(HashMap::new())),
+            rate_limiter,
+        };
+
+        // Запускаем фоновый тик аптайма
+        processor.spawn_uptime_ticker();
+
+        processor
+    }
+
+    // ─── Публичный API ────────────────────────────────────────────────────────
+
+    /// Обрабатывает событие репутации. Вызывать из любого места крейта.
+    pub async fn process(&self, event: ReputationEvent) {
+        match event {
+            ReputationEvent::ValidChunk { peer_id, size_bytes } => {
+                self.score_manager.record_valid_chunk(&peer_id, size_bytes).await;
+            }
+
+            ReputationEvent::BadChunk { peer_id } => {
+                self.score_manager.record_bad_chunk(&peer_id).await;
+                // Дополнительно проверяем — если репутация упала до отрицательной,
+                // принудительно блокируем через rate limiter
+                self.maybe_block_negative(&peer_id).await;
+            }
+
+            ReputationEvent::SpamStrike { peer_id } => {
+                self.score_manager.record_spam_strike(&peer_id).await;
+                self.maybe_block_negative(&peer_id).await;
+            }
+
+            ReputationEvent::BootstrapAssist { peer_id } => {
+                self.score_manager
+                    .record_bootstrap_assist(&peer_id, BOOTSTRAP_BONUS_PER_ASSIST)
+                    .await;
+            }
+
+            ReputationEvent::PeerConnected { peer_id } => {
+                info!("Reputation: tracking uptime for {}", peer_id);
+                self.score_manager.init(&peer_id).await;
+                self.online_since
+                    .lock()
+                    .await
+                    .insert(peer_id, Instant::now());
+            }
+
+            ReputationEvent::PeerDisconnected { peer_id } => {
+                let connected_at = self.online_since.lock().await.remove(&peer_id);
+                if let Some(at) = connected_at {
+                    let uptime = at.elapsed();
+                    debug!(
+                        "Reputation: {} was online for {}s",
+                        peer_id,
+                        uptime.as_secs()
+                    );
+                    self.score_manager.record_uptime(&peer_id, uptime).await;
+                }
+            }
+        }
+    }
+
+    // ─── Внутреннее ──────────────────────────────────────────────────────────
+
+    /// Если репутация ушла в отрицательную зону — блокируем узел на 10 минут.
+    async fn maybe_block_negative(&self, peer_id: &NodeId) {
+        use crate::score::ReputationLevel;
+
+        if self.score_manager.level(peer_id).await == ReputationLevel::Negative {
+            warn!(
+                "Reputation: {} has negative score, applying temp block",
+                peer_id
+            );
+            self.rate_limiter
+                .block_peer(peer_id, Duration::from_secs(600))
+                .await;
+        }
+    }
+
+    /// Периодически начисляет аптайм-бонус всем онлайн-узлам.
+    fn spawn_uptime_ticker(&self) {
+        let online_since = self.online_since.clone();
+        let score_manager = self.score_manager.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = interval(UPTIME_TICK_INTERVAL);
+            ticker.tick().await; // пропускаем первый немедленный тик
+
+            loop {
+                ticker.tick().await;
+
+                let peers: Vec<NodeId> = online_since.lock().await.keys().cloned().collect();
+
+                for peer_id in peers {
+                    score_manager
+                        .record_uptime(&peer_id, UPTIME_TICK_INTERVAL)
+                        .await;
+                }
+            }
+        });
+    }
+}
