@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+void-core = { path = "../core" }
+void-db   = { path = "../db" }
+
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+sha2         = { workspace = true }
+hex          = { workspace = true }
+chrono       = { workspace = true }
+thiserror    = { workspace = true }
+uuid         = { workspace = true }
+bytes        = { workspace = true }
+tokio-util   = { workspace = true }

@@ -59,6 +59,8 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 base64 = "0.21"
 rand = "0.8"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
 
 #egui
 eframe = { version = "0.27", features = ["default"] }
