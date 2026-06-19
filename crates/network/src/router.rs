@@ -22,6 +22,8 @@ pub enum MessageKind {
     Discovery,
     /// Сообщения общего чата (ChatMessage)
     Chat,
+    /// Синхронизация и жалобы репутации (ReputationSync / ReputationReport)
+    Reputation,
     /// Ping / Pong
     Keepalive,
     /// Все сообщения (wildcard)
@@ -244,6 +246,9 @@ fn classify_message(msg: &NetworkMessage) -> MessageKind {
         | NetworkMessage::Peers { .. } => MessageKind::Discovery,
 
         NetworkMessage::ChatMessage { .. } => MessageKind::Chat,
+
+        NetworkMessage::ReputationSync { .. }
+        | NetworkMessage::ReputationReport { .. } => MessageKind::Reputation,
 
         NetworkMessage::Ping | NetworkMessage::Pong => MessageKind::Keepalive,
     }

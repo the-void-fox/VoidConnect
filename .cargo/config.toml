@@ -1,0 +1,10 @@
+# Сборка void-db использует offline-кэш sqlx (crates/db/.sqlx), а не живую БД.
+# Чтобы перегенерировать кэш после изменения SQL-запросов:
+#   nix-shell -p sqlx-cli sqlite rustc cargo gcc --run '
+#     export DATABASE_URL="sqlite://$PWD/crates/db/.dev.db"
+#     sqlx database create
+#     sqlx migrate run --source crates/db/migrations
+#     (cd crates/db && cargo sqlx prepare)
+#   '
+[env]
+SQLX_OFFLINE = "true"

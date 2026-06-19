@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO local_profile (id, public_key, username)\n        VALUES (1, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "90294065a8f6c03f02b968e48137a801c619e9135c87385a5c5e53550717836b"
+}

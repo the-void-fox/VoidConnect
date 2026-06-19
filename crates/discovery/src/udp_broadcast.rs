@@ -12,6 +12,7 @@
 use crate::{DiscoveryError, PeerList};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use tracing::{debug, error, info, warn};
+use void_core::identity::NodeId;
 use void_core::peer::PeerInfo;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use std::sync::Arc;
 const BROADCAST_PORT: u16 = 7701;
 
 /// Интервал между рассылками (секунды)
-const BROADCAST_INTERVAL_SECS: u64 = 10;
+const BROADCAST_INTERVAL_SECS: u64 = 5;
 
 /// Запускает UDP broadcast.
 ///
@@ -42,8 +43,9 @@ pub async fn start_udp_broadcast(
     });
 
     // Приём
+    let my_id = my_peer.id.clone();
     tokio::spawn(async move {
-        if let Err(e) = listen_loop(peer_list, listen_port).await {
+        if let Err(e) = listen_loop(peer_list, listen_port, my_id).await {
             error!("UDP broadcast listener error: {}", e);
         }
     });
@@ -86,14 +88,13 @@ async fn broadcast_loop(my_peer: PeerInfo) -> Result<(), DiscoveryError> {
     }
 }
 
-async fn listen_loop(peer_list: PeerList, listen_port: u16) -> Result<(), DiscoveryError> {
+async fn listen_loop(peer_list: PeerList, listen_port: u16, my_id: NodeId) -> Result<(), DiscoveryError> {
     let bind_addr = format!("0.0.0.0:{}", listen_port);
     let socket = UdpSocket::bind(&bind_addr)?;
     socket.set_broadcast(true)?;
 
     info!("UDP broadcast listener on {}", bind_addr);
 
-    // Один клон делаем заранее — не клонируем на каждой итерации
     let socket = Arc::new(socket);
 
     loop {
@@ -107,13 +108,23 @@ async fn listen_loop(peer_list: PeerList, listen_port: u16) -> Result<(), Discov
             Ok(Ok((data, n, from_addr))) => {
                 match serde_json::from_slice::<PeerInfo>(&data[..n]) {
                     Ok(mut peer) => {
+                        if peer.id == my_id {
+                            debug!("UDP broadcast: ignoring own packet from {}", from_addr);
+                            continue;
+                        }
+                        let already = peer_list.get(&peer.id).await.is_some();
                         peer.ip = from_addr.ip();
                         peer.last_seen = chrono::Utc::now().timestamp();
-                        debug!("UDP broadcast from: {} ({})", peer.name, from_addr);
-                        peer_list.upsert(peer).await;
+                        peer_list.upsert(peer.clone()).await;
+                        if !already {
+                            info!("UDP broadcast: discovered new peer {} at {} (chat_port={})",
+                                peer.name, from_addr.ip(), peer.chat_port);
+                        } else {
+                            debug!("UDP broadcast: heartbeat from {} ({})", peer.name, from_addr);
+                        }
                     }
                     Err(e) => {
-                        warn!("Failed to parse broadcast from {}: {}", from_addr, e);
+                        warn!("Failed to parse UDP broadcast from {}: {}", from_addr, e);
                     }
                 }
             }

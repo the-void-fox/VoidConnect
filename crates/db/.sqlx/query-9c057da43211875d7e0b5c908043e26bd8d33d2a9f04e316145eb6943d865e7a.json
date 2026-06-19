@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT OR IGNORE INTO public_messages\n            (message_id, sender_key, content, signature, sent_at)\n        VALUES (?, ?, ?, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "9c057da43211875d7e0b5c908043e26bd8d33d2a9f04e316145eb6943d865e7a"
+}

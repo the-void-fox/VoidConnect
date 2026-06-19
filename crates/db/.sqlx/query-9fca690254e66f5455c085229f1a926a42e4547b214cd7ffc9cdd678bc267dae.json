@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT OR IGNORE INTO files\n            (file_id, name, size_bytes, total_chunks, owner_key, mime_type, created_at)\n        VALUES (?, ?, ?, ?, ?, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "9fca690254e66f5455c085229f1a926a42e4547b214cd7ffc9cdd678bc267dae"
+}

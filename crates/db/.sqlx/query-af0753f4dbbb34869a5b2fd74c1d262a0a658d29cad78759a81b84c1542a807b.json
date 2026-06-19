@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT public_key as \"public_key!\", username, avatar_url, status_text,\n               ip_address, port, is_bootstrap, last_seen_at, first_seen_at\n        FROM peers\n        WHERE public_key = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "public_key!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "username",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "avatar_url",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status_text",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "ip_address",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "port",
+        "ordinal": 5,
+        "type_info": "Int64"
+      },
+      {
+        "name": "is_bootstrap",
+        "ordinal": 6,
+        "type_info": "Int64"
+      },
+      {
+        "name": "last_seen_at",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "first_seen_at",
+        "ordinal": 8,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "af0753f4dbbb34869a5b2fd74c1d262a0a658d29cad78759a81b84c1542a807b"
+}

@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT public_key as \"public_key!\", score, upload_bytes, download_bytes,\n               valid_chunks_sent, bad_chunks_sent, spam_strikes,\n               uptime_seconds, bootstrap_bonus, updated_at\n        FROM reputation\n        WHERE public_key = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "public_key!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "score",
+        "ordinal": 1,
+        "type_info": "Float"
+      },
+      {
+        "name": "upload_bytes",
+        "ordinal": 2,
+        "type_info": "Int64"
+      },
+      {
+        "name": "download_bytes",
+        "ordinal": 3,
+        "type_info": "Int64"
+      },
+      {
+        "name": "valid_chunks_sent",
+        "ordinal": 4,
+        "type_info": "Int64"
+      },
+      {
+        "name": "bad_chunks_sent",
+        "ordinal": 5,
+        "type_info": "Int64"
+      },
+      {
+        "name": "spam_strikes",
+        "ordinal": 6,
+        "type_info": "Int64"
+      },
+      {
+        "name": "uptime_seconds",
+        "ordinal": 7,
+        "type_info": "Int64"
+      },
+      {
+        "name": "bootstrap_bonus",
+        "ordinal": 8,
+        "type_info": "Float"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 9,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f3ea2724f65f9d08269cc8ccb000e825fe0dae3cf956c7d0fd263c25c3ca903b"
+}

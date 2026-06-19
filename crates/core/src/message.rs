@@ -28,6 +28,23 @@ pub enum NetworkMessage {
         signature: String,
     },
 
+    /// Синхронизация репутации между узлами.
+    /// `signed_payload` — сериализованный `SyncPayload`, подписанный ключом `signer`.
+    ReputationSync {
+        from: NodeId,
+        signed_payload: Vec<u8>,
+        signature: String,
+        signer: String,
+    },
+
+    /// Подписанная жалоба на узел `target`.
+    ReputationReport {
+        target: NodeId,
+        signed_payload: Vec<u8>,
+        signature: String,
+        signer: String,
+    },
+
     /// Пинг для проверки доступности
     Ping,
     Pong,

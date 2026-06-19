@@ -97,7 +97,7 @@ mod tests {
         let alice = EncryptionKeypair::generate();
         let bob   = EncryptionKeypair::generate();
 
-        let plaintext = b"Привет, Боб!";
+        let plaintext = b"Hello, Bob!";
 
         // Алиса шифрует для Боба
         let encrypted = EncryptedMessage::encrypt(
@@ -106,7 +106,6 @@ mod tests {
             &alice,
         ).unwrap();
 
-        // Боб расшифровывает
         let decrypted = encrypted.decrypt(&bob).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -118,7 +117,7 @@ mod tests {
         let eve   = EncryptionKeypair::generate(); // злоумышленник
 
         let encrypted = EncryptedMessage::encrypt(
-            b"секрет",
+            b"secret",
             &bob.public_bytes(),
             &alice,
         ).unwrap();

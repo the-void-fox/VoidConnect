@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO peers (public_key, username, avatar_url, status_text,\n                           ip_address, port, is_bootstrap, last_seen_at)\n        VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n        ON CONFLICT (public_key) DO UPDATE SET\n            username     = COALESCE(excluded.username, username),\n            avatar_url   = COALESCE(excluded.avatar_url, avatar_url),\n            status_text  = COALESCE(excluded.status_text, status_text),\n            ip_address   = COALESCE(excluded.ip_address, ip_address),\n            port         = COALESCE(excluded.port, port),\n            is_bootstrap = excluded.is_bootstrap,\n            last_seen_at = excluded.last_seen_at\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "169ead2609cfcc719b5597380d615e9b99d962a6f0bedfd7e35707c3989d21a3"
+}

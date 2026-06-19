@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT COUNT(DISTINCT reporter_key) as \"cnt: i64\"\n        FROM reputation_reports\n        WHERE target_key = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "cnt: i64",
+        "ordinal": 0,
+        "type_info": "Int"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3e89e32bf185028009346875dba68106d6d3771b9ea073ea35e7b31cd34e20ab"
+}

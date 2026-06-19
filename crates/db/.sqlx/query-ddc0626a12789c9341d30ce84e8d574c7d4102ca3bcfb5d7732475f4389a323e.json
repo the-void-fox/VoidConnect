@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(1) as cnt FROM public_messages WHERE message_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "cnt",
+        "ordinal": 0,
+        "type_info": "Int"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ddc0626a12789c9341d30ce84e8d574c7d4102ca3bcfb5d7732475f4389a323e"
+}

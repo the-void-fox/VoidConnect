@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id as \"id!\", message_id, peer_key, direction, encrypted_blob,\n               sent_at, received_at, is_read\n        FROM private_messages\n        WHERE peer_key = ?\n        ORDER BY sent_at DESC\n        LIMIT ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Int64"
+      },
+      {
+        "name": "message_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "peer_key",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "direction",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "encrypted_blob",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "sent_at",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "received_at",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "is_read",
+        "ordinal": 7,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4c1a1f2b89c715414da6cb121d010038f229b6eb475366c847d1bb2996dfba23"
+}

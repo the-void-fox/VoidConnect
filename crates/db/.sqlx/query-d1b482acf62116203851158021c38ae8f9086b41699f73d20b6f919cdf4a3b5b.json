@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE local_profile\n        SET\n            username    = COALESCE(?, username),\n            avatar_url  = COALESCE(?, avatar_url),\n            status_text = COALESCE(?, status_text)\n        WHERE id = 1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "d1b482acf62116203851158021c38ae8f9086b41699f73d20b6f919cdf4a3b5b"
+}

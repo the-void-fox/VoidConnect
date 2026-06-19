@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT peer_key FROM chunk_owners WHERE chunk_hash = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "peer_key",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f02507c2912852932e19062279df0256b8c9cdbb4b09d088285e05ed4f1a918a"
+}

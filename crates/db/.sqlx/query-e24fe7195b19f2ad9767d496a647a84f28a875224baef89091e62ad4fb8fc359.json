@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT OR REPLACE INTO chunk_owners (chunk_hash, peer_key, verified_at)\n        VALUES (?, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "e24fe7195b19f2ad9767d496a647a84f28a875224baef89091e62ad4fb8fc359"
+}

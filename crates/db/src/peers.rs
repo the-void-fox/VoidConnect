@@ -81,7 +81,7 @@ pub async fn upsert_peer(pool: &DbPool, peer: &Peer) -> Result<()> {
 pub async fn get_peer(pool: &DbPool, public_key: &str) -> Result<Option<Peer>> {
     let row = sqlx::query!(
         r#"
-        SELECT public_key, username, avatar_url, status_text,
+        SELECT public_key as "public_key!", username, avatar_url, status_text,
                ip_address, port, is_bootstrap, last_seen_at, first_seen_at
         FROM peers
         WHERE public_key = ?
@@ -108,7 +108,7 @@ pub async fn get_peer(pool: &DbPool, public_key: &str) -> Result<Option<Peer>> {
 pub async fn list_peers(pool: &DbPool) -> Result<Vec<Peer>> {
     let rows = sqlx::query!(
         r#"
-        SELECT public_key, username, avatar_url, status_text,
+        SELECT public_key as "public_key!", username, avatar_url, status_text,
                ip_address, port, is_bootstrap, last_seen_at, first_seen_at
         FROM peers
         ORDER BY last_seen_at DESC
@@ -137,7 +137,7 @@ pub async fn list_peers(pool: &DbPool) -> Result<Vec<Peer>> {
 pub async fn list_bootstrap_peers(pool: &DbPool) -> Result<Vec<Peer>> {
     let rows = sqlx::query!(
         r#"
-        SELECT public_key, username, avatar_url, status_text,
+        SELECT public_key as "public_key!", username, avatar_url, status_text,
                ip_address, port, is_bootstrap, last_seen_at, first_seen_at
         FROM peers
         WHERE is_bootstrap = 1
@@ -185,7 +185,7 @@ pub async fn touch_peer(pool: &DbPool, public_key: &str) -> Result<()> {
 pub async fn get_reputation(pool: &DbPool, public_key: &str) -> Result<Option<Reputation>> {
     let row = sqlx::query!(
         r#"
-        SELECT public_key, score, upload_bytes, download_bytes,
+        SELECT public_key as "public_key!", score, upload_bytes, download_bytes,
                valid_chunks_sent, bad_chunks_sent, spam_strikes,
                uptime_seconds, bootstrap_bonus, updated_at
         FROM reputation
@@ -316,7 +316,7 @@ pub async fn add_report(
 pub async fn count_reports(pool: &DbPool, target_key: &str) -> Result<i64> {
     let row = sqlx::query!(
         r#"
-        SELECT COUNT(DISTINCT reporter_key) as cnt
+        SELECT COUNT(DISTINCT reporter_key) as "cnt: i64"
         FROM reputation_reports
         WHERE target_key = ?
         "#,
@@ -325,5 +325,5 @@ pub async fn count_reports(pool: &DbPool, target_key: &str) -> Result<i64> {
     .fetch_one(pool)
     .await?;
 
-    Ok(row.cnt.unwrap_or(0))
+    Ok(row.cnt)
 }

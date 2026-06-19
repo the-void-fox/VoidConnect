@@ -26,10 +26,11 @@ pub async fn start_mdns(
 
     register_self(&mdns, &my_peer)?;
 
+    let my_id = my_peer.id.clone();
     let peer_list_clone = peer_list.clone();
     let mdns_clone = mdns.clone();
     tokio::spawn(async move {
-        if let Err(e) = listen_for_peers(mdns_clone, peer_list_clone).await {
+        if let Err(e) = listen_for_peers(mdns_clone, peer_list_clone, my_id).await {
             error!("mDNS listener error: {}", e);
         }
     });
@@ -84,7 +85,7 @@ fn register_self(mdns: &ServiceDaemon, peer: &PeerInfo) -> Result<(), DiscoveryE
     Ok(())
 }
 
-async fn listen_for_peers(mdns: ServiceDaemon, peer_list: PeerList) -> Result<(), DiscoveryError> {
+async fn listen_for_peers(mdns: ServiceDaemon, peer_list: PeerList, my_id: NodeId) -> Result<(), DiscoveryError> {
     let receiver = mdns
         .browse(SERVICE_TYPE)
         .map_err(|e| DiscoveryError::Mdns(e.to_string()))?;
@@ -101,7 +102,7 @@ async fn listen_for_peers(mdns: ServiceDaemon, peer_list: PeerList) -> Result<()
 
         match event {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                handle_resolved(&peer_list, info).await;
+                handle_resolved(&peer_list, info, &my_id).await;
             }
             Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                 handle_removed(&peer_list, &fullname).await;
@@ -114,7 +115,7 @@ async fn listen_for_peers(mdns: ServiceDaemon, peer_list: PeerList) -> Result<()
     }
 }
 
-async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo) {
+async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo, my_id: &NodeId) {
     let addresses: Vec<IpAddr> = info.get_addresses().iter().cloned().collect();
     let ip = match addresses.first() {
         Some(ip) => *ip,
@@ -133,6 +134,11 @@ async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo) {
             return;
         }
     };
+
+    if id_str == my_id.as_str() {
+        debug!("mDNS: ignoring own announcement");
+        return;
+    }
 
     let version = props.get("version").map(|v| v.val_str().to_string()).unwrap_or_default();
     if version != PROTOCOL_VERSION {
@@ -179,12 +185,12 @@ async fn handle_removed(peer_list: &PeerList, fullname: &str) {
             &peer.id.as_str()[..peer.id.as_str().len().min(8)]
         );
         if instance == fullname {
-            info!("Peer left: {} ({})", peer.name, peer.id);
+            info!("mDNS: peer left — {} ({}) at {}", peer.name, peer.id, peer.ip);
             peer_list.remove(&peer.id).await;
             return;
         }
     }
-    debug!("Received remove for unknown peer: {}", fullname);
+    debug!("mDNS: received remove for unknown peer: {}", fullname);
 }
 
 fn parse_services(s: &str) -> Vec<Service> {

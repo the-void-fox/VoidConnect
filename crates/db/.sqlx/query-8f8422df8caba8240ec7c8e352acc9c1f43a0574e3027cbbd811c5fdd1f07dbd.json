@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE reputation\n        SET\n            upload_bytes      = upload_bytes      + ?,\n            download_bytes    = download_bytes    + ?,\n            valid_chunks_sent = valid_chunks_sent + ?,\n            bad_chunks_sent   = bad_chunks_sent   + ?,\n            spam_strikes      = spam_strikes      + ?,\n            uptime_seconds    = uptime_seconds    + ?,\n            bootstrap_bonus   = bootstrap_bonus   + ?,\n            -- упрощённая формула score; пересчитай в reputation::score.rs при желании\n            score = score\n                + (? * 0.01)          -- upload ratio\n                - (? * 0.5)           -- bad chunks penalty\n                - (? * 1.0)           -- spam penalty\n                + (? * 0.001)         -- uptime bonus\n                + ?,                  -- bootstrap bonus\n            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n        WHERE public_key = ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 13
+    },
+    "nullable": []
+  },
+  "hash": "8f8422df8caba8240ec7c8e352acc9c1f43a0574e3027cbbd811c5fdd1f07dbd"
+}

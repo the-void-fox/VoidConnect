@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT file_id as \"file_id!\", name, size_bytes, total_chunks, owner_key, mime_type, created_at\n         FROM files ORDER BY created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "file_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "size_bytes",
+        "ordinal": 2,
+        "type_info": "Int64"
+      },
+      {
+        "name": "total_chunks",
+        "ordinal": 3,
+        "type_info": "Int64"
+      },
+      {
+        "name": "owner_key",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "mime_type",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "f7a8a269f12ab19203adec05c23ad684c76f5d6b8aa3b22d9f1ae466c4e1ecb9"
+}

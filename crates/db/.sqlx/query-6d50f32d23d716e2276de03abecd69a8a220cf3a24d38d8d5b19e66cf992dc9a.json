@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM chunk_owners WHERE peer_key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "6d50f32d23d716e2276de03abecd69a8a220cf3a24d38d8d5b19e66cf992dc9a"
+}

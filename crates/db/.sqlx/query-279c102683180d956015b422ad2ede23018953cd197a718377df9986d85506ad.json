@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            COUNT(*) as total,\n            SUM(is_local) as local_count\n        FROM chunks\n        WHERE file_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "total",
+        "ordinal": 0,
+        "type_info": "Int"
+      },
+      {
+        "name": "local_count",
+        "ordinal": 1,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "279c102683180d956015b422ad2ede23018953cd197a718377df9986d85506ad"
+}

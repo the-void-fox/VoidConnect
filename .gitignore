@@ -1,0 +1,8 @@
+target
+Obsidian
+dist
+
+# Локальная dev-БД для генерации sqlx offline-кэша (.sqlx коммитим, БД — нет)
+crates/db/.dev.db
+crates/db/.dev.db-wal
+crates/db/.dev.db-shm

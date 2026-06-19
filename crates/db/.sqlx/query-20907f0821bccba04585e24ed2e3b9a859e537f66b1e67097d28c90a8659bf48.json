@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO chunks (hash, file_id, chunk_index, size_bytes, is_local, local_path)\n        VALUES (?, ?, ?, ?, ?, ?)\n        ON CONFLICT (hash) DO UPDATE SET\n            is_local   = excluded.is_local,\n            local_path = excluded.local_path\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "20907f0821bccba04585e24ed2e3b9a859e537f66b1e67097d28c90a8659bf48"
+}

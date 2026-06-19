@@ -121,11 +121,17 @@ async fn main() -> anyhow::Result<()> {
         print!("> ");
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        let line = tokio::task::spawn_blocking(|| {
+        let (n, line) = tokio::task::spawn_blocking(|| {
             let mut buf = String::new();
-            std::io::stdin().read_line(&mut buf)?;
-            Ok::<String, std::io::Error>(buf)
+            let n = std::io::stdin().read_line(&mut buf)?;
+            Ok::<(usize, String), std::io::Error>((n, buf))
         }).await??;
+
+        // n == 0 — это EOF (stdin закрыт): выходим, а не крутимся в пустом цикле.
+        if n == 0 {
+            info!("stdin closed (EOF) — exiting.");
+            break;
+        }
 
         let text = line.trim().to_string();
         if text.is_empty() {
@@ -136,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
             warn!("Failed to send: {}", e);
         }
     }
+
+    Ok(())
 }
 
 fn generate_temp_id() -> NodeId {

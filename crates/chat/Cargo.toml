@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-void-core = { path = "../core" }
+void-core      = { path = "../core" }
+void-crypto    = { path = "../crypto" }
 void-discovery = { path = "../discovery" }
+hex = { workspace = true }
 
 chrono = { workspace = true }
 tokio = { workspace = true }

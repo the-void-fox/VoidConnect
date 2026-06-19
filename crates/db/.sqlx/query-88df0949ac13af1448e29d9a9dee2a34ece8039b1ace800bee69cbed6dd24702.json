@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT hash as \"hash!\", file_id, chunk_index, size_bytes, is_local, local_path\n        FROM chunks\n        WHERE file_id = ?\n        ORDER BY chunk_index ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "hash!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "file_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "chunk_index",
+        "ordinal": 2,
+        "type_info": "Int64"
+      },
+      {
+        "name": "size_bytes",
+        "ordinal": 3,
+        "type_info": "Int64"
+      },
+      {
+        "name": "is_local",
+        "ordinal": 4,
+        "type_info": "Int64"
+      },
+      {
+        "name": "local_path",
+        "ordinal": 5,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "88df0949ac13af1448e29d9a9dee2a34ece8039b1ace800bee69cbed6dd24702"
+}

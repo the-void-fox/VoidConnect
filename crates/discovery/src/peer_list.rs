@@ -22,9 +22,26 @@ impl PeerList {
         }
     }
 
-    /// Добавить или обновить запись об узле
+    /// Добавить или обновить запись об узле.
+    /// Если вставляется реальный пир — удаляем stub-заглушки с тем же IP.
+    /// На loopback (127.x) сравниваем ещё и порт, чтобы не затереть чужие stubs.
     pub async fn upsert(&self, peer: PeerInfo) {
         let mut map = self.peers.write().await;
+        if !peer.id.as_str().starts_with("stub-") {
+            let is_loopback = peer.ip.is_loopback();
+            let stale: Vec<NodeId> = map.values()
+                .filter(|p| {
+                    p.id.as_str().starts_with("stub-")
+                        && p.ip == peer.ip
+                        // На loopback несколько экземпляров — убираем только stub с тем же портом
+                        && (!is_loopback || p.port == peer.port)
+                })
+                .map(|p| p.id.clone())
+                .collect();
+            for id in stale {
+                map.remove(&id);
+            }
+        }
         map.insert(peer.id.clone(), peer);
     }
 
@@ -51,11 +68,15 @@ impl PeerList {
         self.peers.read().await.len()
     }
 
-    /// Удалить "мёртвые" узлы (не отвечали больше 60 секунд)
+    /// Удалить "мёртвые" узлы (не отвечали больше 60 секунд).
+    /// Ручно добавленные узлы (id начинается на "stub-") не удаляются —
+    /// они живут до тех пор, пока реальный пир не заменит их.
     pub async fn prune_stale(&self) {
         let now = chrono::Utc::now().timestamp();
         let mut map = self.peers.write().await;
-        map.retain(|_, peer| peer.is_alive(now));
+        map.retain(|_, peer| {
+            peer.id.as_str().starts_with("stub-") || peer.is_alive(now)
+        });
     }
 }
 

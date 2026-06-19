@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT OR IGNORE INTO private_messages\n            (message_id, peer_key, direction, encrypted_blob, sent_at)\n        VALUES (?, ?, ?, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "1d657eebdca078f104b472fca057b261e9c786f31d3d4af438a74ba4c6c83a08"
+}

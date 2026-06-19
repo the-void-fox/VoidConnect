@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE peers\n        SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n        WHERE public_key = ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "6a490d59b5bd108f461c78f6919d15b1d4be30a09d5518c83c8890e6b8e8d469"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO reputation_reports (target_key, reporter_key, reason, signature)\n        VALUES (?, ?, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "1a49dd391541c3aa00ed21049b95c430434a6c31b688a6177bd36774139a0937"
+}

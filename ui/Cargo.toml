@@ -12,3 +12,17 @@ eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
 chrono = { workspace = true }
+
+void-core      = { path = "../crates/core" }
+void-crypto    = { path = "../crates/crypto" }
+void-discovery = { path = "../crates/discovery" }
+void-chat      = { path = "../crates/chat" }
+
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+rand               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+hex                = { workspace = true }

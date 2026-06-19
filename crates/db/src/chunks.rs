@@ -54,7 +54,7 @@ pub async fn insert_file(pool: &DbPool, file: &FileRecord) -> Result<()> {
 pub async fn get_file(pool: &DbPool, file_id: &str) -> Result<Option<FileRecord>> {
     let row = sqlx::query!(
         r#"
-        SELECT file_id, name, size_bytes, total_chunks, owner_key, mime_type, created_at
+        SELECT file_id as "file_id!", name, size_bytes, total_chunks, owner_key, mime_type, created_at
         FROM files WHERE file_id = ?
         "#,
         file_id,
@@ -76,7 +76,7 @@ pub async fn get_file(pool: &DbPool, file_id: &str) -> Result<Option<FileRecord>
 /// Список всех известных файлов.
 pub async fn list_files(pool: &DbPool) -> Result<Vec<FileRecord>> {
     let rows = sqlx::query!(
-        "SELECT file_id, name, size_bytes, total_chunks, owner_key, mime_type, created_at
+        "SELECT file_id as \"file_id!\", name, size_bytes, total_chunks, owner_key, mime_type, created_at
          FROM files ORDER BY created_at DESC"
     )
     .fetch_all(pool)
@@ -126,7 +126,7 @@ pub async fn upsert_chunk(pool: &DbPool, chunk: &Chunk) -> Result<()> {
 pub async fn get_chunks_for_file(pool: &DbPool, file_id: &str) -> Result<Vec<Chunk>> {
     let rows = sqlx::query!(
         r#"
-        SELECT hash, file_id, chunk_index, size_bytes, is_local, local_path
+        SELECT hash as "hash!", file_id, chunk_index, size_bytes, is_local, local_path
         FROM chunks
         WHERE file_id = ?
         ORDER BY chunk_index ASC
@@ -153,7 +153,7 @@ pub async fn get_chunks_for_file(pool: &DbPool, file_id: &str) -> Result<Vec<Chu
 pub async fn get_local_chunks(pool: &DbPool) -> Result<Vec<Chunk>> {
     let rows = sqlx::query!(
         r#"
-        SELECT hash, file_id, chunk_index, size_bytes, is_local, local_path
+        SELECT hash as "hash!", file_id, chunk_index, size_bytes, is_local, local_path
         FROM chunks WHERE is_local = 1
         "#
     )

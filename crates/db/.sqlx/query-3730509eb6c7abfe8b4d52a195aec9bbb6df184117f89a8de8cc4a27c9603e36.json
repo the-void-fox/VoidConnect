@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT COUNT(1) as \"cnt: i64\"\n        FROM private_messages\n        WHERE peer_key = ? AND direction = 'in' AND is_read = 0\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "cnt: i64",
+        "ordinal": 0,
+        "type_info": "Int"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3730509eb6c7abfe8b4d52a195aec9bbb6df184117f89a8de8cc4a27c9603e36"
+}

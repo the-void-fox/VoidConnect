@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT OR IGNORE INTO reputation (public_key)\n        VALUES (?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "2cadf1f6b0d111a65b3623332043f4c21a6d6b6542976335642e7746fd203563"
+}

@@ -81,7 +81,7 @@ pub async fn save_public_message(
 pub async fn get_public_history(pool: &DbPool, limit: i64) -> Result<Vec<PublicMessage>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, message_id, sender_key, content, signature, sent_at, received_at
+        SELECT id as "id!", message_id, sender_key, content, signature, sent_at, received_at
         FROM public_messages
         ORDER BY sent_at DESC
         LIMIT ?
@@ -157,7 +157,7 @@ pub async fn get_private_history(
 ) -> Result<Vec<PrivateMessage>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, message_id, peer_key, direction, encrypted_blob,
+        SELECT id as "id!", message_id, peer_key, direction, encrypted_blob,
                sent_at, received_at, is_read
         FROM private_messages
         WHERE peer_key = ?
@@ -206,7 +206,7 @@ pub async fn mark_read(pool: &DbPool, peer_key: &str) -> Result<u64> {
 pub async fn unread_count(pool: &DbPool, peer_key: &str) -> Result<i64> {
     let row = sqlx::query!(
         r#"
-        SELECT COUNT(1) as cnt
+        SELECT COUNT(1) as "cnt: i64"
         FROM private_messages
         WHERE peer_key = ? AND direction = 'in' AND is_read = 0
         "#,

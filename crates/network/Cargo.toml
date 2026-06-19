@@ -18,6 +18,9 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Время
+chrono = { workspace = true }
+
 # Ошибки
 thiserror = { workspace = true }
 

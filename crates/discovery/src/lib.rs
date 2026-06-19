@@ -1,4 +1,5 @@
 pub mod error;
+pub mod local_discovery;
 pub mod mdns;
 pub mod peer_list;
 pub mod udp_broadcast;

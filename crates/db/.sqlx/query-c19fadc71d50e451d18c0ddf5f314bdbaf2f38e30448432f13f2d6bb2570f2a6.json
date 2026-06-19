@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id as \"id!\", message_id, sender_key, content, signature, sent_at, received_at\n        FROM public_messages\n        ORDER BY sent_at DESC\n        LIMIT ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Int64"
+      },
+      {
+        "name": "message_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "sender_key",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "content",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "signature",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "sent_at",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "received_at",
+        "ordinal": 6,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c19fadc71d50e451d18c0ddf5f314bdbaf2f38e30448432f13f2d6bb2570f2a6"
+}

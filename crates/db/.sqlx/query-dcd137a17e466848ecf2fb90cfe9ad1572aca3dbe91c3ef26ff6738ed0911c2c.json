@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE private_messages\n        SET is_read = 1\n        WHERE peer_key = ? AND direction = 'in' AND is_read = 0\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "dcd137a17e466848ecf2fb90cfe9ad1572aca3dbe91c3ef26ff6738ed0911c2c"
+}

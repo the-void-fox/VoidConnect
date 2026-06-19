@@ -37,6 +37,27 @@ pub struct PeerInfo {
     pub last_seen: i64,
 }
 
+/// Профиль узла — расширенные данные, которыми узлы обмениваются напрямую.
+/// Не хранится в mDNS/UDP (слишком объёмно), передаётся через TCP-чат при подключении.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PeerProfile {
+    pub node_id:     NodeId,
+    pub name:        String,
+    pub description: String,
+    /// "online" | "away" | "busy" | "offline"
+    pub status:      String,
+    /// X25519 публичный ключ (hex) для E2E шифрования личных сообщений.
+    /// None = старый узел без поддержки DM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc_pubkey:  Option<String>,
+}
+
+impl PeerProfile {
+    pub fn new(node_id: NodeId, name: String) -> Self {
+        PeerProfile { node_id, name, description: String::new(), status: "online".into(), enc_pubkey: None }
+    }
+}
+
 impl PeerInfo {
     /// Адрес для подключения в формате "ip:port"
     pub fn addr(&self) -> String {
