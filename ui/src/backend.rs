@@ -2,13 +2,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
 use void_chat::public_chat::{start_public_chat, ChatMessage};
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd};
-use void_crypto::keys::EncryptionKeypair;
+use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_discovery::PeerList;
 
 pub struct BackendHandle {
@@ -39,6 +40,9 @@ pub struct BackendHandle {
     pub dm_sender:     tokio::sync::mpsc::UnboundedSender<DmSendCmd>,
     /// DM-порт нашего узла = base_port + 3
     pub dm_port:       u16,
+    /// История общего чата, загруженная из БД при старте.
+    /// `None` пока бэкенд не загрузил; GUI забирает её один раз (`take`).
+    pub chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>,
 }
 
 pub fn start_backend(
@@ -47,11 +51,14 @@ pub fn start_backend(
     my_id:      NodeId,
     local_mode: bool,
     enc_kp:     Arc<EncryptionKeypair>,
+    sign_kp:    Arc<SigningKeypair>,
+    data_dir:   PathBuf,
 ) -> BackendHandle {
     let chat_inbox:    Arc<Mutex<VecDeque<ChatMessage>>>         = Arc::new(Mutex::new(VecDeque::new()));
     let peers:         Arc<Mutex<Vec<PeerInfo>>>                  = Arc::new(Mutex::new(Vec::new()));
     let peer_profiles: Arc<Mutex<HashMap<NodeId, PeerProfile>>>  = Arc::new(Mutex::new(HashMap::new()));
     let dm_inbox:      Arc<Mutex<VecDeque<IncomingDm>>>          = Arc::new(Mutex::new(VecDeque::new()));
+    let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
 
     let (chat_tx,    chat_rx)    = tokio::sync::mpsc::unbounded_channel::<String>();
     let (connect_tx, connect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -87,6 +94,8 @@ pub fn start_backend(
     let profiles_bg = Arc::clone(&peer_profiles);
     let dm_inbox_bg = Arc::clone(&dm_inbox);
     let enc_kp_bg   = Arc::clone(&enc_kp);
+    let sign_kp_bg  = Arc::clone(&sign_kp);
+    let history_bg  = Arc::clone(&chat_history);
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -94,8 +103,9 @@ pub fn start_backend(
             backend_main(
                 my_peer, base_port, local_mode,
                 inbox_bg, peers_bg, profiles_bg, dm_inbox_bg,
-                enc_kp_bg, dm_port,
+                enc_kp_bg, sign_kp_bg, dm_port,
                 chat_rx, connect_rx, profile_rx, dm_rx,
+                data_dir, history_bg,
             ).await;
         });
     });
@@ -119,6 +129,7 @@ pub fn start_backend(
         dm_inbox,
         dm_sender: dm_tx,
         dm_port,
+        chat_history,
     }
 }
 
@@ -134,12 +145,38 @@ async fn backend_main(
     profiles_out: Arc<Mutex<HashMap<NodeId, PeerProfile>>>,
     dm_inbox:    Arc<Mutex<VecDeque<IncomingDm>>>,
     enc_kp:      Arc<EncryptionKeypair>,
+    sign_kp:     Arc<SigningKeypair>,
     dm_port:     u16,
     mut chat_rx:    tokio::sync::mpsc::UnboundedReceiver<String>,
     mut connect_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     mut profile_rx: tokio::sync::mpsc::UnboundedReceiver<PeerProfile>,
     mut dm_rx:      tokio::sync::mpsc::UnboundedReceiver<DmSendCmd>,
+    data_dir:       PathBuf,
+    chat_history_out: Arc<Mutex<Option<Vec<ChatMessage>>>>,
 ) {
+    // Открываем БД для персистентности истории общего чата.
+    // При ошибке работаем без персистентности — это не критично для чата.
+    let db_pool: Option<void_db::DbPool> = match void_db::open(&data_dir.join("void.db")).await {
+        Ok(pool) => {
+            tracing::info!("DB opened at {}", data_dir.join("void.db").display());
+            Some(pool)
+        }
+        Err(e) => {
+            tracing::error!("DB open failed — история чата не будет сохраняться: {}", e);
+            None
+        }
+    };
+
+    // Загружаем сохранённую историю общего чата и отдаём её GUI (один раз).
+    let loaded = match &db_pool {
+        Some(pool) => match void_db::messages::get_public_history(pool, 300).await {
+            Ok(rows) => rows.into_iter().rev().map(db_msg_to_chat).collect(),
+            Err(e)   => { tracing::warn!("Не удалось загрузить историю чата: {}", e); Vec::new() }
+        },
+        None => Vec::new(),
+    };
+    *chat_history_out.lock().unwrap() = Some(loaded);
+
     let peer_list = PeerList::new();
 
     if local_mode {
@@ -157,7 +194,7 @@ async fn backend_main(
         }
     }
 
-    let chat = match start_public_chat(my_peer.clone(), peer_list.clone(), my_peer.chat_port).await {
+    let chat = match start_public_chat(my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp).await {
         Ok(h)  => h,
         Err(e) => {
             tracing::error!("Chat TCP server failed on port {}: {}", my_peer.chat_port, e);
@@ -180,13 +217,20 @@ async fn backend_main(
         }
     };
 
-    // Задача: входящие публичные сообщения → inbox GUI
+    // Задача: входящие публичные сообщения → inbox GUI + персистентность в БД
     let mut rx = chat.subscribe();
     let inbox_task = Arc::clone(&inbox);
+    let pool_for_save = db_pool.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(msg) => {
+                    // Сохраняем в БД (best-effort, дедуп по message_id внутри INSERT OR IGNORE)
+                    if let Some(pool) = &pool_for_save {
+                        if let Err(e) = persist_public_message(pool, &msg).await {
+                            tracing::warn!("Не удалось сохранить сообщение чата: {}", e);
+                        }
+                    }
                     let mut q = inbox_task.lock().unwrap();
                     if q.len() > 500 { q.pop_front(); }
                     q.push_back(msg);
@@ -314,4 +358,37 @@ fn get_local_ip() -> IpAddr {
     }
     tracing::warn!("Не удалось определить LAN IP. Используется 0.0.0.0.");
     IpAddr::from([0, 0, 0, 0])
+}
+
+// ─── Персистентность истории общего чата ─────────────────────────────────────
+
+/// Сохраняет сообщение общего чата в БД. message_id = "{from}:{seq}" —
+/// детерминированный ключ для дедупликации (INSERT OR IGNORE).
+async fn persist_public_message(pool: &void_db::DbPool, msg: &ChatMessage) -> void_db::Result<()> {
+    let message_id = format!("{}:{}", msg.from.as_str(), msg.seq);
+    let sent_at = chrono::DateTime::from_timestamp(msg.timestamp, 0)
+        .unwrap_or_else(chrono::Utc::now);
+    void_db::messages::save_public_message(
+        pool,
+        &message_id,
+        msg.from.as_str(),
+        &msg.from_name,
+        &msg.text,
+        msg.signature.as_deref().unwrap_or(""),
+        sent_at,
+    )
+    .await
+}
+
+/// Преобразует запись из БД в ChatMessage для GUI.
+/// seq не хранится (для отображения истории не нужен) → 0.
+fn db_msg_to_chat(m: void_db::messages::PublicMessage) -> ChatMessage {
+    ChatMessage {
+        from:      NodeId(m.sender_key),
+        from_name: m.sender_name,
+        text:      m.content,
+        timestamp: m.sent_at.timestamp(),
+        seq:       0,
+        signature: if m.signature.is_empty() { None } else { Some(m.signature) },
+    }
 }

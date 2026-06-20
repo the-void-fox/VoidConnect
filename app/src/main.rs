@@ -1,8 +1,10 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, Service};
+use void_crypto::keys::SigningKeypair;
 use void_discovery::{
     mdns::start_mdns,
     udp_broadcast::start_udp_broadcast,
@@ -41,7 +43,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Void Connect as '{}' (port={}, chat_port={})", name, base_port, chat_port);
 
-    let my_id = generate_temp_id();
+    // Ключ подписи: его публичная часть становится нашим NodeId,
+    // чтобы получатели могли проверять подписи наших сообщений.
+    let signing_kp = Arc::new(SigningKeypair::generate());
+    let my_id = NodeId::from_public_key_bytes(&signing_kp.public_bytes());
     let my_ip  = IpAddr::from([127, 0, 0, 1]);
 
     let my_peer = PeerInfo {
@@ -81,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     // Передаём base_port чтобы второй экземпляр не конфликтовал на 7701
     start_udp_broadcast(my_peer.clone(), peer_list.clone(), base_port).await?;
 
-    let chat = start_public_chat(my_peer.clone(), peer_list.clone(), chat_port).await?;
+    let chat = start_public_chat(my_peer.clone(), peer_list.clone(), chat_port, signing_kp).await?;
 
     // Входящие сообщения → консоль
     let mut rx = chat.subscribe();
@@ -144,11 +149,4 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn generate_temp_id() -> NodeId {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    NodeId::from_public_key_bytes(&bytes)
 }

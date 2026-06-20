@@ -67,8 +67,9 @@ CREATE INDEX IF NOT EXISTS idx_reports_target ON reputation_reports (target_key)
 -- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS public_messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id      TEXT    NOT NULL UNIQUE,         -- UUID от отправителя (дедупликация)
+    message_id      TEXT    NOT NULL UNIQUE,         -- "{sender_key}:{seq}" (дедупликация)
     sender_key      TEXT    NOT NULL,                -- public key отправителя
+    sender_name     TEXT    NOT NULL DEFAULT '',     -- отображаемое имя на момент отправки
     content         TEXT    NOT NULL,
     signature       TEXT    NOT NULL,                -- подпись сообщения
     sent_at         TEXT    NOT NULL,                -- время по часам отправителя

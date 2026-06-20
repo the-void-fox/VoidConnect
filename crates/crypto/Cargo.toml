@@ -31,3 +31,6 @@ thiserror      = { workspace = true }
 
 # Zeroize — обнуление секретов в памяти после использования
 zeroize        = { workspace = true }
+
+[dev-dependencies]
+tempfile       = { workspace = true }

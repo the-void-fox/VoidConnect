@@ -400,3 +400,197 @@ async fn read_dm_pkt(rd: &mut OwnedReadHalf) -> anyhow::Result<DmPacket> {
     rd.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
 }
+
+// ── Тесты ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+    use void_core::peer::Service;
+
+    /// Берёт свободный TCP-порт на loopback (закрывая временный листенер).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn node_id(seed: u8) -> NodeId {
+        NodeId::from_public_key_bytes(&[seed; 32])
+    }
+
+    fn test_peer(name: &str, id_seed: u8, dm_port: u16) -> PeerInfo {
+        PeerInfo {
+            id:        node_id(id_seed),
+            name:      name.to_string(),
+            ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
+            // base_port/chat_port не используются DM-сервером (он слушает dm_port),
+            // но заполняем правдоподобно: dm_port = base + 3
+            port:      dm_port.wrapping_sub(3),
+            chat_port: dm_port.wrapping_sub(1),
+            services:  vec![Service::Chat],
+            last_seen: 0,
+        }
+    }
+
+    /// Запускает узел DM-чата на заданном порту.
+    async fn start_node(
+        name: &str,
+        id_seed: u8,
+        dm_port: u16,
+    ) -> (PrivateChatHandle, Arc<EncryptionKeypair>, NodeId) {
+        let kp = Arc::new(EncryptionKeypair::generate());
+        let peer = test_peer(name, id_seed, dm_port);
+        let id = peer.id.clone();
+        let handle = start_private_chat(peer, Arc::clone(&kp), dm_port)
+            .await
+            .expect("start_private_chat");
+        (handle, kp, id)
+    }
+
+    /// Сквозной сценарий: Alice шифрует и отправляет DM → Bob получает расшифрованный текст.
+    #[tokio::test]
+    async fn dm_delivered_and_decrypted() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (alice, _a_kp, a_id) = start_node("alice", 1, a_port).await;
+        let (bob, b_kp, b_id) = start_node("bob", 2, b_port).await;
+
+        let mut bob_rx = bob.subscribe();
+
+        // Ждём, пока DM-сервер Боба забиндится.
+        sleep(Duration::from_millis(300)).await;
+
+        alice
+            .send_dm(DmSendCmd {
+                to:               b_id.clone(),
+                to_dm_addr:       format!("127.0.0.1:{}", b_port),
+                their_enc_pubkey: b_kp.public_bytes(),
+                plaintext:        "привет, Боб 🔒".into(),
+                message_id:       "m1".into(),
+            })
+            .await
+            .expect("send_dm");
+
+        let dm = timeout(Duration::from_secs(3), bob_rx.recv())
+            .await
+            .expect("таймаут ожидания DM")
+            .expect("broadcast закрыт");
+
+        assert_eq!(dm.plaintext, "привет, Боб 🔒");
+        assert_eq!(dm.from, a_id, "from должен быть NodeId Алисы");
+        assert_eq!(dm.message_id, "m1");
+    }
+
+    /// Двунаправленный обмен: Bob отвечает Alice, используя enc_pubkey,
+    /// закэшированный во время handshake (проверяет known_pubkey + переиспользование).
+    #[tokio::test]
+    async fn dm_bidirectional_reply() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (alice, a_kp, a_id) = start_node("alice", 1, a_port).await;
+        let (bob, b_kp, b_id) = start_node("bob", 2, b_port).await;
+
+        let mut alice_rx = alice.subscribe();
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        // Alice → Bob
+        alice
+            .send_dm(DmSendCmd {
+                to:               b_id.clone(),
+                to_dm_addr:       format!("127.0.0.1:{}", b_port),
+                their_enc_pubkey: b_kp.public_bytes(),
+                plaintext:        "ping".into(),
+                message_id:       "m1".into(),
+            })
+            .await
+            .expect("send ping");
+
+        let ping = timeout(Duration::from_secs(3), bob_rx.recv())
+            .await
+            .expect("таймаут ping")
+            .unwrap();
+        assert_eq!(ping.plaintext, "ping");
+
+        // Bob должен был закэшировать enc_pubkey Алисы во время handshake.
+        let a_pub = bob
+            .known_pubkey(&a_id)
+            .await
+            .expect("enc_pubkey Алисы закэширован у Боба");
+        assert_eq!(a_pub, a_kp.public_bytes());
+
+        // Bob → Alice (ответ)
+        bob.send_dm(DmSendCmd {
+            to:               a_id.clone(),
+            to_dm_addr:       format!("127.0.0.1:{}", a_port),
+            their_enc_pubkey: a_pub,
+            plaintext:        "pong".into(),
+            message_id:       "m2".into(),
+        })
+        .await
+        .expect("send pong");
+
+        let pong = timeout(Duration::from_secs(3), alice_rx.recv())
+            .await
+            .expect("таймаут pong")
+            .unwrap();
+        assert_eq!(pong.plaintext, "pong");
+        assert_eq!(pong.from, b_id);
+    }
+
+    /// Несколько сообщений подряд по одному соединению доставляются по порядку.
+    #[tokio::test]
+    async fn dm_multiple_messages_reuse_connection() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (alice, _a_kp, _a_id) = start_node("alice", 1, a_port).await;
+        let (bob, b_kp, b_id) = start_node("bob", 2, b_port).await;
+
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        for i in 0..5 {
+            alice
+                .send_dm(DmSendCmd {
+                    to:               b_id.clone(),
+                    to_dm_addr:       format!("127.0.0.1:{}", b_port),
+                    their_enc_pubkey: b_kp.public_bytes(),
+                    plaintext:        format!("msg-{i}"),
+                    message_id:       format!("m{i}"),
+                })
+                .await
+                .expect("send_dm");
+        }
+
+        for i in 0..5 {
+            let dm = timeout(Duration::from_secs(3), bob_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("таймаут на сообщении {i}"))
+                .unwrap();
+            assert_eq!(dm.plaintext, format!("msg-{i}"));
+        }
+    }
+
+    /// Сериализация протокольных пакетов: roundtrip + неизвестный тип → Unknown.
+    #[test]
+    fn dm_packet_serde_roundtrip() {
+        let hello = DmPacket::Hello {
+            node_id:    node_id(7),
+            name:       "alice".into(),
+            enc_pubkey: "deadbeef".into(),
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        let back: DmPacket = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, DmPacket::Hello { .. }));
+
+        // Пакет неизвестного типа от будущей версии не должен ломать парсинг.
+        let unknown: DmPacket = serde_json::from_str(r#"{"kind":"from_the_future"}"#).unwrap();
+        assert!(matches!(unknown, DmPacket::Unknown));
+    }
+}

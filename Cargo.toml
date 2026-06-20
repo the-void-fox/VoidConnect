@@ -63,6 +63,9 @@ rand = "0.8"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 
+# Тесты
+tempfile = "3"
+
 #egui
 eframe = { version = "0.27", features = ["default"] }
 egui = "0.27"

@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicMessage {
     pub id: i64,
-    pub message_id: String,   // UUID от отправителя
+    pub message_id: String,   // "{sender_key}:{seq}"
     pub sender_key: String,
+    pub sender_name: String,
     pub content: String,
     pub signature: String,
     pub sent_at: DateTime<Utc>,
@@ -54,6 +55,7 @@ pub async fn save_public_message(
     pool: &DbPool,
     message_id: &str,
     sender_key: &str,
+    sender_name: &str,
     content: &str,
     signature: &str,
     sent_at: DateTime<Utc>,
@@ -62,11 +64,12 @@ pub async fn save_public_message(
     sqlx::query!(
         r#"
         INSERT OR IGNORE INTO public_messages
-            (message_id, sender_key, content, signature, sent_at)
-        VALUES (?, ?, ?, ?, ?)
+            (message_id, sender_key, sender_name, content, signature, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         "#,
         message_id,
         sender_key,
+        sender_name,
         content,
         signature,
         sent,
@@ -81,7 +84,7 @@ pub async fn save_public_message(
 pub async fn get_public_history(pool: &DbPool, limit: i64) -> Result<Vec<PublicMessage>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id as "id!", message_id, sender_key, content, signature, sent_at, received_at
+        SELECT id as "id!", message_id, sender_key, sender_name, content, signature, sent_at, received_at
         FROM public_messages
         ORDER BY sent_at DESC
         LIMIT ?
@@ -97,6 +100,7 @@ pub async fn get_public_history(pool: &DbPool, limit: i64) -> Result<Vec<PublicM
             id: r.id,
             message_id: r.message_id,
             sender_key: r.sender_key,
+            sender_name: r.sender_name,
             content: r.content,
             signature: r.signature,
             sent_at: r.sent_at.parse().unwrap_or_else(|_| Utc::now()),
@@ -216,4 +220,99 @@ pub async fn unread_count(pool: &DbPool, peer_key: &str) -> Result<i64> {
     .await?;
 
     Ok(row.cnt)
+}
+
+// ─── Тесты ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{open, DbPool};
+
+    async fn temp_db() -> (tempfile::TempDir, DbPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("test.db")).await.expect("open db");
+        (dir, pool)
+    }
+
+    /// Сообщение сохраняется и читается обратно с сохранением имени отправителя;
+    /// повторная вставка того же message_id игнорируется (дедупликация).
+    #[tokio::test]
+    async fn public_message_roundtrip_and_dedup() {
+        let (_dir, pool) = temp_db().await;
+        let t = Utc::now();
+
+        save_public_message(&pool, "k:1", "k", "Алиса", "привет", "sig", t).await.unwrap();
+        // Тот же message_id — должен быть проигнорирован.
+        save_public_message(&pool, "k:1", "k", "Алиса", "дубль", "sig", t).await.unwrap();
+        save_public_message(&pool, "k:2", "k", "Алиса", "второе", "sig",
+            t + chrono::Duration::seconds(1)).await.unwrap();
+
+        let hist = get_public_history(&pool, 10).await.unwrap();
+        assert_eq!(hist.len(), 2, "дубль по message_id не должен добавляться");
+        // get_public_history возвращает новые первыми (ORDER BY sent_at DESC)
+        assert_eq!(hist[0].content, "второе");
+        assert_eq!(hist[1].content, "привет");
+        assert_eq!(hist[0].sender_name, "Алиса", "имя отправителя должно сохраняться");
+        assert!(hist.iter().all(|m| m.sender_key == "k"));
+    }
+
+    /// История переживает «перезапуск»: повторное открытие того же файла БД
+    /// возвращает ранее сохранённые сообщения.
+    #[tokio::test]
+    async fn history_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let pool = open(&path).await.unwrap();
+            save_public_message(&pool, "k:1", "k", "n", "до перезапуска", "s", Utc::now())
+                .await.unwrap();
+        }
+        // Новое подключение к тому же файлу — данные на месте.
+        let pool2 = open(&path).await.unwrap();
+        let hist = get_public_history(&pool2, 10).await.unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].content, "до перезапуска");
+    }
+
+    #[tokio::test]
+    async fn public_history_respects_limit() {
+        let (_dir, pool) = temp_db().await;
+        for i in 0..5 {
+            save_public_message(&pool, &format!("k:{i}"), "k", "n", &format!("m{i}"), "s",
+                Utc::now() + chrono::Duration::seconds(i)).await.unwrap();
+        }
+        assert_eq!(get_public_history(&pool, 3).await.unwrap().len(), 3);
+        assert_eq!(get_public_history(&pool, 100).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn public_message_exists_works() {
+        let (_dir, pool) = temp_db().await;
+        assert!(!public_message_exists(&pool, "k:1").await.unwrap());
+        save_public_message(&pool, "k:1", "k", "n", "x", "s", Utc::now()).await.unwrap();
+        assert!(public_message_exists(&pool, "k:1").await.unwrap());
+    }
+
+    /// Личные сообщения: сохранение, выборка по собеседнику, счётчик непрочитанных
+    /// и пометка прочитанными.
+    #[tokio::test]
+    async fn private_messages_roundtrip_and_unread() {
+        let (_dir, pool) = temp_db().await;
+        let t = Utc::now();
+
+        save_private_message(&pool, "m1", "peerA", Direction::In, b"blob1", t).await.unwrap();
+        save_private_message(&pool, "m2", "peerA", Direction::Out, b"blob2",
+            t + chrono::Duration::seconds(1)).await.unwrap();
+        save_private_message(&pool, "m3", "peerB", Direction::In, b"blob3", t).await.unwrap();
+
+        let conv = get_private_history(&pool, "peerA", 10).await.unwrap();
+        assert_eq!(conv.len(), 2, "только переписка с peerA");
+
+        // Непрочитано от peerA: одно входящее (m1).
+        assert_eq!(unread_count(&pool, "peerA").await.unwrap(), 1);
+        mark_read(&pool, "peerA").await.unwrap();
+        assert_eq!(unread_count(&pool, "peerA").await.unwrap(), 0);
+    }
 }

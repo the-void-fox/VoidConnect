@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 void-core    = { path = "../crates/core" }
+void-crypto  = { path = "../crates/crypto" }
 void-discovery = { path = "../crates/discovery" }
 void-chat = { path = "../crates/chat" }
 

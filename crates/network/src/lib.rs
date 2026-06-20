@@ -24,7 +24,7 @@ const EVENT_BUFFER: usize = 1024;
 /// `peer_list` — разделяемый список из крейта discovery; Router будет его обновлять.
 ///
 /// # Пример
-/// ```rust
+/// ```ignore
 /// let peer_list = PeerList::new();
 /// let router = network::start(my_peer, peer_list.clone(), 7777).await?;
 /// ```

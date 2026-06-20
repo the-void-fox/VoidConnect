@@ -57,6 +57,8 @@ pub struct VoidApp {
     pub graph:        Graph,
     pub backend:      BackendHandle,
     peer_count:       usize,
+    /// Подгружена ли уже история общего чата из БД (делается один раз).
+    history_loaded:   bool,
 }
 
 impl VoidApp {
@@ -106,12 +108,14 @@ impl VoidApp {
             graph,
             backend,
             peer_count: 0,
+            history_loaded: false,
         }
     }
 }
 
 impl eframe::App for VoidApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.load_chat_history_once();
         self.poll_chat();
         self.poll_private_chat();
         self.refresh_peers();
@@ -178,6 +182,32 @@ impl VoidApp {
         };
         self.private.open_conversation(peer_id, peer_name);
         self.current_page = Page::Private;
+    }
+
+    /// Один раз подгружает историю общего чата из БД, как только бэкенд её
+    /// загрузил. В отличие от poll_chat, показывает и наши собственные прошлые
+    /// сообщения (is_me) — оптимистичного дублирования здесь нет.
+    fn load_chat_history_once(&mut self) {
+        if self.history_loaded {
+            return;
+        }
+        let history = self.backend.chat_history.lock().unwrap().take();
+        if let Some(history) = history {
+            for msg in history {
+                let is_me = msg.from.as_str() == self.backend.my_id_full;
+                let time = chrono::DateTime::from_timestamp(msg.timestamp, 0)
+                    .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%H:%M").to_string())
+                    .unwrap_or_default();
+                self.chat.receive_message(crate::pages::chat::ChatMessage {
+                    author:  msg.from_name.clone(),
+                    text:    msg.text.clone(),
+                    time,
+                    is_me,
+                    from_id: Some(msg.from.clone()),
+                });
+            }
+            self.history_loaded = true;
+        }
     }
 
     fn poll_chat(&mut self) {

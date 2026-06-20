@@ -74,3 +74,60 @@ impl PeerInfo {
         now - self.last_seen < 60
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::NodeId;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn sample(last_seen: i64) -> PeerInfo {
+        PeerInfo {
+            id:        NodeId("id".into()),
+            name:      "bob".into(),
+            ip:        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 7)),
+            port:      7700,
+            chat_port: 7702,
+            services:  vec![Service::Chat],
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn addr_helpers_format_ip_and_ports() {
+        let p = sample(0);
+        assert_eq!(p.addr(), "192.168.0.7:7700");
+        assert_eq!(p.chat_addr(), "192.168.0.7:7702");
+    }
+
+    #[test]
+    fn is_alive_boundary() {
+        let p = sample(1_000);
+        assert!(p.is_alive(1_000));          // только что
+        assert!(p.is_alive(1_059));          // 59 c назад — ещё жив
+        assert!(!p.is_alive(1_060));         // ровно 60 c — уже нет
+        assert!(!p.is_alive(2_000));
+    }
+
+    #[test]
+    fn profile_new_defaults() {
+        let prof = PeerProfile::new(NodeId("x".into()), "alice".into());
+        assert_eq!(prof.status, "online");
+        assert!(prof.description.is_empty());
+        assert!(prof.enc_pubkey.is_none());
+    }
+
+    #[test]
+    fn profile_omits_none_enc_pubkey_in_json() {
+        // enc_pubkey = None не должен попадать в JSON (skip_serializing_if).
+        let prof = PeerProfile::new(NodeId("x".into()), "alice".into());
+        let json = serde_json::to_string(&prof).unwrap();
+        assert!(!json.contains("enc_pubkey"));
+
+        // А round-trip с Some — сохраняется.
+        let mut prof2 = prof.clone();
+        prof2.enc_pubkey = Some("deadbeef".into());
+        let back: PeerProfile = serde_json::from_str(&serde_json::to_string(&prof2).unwrap()).unwrap();
+        assert_eq!(back.enc_pubkey.as_deref(), Some("deadbeef"));
+    }
+}

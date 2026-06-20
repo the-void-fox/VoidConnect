@@ -42,7 +42,7 @@ pub struct RouterEvent {
 /// Получает события от ConnectionManager и раздаёт их подписчикам.
 ///
 /// Архитектура:
-/// ```
+/// ```text
 /// ConnectionManager --ConnectionEvent--> Router --RouterEvent--> subscribers
 /// ```
 ///
@@ -90,7 +90,7 @@ impl Router {
     /// Возвращает Receiver для чтения событий.
     ///
     /// Пример:
-    /// ```rust
+    /// ```ignore
     /// let mut rx = router.subscribe(MessageKind::Chat, 128).await;
     /// while let Some(event) = rx.recv().await {
     ///     // обработка сообщений чата

@@ -24,6 +24,17 @@ fn main() -> eframe::Result<()> {
     // Parse flags: --local / -l can appear anywhere in args
     let local_mode = args.iter().any(|a| a == "--local" || a == "-l");
 
+    // Папка данных: --data-dir=PATH или env VOID_DATA_DIR (по умолчанию ~/.config/void-connect).
+    // Удобно для запуска нескольких инстансов на одной машине — у каждого свои
+    // ключи, профиль, void.db и история DM. Должно быть задано ДО profile_dir().
+    let data_dir_override = args.iter()
+        .find_map(|a| a.strip_prefix("--data-dir="))
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("VOID_DATA_DIR").ok().map(std::path::PathBuf::from));
+    if let Some(dir) = data_dir_override {
+        profile_store::set_data_dir(dir);
+    }
+
     // Positional args (skip flags)
     let positional: Vec<&str> = args.iter().skip(1)
         .filter(|a| !a.starts_with('-'))
@@ -56,10 +67,12 @@ fn main() -> eframe::Result<()> {
     saved.node_id = identity.id.as_str().to_string();
     profile_store::save_profile(&saved).ok();
 
-    // Оборачиваем EncryptionKeypair в Arc, чтобы шарить между backend и GUI
+    // Оборачиваем keypair'ы в Arc, чтобы шарить между backend и GUI.
     let enc_kp = std::sync::Arc::new(identity.encryption);
+    // Ключ подписи сообщений общего чата (его pubkey == node_id).
+    let sign_kp = std::sync::Arc::new(identity.signing);
 
-    let backend = backend::start_backend(name, base_port, node_id, local_mode, enc_kp);
+    let backend = backend::start_backend(name, base_port, node_id, local_mode, enc_kp, sign_kp, data_dir);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

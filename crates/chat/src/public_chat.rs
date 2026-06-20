@@ -22,6 +22,8 @@ use tracing::{debug, error, info, warn};
 
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
+use void_crypto::keys::SigningKeypair;
+use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
 
 const MAX_MESSAGE_LEN: usize = 65536;
@@ -75,6 +77,9 @@ struct PublicChatInner {
     my_peer:     PeerInfo,
     peer_list:   PeerList,
     chat_port:   u16,
+    /// Ключ подписи исходящих сообщений. Его публичная часть должна
+    /// совпадать с `my_peer.id` (NodeId = hex(Ed25519 pubkey)).
+    signing_kp:  Arc<SigningKeypair>,
     incoming_tx: broadcast::Sender<ChatMessage>,
     history:     Mutex<VecDeque<ChatMessage>>,
     seq_counter: Mutex<u64>,
@@ -95,11 +100,11 @@ struct PublicChatInner {
 }
 
 impl PublicChat {
-    fn new(my_peer: PeerInfo, peer_list: PeerList, chat_port: u16) -> Self {
+    fn new(my_peer: PeerInfo, peer_list: PeerList, chat_port: u16, signing_kp: Arc<SigningKeypair>) -> Self {
         let (incoming_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
-                my_peer, peer_list, chat_port, incoming_tx,
+                my_peer, peer_list, chat_port, signing_kp, incoming_tx,
                 history:     Mutex::new(VecDeque::with_capacity(100)),
                 seq_counter: Mutex::new(0),
                 seen:        Mutex::new(HashSet::new()),
@@ -147,8 +152,9 @@ pub async fn start_public_chat(
     my_peer: PeerInfo,
     peer_list: PeerList,
     chat_port: u16,
+    signing_kp: Arc<SigningKeypair>,
 ) -> anyhow::Result<ChatHandle> {
-    let chat = PublicChat::new(my_peer, peer_list, chat_port);
+    let chat = PublicChat::new(my_peer, peer_list, chat_port, signing_kp);
 
     let c = chat.clone();
     tokio::spawn(async move {
@@ -304,8 +310,43 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
 
 // ─── Обработка входящих данных ────────────────────────────────────────────────
 
+/// Канонические байты сообщения для подписи/проверки.
+/// Привязывает отправителя, порядковый номер, время и текст.
+fn message_signing_bytes(from: &NodeId, seq: u64, timestamp: i64, text: &str) -> Vec<u8> {
+    format!("{}\n{}\n{}\n{}", from.as_str(), seq, timestamp, text).into_bytes()
+}
+
 impl PublicChat {
+    /// Подписывает исходящее сообщение нашим Ed25519-ключом.
+    fn sign_message(&self, msg: &mut ChatMessage) {
+        let bytes = message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.text);
+        match SignedMessage::sign(bytes, &self.inner.signing_kp) {
+            Ok(signed) => msg.signature = Some(signed.signature),
+            Err(e) => warn!("Failed to sign chat message: {:?}", e),
+        }
+    }
+
+    /// Проверяет подпись входящего сообщения ключом, выведенным из `from`
+    /// (NodeId == hex(Ed25519 pubkey)). Сообщения без подписи или с неверной
+    /// подписью отбрасываются — это защита от подмены отправителя.
+    fn verify_message(&self, msg: &ChatMessage) -> bool {
+        let Some(signature) = msg.signature.clone() else {
+            return false;
+        };
+        let signed = SignedMessage {
+            payload:   message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.text),
+            signature,
+            signer:    msg.from.as_str().to_string(),
+        };
+        signed.verify().is_ok()
+    }
+
     async fn handle_incoming(&self, msg: ChatMessage) {
+        if !self.verify_message(&msg) {
+            warn!("Отброшено сообщение с неверной/отсутствующей подписью от {}", msg.from);
+            return;
+        }
+
         let key = (msg.from.as_str().to_string(), msg.seq);
         {
             let mut seen = self.inner.seen.lock().await;
@@ -368,7 +409,8 @@ impl PublicChat {
                 .unwrap_or_else(|| self.inner.my_peer.name.clone())
         };
 
-        let msg = ChatMessage::new(self.inner.my_peer.id.clone(), my_name, text, seq);
+        let mut msg = ChatMessage::new(self.inner.my_peer.id.clone(), my_name, text, seq);
+        self.sign_message(&mut msg);
 
         let is_relay = self.inner.relay.read().await.is_none();
         if is_relay {
@@ -394,96 +436,114 @@ impl PublicChat {
 
 async fn relay_manager(chat: PublicChat) {
     let mut interval = tokio::time::interval(Duration::from_secs(3));
-    loop {
-        interval.tick().await;
+    interval.tick().await; // поглощаем немедленный первый тик
+    let changes = chat.inner.peer_list.subscribe_changes();
 
-        let peers = chat.inner.peer_list.all().await;
-        if peers.is_empty() {
-            continue;
+    loop {
+        relay_pass(&chat).await;
+
+        // Реагируем сразу на изменение состава пиров (апгрейд stub→real,
+        // подключение/отключение узла), а не дожидаясь следующего тика —
+        // это убирает ~3-секундное окно релей-флаппинга. Между изменениями
+        // работает периодическая проверка живости соединения.
+        let notified = changes.notified();
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = notified => {
+                debug!("relay_manager: состав пиров изменился — немедленный перевыбор");
+            }
+        }
+    }
+}
+
+/// Один проход: выбирает ретранслятор и при необходимости (пере)подключается.
+async fn relay_pass(chat: &PublicChat) {
+    let peers = chat.inner.peer_list.all().await;
+    if peers.is_empty() {
+        return;
+    }
+
+    let my_id = chat.inner.my_peer.id.as_str().to_string();
+    let real_peers: Vec<_> = peers.iter()
+        .filter(|p| p.id.as_str().len() == 64)
+        .collect();
+
+    let elected = if real_peers.is_empty() {
+        peers[0].id.as_str().to_string()
+    } else {
+        let mut candidates: Vec<String> = real_peers.iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+        candidates.push(my_id.clone());
+        candidates.sort();
+        candidates.into_iter().next().unwrap()
+    };
+
+    if elected == my_id {
+        let was_client = chat.inner.relay.read().await.is_some();
+        if was_client {
+            info!("I am now the relay (transitioned from client)");
+            *chat.inner.relay.write().await = None;
+            *chat.inner.outbox_tx.lock().await = None;
+        } else {
+            debug!("Relay check: I am the relay, {} client(s) connected",
+                chat.inner.clients.lock().await.len());
+        }
+    } else {
+        let relay_id  = NodeId(elected.clone());
+        let current   = chat.inner.relay.read().await.clone();
+
+        let peer = match peers.iter().find(|p| p.id.as_str() == elected) {
+            Some(p) => p.clone(),
+            None    => {
+                warn!("Elected relay {} not found in peer_list", &elected[..8.min(elected.len())]);
+                return;
+            }
+        };
+        let relay_addr = peer.chat_addr();
+
+        if current.as_ref() == Some(&relay_id) {
+            let alive = chat.inner.outbox_tx.lock().await.as_ref()
+                .map(|tx| !tx.is_closed())
+                .unwrap_or(false);
+            if alive {
+                debug!("Relay connection alive: {} ({})", &elected[..8.min(elected.len())], relay_addr);
+                return;
+            }
+            info!("Relay connection lost — reconnecting to {} ({})", &elected[..8.min(elected.len())], relay_addr);
+        } else {
+            info!("Elected new relay: id={}... addr={}", &elected[..8.min(elected.len())], relay_addr);
         }
 
-        let my_id = chat.inner.my_peer.id.as_str().to_string();
-        let real_peers: Vec<_> = peers.iter()
-            .filter(|p| p.id.as_str().len() == 64)
-            .collect();
+        match connect_to_relay(chat, peer).await {
+            Ok(tx) => {
+                let cgen = chat.inner.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                *chat.inner.relay.write().await    = Some(relay_id);
+                *chat.inner.outbox_tx.lock().await = Some(tx.clone());
+                info!("Connected to relay {} ({}) cgen={}", &elected[..8.min(elected.len())], relay_addr, cgen);
 
-        let elected = if real_peers.is_empty() {
-            peers[0].id.as_str().to_string()
-        } else {
-            let mut candidates: Vec<String> = real_peers.iter()
-                .map(|p| p.id.as_str().to_string())
-                .collect();
-            candidates.push(my_id.clone());
-            candidates.sort();
-            candidates.into_iter().next().unwrap()
-        };
-
-        if elected == my_id {
-            let was_client = chat.inner.relay.read().await.is_some();
-            if was_client {
-                info!("I am now the relay (transitioned from client)");
-                *chat.inner.relay.write().await = None;
-                *chat.inner.outbox_tx.lock().await = None;
-            } else {
-                debug!("Relay check: I am the relay, {} client(s) connected",
-                    chat.inner.clients.lock().await.len());
-            }
-        } else {
-            let relay_id  = NodeId(elected.clone());
-            let current   = chat.inner.relay.read().await.clone();
-
-            let peer = match peers.iter().find(|p| p.id.as_str() == elected) {
-                Some(p) => p.clone(),
-                None    => {
-                    warn!("Elected relay {} not found in peer_list", &elected[..8.min(elected.len())]);
-                    continue;
-                }
-            };
-            let relay_addr = peer.chat_addr();
-
-            if current.as_ref() == Some(&relay_id) {
-                let alive = chat.inner.outbox_tx.lock().await.as_ref()
-                    .map(|tx| !tx.is_closed())
-                    .unwrap_or(false);
-                if alive {
-                    debug!("Relay connection alive: {} ({})", &elected[..8.min(elected.len())], relay_addr);
-                    continue;
-                }
-                info!("Relay connection lost — reconnecting to {} ({})", &elected[..8.min(elected.len())], relay_addr);
-            } else {
-                info!("Elected new relay: id={}... addr={}", &elected[..8.min(elected.len())], relay_addr);
-            }
-
-            match connect_to_relay(&chat, peer).await {
-                Ok(tx) => {
-                    let cgen = chat.inner.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
-                    *chat.inner.relay.write().await    = Some(relay_id);
-                    *chat.inner.outbox_tx.lock().await = Some(tx.clone());
-                    info!("Connected to relay {} ({}) cgen={}", &elected[..8.min(elected.len())], relay_addr, cgen);
-
-                    // Пинг-задача: периодически пишем в канал чтобы обнаружить обрыв
-                    let chat_ping = chat.clone();
-                    tokio::spawn(async move {
-                        let mut ivl = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
-                        ivl.tick().await; // пропускаем первый немедленный тик
-                        loop {
-                            ivl.tick().await;
-                            if tx.send(ChatPacket::Ping).await.is_err() {
-                                debug!("Ping failed (cgen={}) — relay connection dead", cgen);
-                                // Очищаем outbox только если мы всё ещё актуальное поколение
-                                let cur_gen = chat_ping.inner.conn_gen.load(Ordering::SeqCst);
-                                if cur_gen == cgen {
-                                    *chat_ping.inner.outbox_tx.lock().await = None;
-                                }
-                                break;
+                // Пинг-задача: периодически пишем в канал чтобы обнаружить обрыв
+                let chat_ping = chat.clone();
+                tokio::spawn(async move {
+                    let mut ivl = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+                    ivl.tick().await; // пропускаем первый немедленный тик
+                    loop {
+                        ivl.tick().await;
+                        if tx.send(ChatPacket::Ping).await.is_err() {
+                            debug!("Ping failed (cgen={}) — relay connection dead", cgen);
+                            // Очищаем outbox только если мы всё ещё актуальное поколение
+                            let cur_gen = chat_ping.inner.conn_gen.load(Ordering::SeqCst);
+                            if cur_gen == cgen {
+                                *chat_ping.inner.outbox_tx.lock().await = None;
                             }
-                            debug!("Ping sent to relay (cgen={})", cgen);
+                            break;
                         }
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to connect to relay {} ({}): {}", &elected[..8.min(elected.len())], relay_addr, e);
-                }
+                        debug!("Ping sent to relay (cgen={})", cgen);
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("Failed to connect to relay {} ({}): {}", &elected[..8.min(elected.len())], relay_addr, e);
             }
         }
     }
@@ -629,4 +689,203 @@ async fn read_packet_rd(rd: &mut tokio::net::tcp::OwnedReadHalf) -> anyhow::Resu
     let mut buf = vec![0u8; len];
     rd.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
+}
+
+// ─── Тесты ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+    use tokio::time::timeout;
+    use void_core::peer::Service;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn node_id(seed: u8) -> NodeId {
+        NodeId::from_public_key_bytes(&[seed; 32])
+    }
+
+    /// Детерминированный ключ подписи + соответствующий ему NodeId.
+    fn keypair(seed: u8) -> (Arc<SigningKeypair>, NodeId) {
+        let kp = Arc::new(SigningKeypair::from_seed(&[seed; 32]).unwrap());
+        let id = NodeId::from_public_key_bytes(&kp.public_bytes());
+        (kp, id)
+    }
+
+    fn test_peer(name: &str, id: NodeId, chat_port: u16) -> PeerInfo {
+        PeerInfo {
+            id,
+            name:      name.to_string(),
+            ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port:      chat_port.wrapping_sub(2),
+            chat_port,
+            services:  vec![Service::Chat],
+            last_seen: 0,
+        }
+    }
+
+    /// Ждёт в broadcast-приёмнике сообщение с заданным текстом (пропуская прочие).
+    async fn wait_for_text(rx: &mut broadcast::Receiver<ChatMessage>, text: &str, secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { return false; }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Ok(m)) if m.text == text => return true,
+                Ok(Ok(_)) => continue,             // другое сообщение — пропускаем
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Сериализация ChatPacket: roundtrip Message + неизвестный тип → Unknown.
+    #[test]
+    fn chat_packet_serde_roundtrip() {
+        let msg = ChatMessage::new(node_id(1), "alice".into(), "привет".into(), 42);
+        let json = serde_json::to_string(&ChatPacket::Message(msg)).unwrap();
+        let back: ChatPacket = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatPacket::Message(m) => {
+                assert_eq!(m.text, "привет");
+                assert_eq!(m.seq, 42);
+                assert_eq!(m.from_name, "alice");
+            }
+            other => panic!("ожидался Message, получено {other:?}"),
+        }
+
+        let unknown: ChatPacket = serde_json::from_str(r#"{"kind":"future_packet"}"#).unwrap();
+        assert!(matches!(unknown, ChatPacket::Unknown));
+    }
+
+    /// Подпись исходящего сообщения проверяется получателем; подмена любого
+    /// поля или отправителя, как и отсутствие подписи, отклоняется.
+    #[tokio::test]
+    async fn signature_roundtrip_and_tamper_detection() {
+        let (kp, id) = keypair(5);
+        let peer = test_peer("x", id.clone(), 1);
+        let chat = PublicChat::new(peer, PeerList::new(), 1, kp);
+
+        let mut msg = ChatMessage::new(id.clone(), "x".into(), "secret".into(), 1);
+        chat.sign_message(&mut msg);
+        assert!(msg.signature.is_some(), "сообщение должно быть подписано");
+        assert!(chat.verify_message(&msg), "валидная подпись должна проходить");
+
+        // Подмена текста инвалидирует подпись.
+        let mut tampered = msg.clone();
+        tampered.text = "evil".into();
+        assert!(!chat.verify_message(&tampered));
+
+        // Отсутствие подписи → отклоняется.
+        let mut unsigned = msg.clone();
+        unsigned.signature = None;
+        assert!(!chat.verify_message(&unsigned));
+
+        // Подмена отправителя (чужой NodeId) → подпись не сходится с ключом.
+        let (_other_kp, other_id) = keypair(9);
+        let mut spoofed = msg.clone();
+        spoofed.from = other_id;
+        assert!(!chat.verify_message(&spoofed));
+    }
+
+    /// Два узла: меньший по ID становится релеем, второй — клиентом.
+    /// Сообщения подписываются отправителем и проходят проверку у получателя
+    /// в обе стороны (роли определяются реальными ключами — тест к ним нейтрален).
+    #[tokio::test]
+    async fn relay_election_and_two_way_delivery() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id, a_port);
+        let b_peer = test_peer("bob", b_id, b_port);
+
+        // Каждый узел заранее знает другого (на loopback mDNS/UDP не работают).
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+
+        let mut alice_rx = alice.subscribe();
+        let mut bob_rx = bob.subscribe();
+
+        // Клиент → релей. Повторяем отправку, пока релей-соединение не установится
+        // (relay_manager опрашивает список пиров с интервалом, первое соединение
+        // может прийтись на момент до биндинга сервера релея).
+        let mut delivered = false;
+        for _ in 0..30 {
+            bob.send("from_bob".into()).await.unwrap();
+            if wait_for_text(&mut alice_rx, "from_bob", 1).await {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "релей (Alice) не получил сообщение клиента (Bob)");
+
+        // Релей → клиент.
+        alice.send("from_alice".into()).await.unwrap();
+        assert!(
+            wait_for_text(&mut bob_rx, "from_alice", 5).await,
+            "клиент (Bob) не получил сообщение релея (Alice)"
+        );
+    }
+
+    /// Три узла: сообщение от одного доходит до обоих остальных через релей
+    /// (проверяет форвардинг релея клиентам при N>2). Тест нейтрален к тому,
+    /// какой именно узел стал релеем.
+    #[tokio::test]
+    async fn three_nodes_broadcast_via_relay() {
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let (c_kp, c_id) = keypair(3);
+        let a_port = free_port();
+        let b_port = free_port();
+        let c_port = free_port();
+        let a_peer = test_peer("a", a_id, a_port);
+        let b_peer = test_peer("b", b_id, b_port);
+        let c_peer = test_peer("c", c_id, c_port);
+
+        // Каждый узел заранее знает двух других.
+        let a_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        a_pl.upsert(c_peer.clone()).await;
+        let b_pl = PeerList::new();
+        b_pl.upsert(a_peer.clone()).await;
+        b_pl.upsert(c_peer.clone()).await;
+        let c_pl = PeerList::new();
+        c_pl.upsert(a_peer.clone()).await;
+        c_pl.upsert(b_peer.clone()).await;
+
+        let a = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
+        let b = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+        let c = start_public_chat(c_peer.clone(), c_pl, c_port, c_kp).await.unwrap();
+
+        let mut b_rx = b.subscribe();
+        let mut c_rx = c.subscribe();
+
+        // Отправляем от A, пока сообщение не дойдёт и до B, и до C
+        // (с запасом на установку клиентских соединений с релеем).
+        let mut got_b = false;
+        let mut got_c = false;
+        for _ in 0..40 {
+            a.send("from_a".into()).await.unwrap();
+            if !got_b { got_b = wait_for_text(&mut b_rx, "from_a", 1).await; }
+            if !got_c { got_c = wait_for_text(&mut c_rx, "from_a", 1).await; }
+            if got_b && got_c { break; }
+        }
+        assert!(got_b, "узел B не получил сообщение от A");
+        assert!(got_c, "узел C не получил сообщение от A");
+    }
 }
