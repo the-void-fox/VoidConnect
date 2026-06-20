@@ -28,4 +28,7 @@ pub enum StorageError {
 
     #[error("transfer timeout for chunk: {0}")]
     Timeout(String),
+
+    #[error("download cancelled")]
+    Cancelled,
 }

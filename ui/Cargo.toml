@@ -18,6 +18,7 @@ void-crypto    = { path = "../crates/crypto" }
 void-discovery = { path = "../crates/discovery" }
 void-chat      = { path = "../crates/chat" }
 void-db        = { path = "../crates/db" }
+void-storage   = { path = "../crates/storage" }
 
 tokio              = { workspace = true }
 tracing            = { workspace = true }

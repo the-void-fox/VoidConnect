@@ -12,11 +12,15 @@
 //! manager.download_file(&file_id, Path::new("/tmp/output/photo.jpg")).await?;
 //! ```
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tracing::{error, info, warn};
 use void_core::identity::NodeId;
+use void_core::manifest::{ChunkMeta, FileManifest};
 use void_core::peer::PeerInfo;
 use void_db::chunks as db_chunks;
 use void_db::DbPool;
@@ -129,20 +133,131 @@ impl StorageManager {
         Ok(file_id)
     }
 
+    // ─── Манифесты (Фаза 2: обнаружение файлов в сети) ────────────────────────
+
+    /// Строит манифест файла из локальной БД — для рассылки объявления другим
+    /// узлам. Возвращает `None`, если файл неизвестен.
+    pub async fn file_manifest(&self, file_id: &str) -> Result<Option<FileManifest>, StorageError> {
+        let Some(file) = db_chunks::get_file(&self.pool, file_id).await? else {
+            return Ok(None);
+        };
+        let chunks = db_chunks::get_chunks_for_file(&self.pool, file_id).await?;
+        let chunk_meta = chunks
+            .iter()
+            .map(|c| ChunkMeta {
+                hash: c.hash.clone(),
+                index: c.chunk_index,
+                size: c.size_bytes,
+            })
+            .collect();
+
+        // Объявляем себя владельцем: каждый узел, рассылающий манифест,
+        // утверждает, что у него есть чанки (для публикатора — он один; для
+        // скачавшего — он добавляется к уже известным сидерам через merge).
+        Ok(Some(FileManifest {
+            file_id: file.file_id,
+            name: file.name,
+            size_bytes: file.size_bytes,
+            mime_type: file.mime_type,
+            owners: vec![self.my_id.clone()],
+            chunks: chunk_meta,
+        }))
+    }
+
+    /// Обрабатывает входящий манифест файла от сети: регистрирует файл и его
+    /// чанки локально (`is_local = false`), фиксирует владельца. После этого
+    /// файл доступен для скачивания через [`download_file`].
+    ///
+    /// Уже скачанные локально чанки не затираются (на случай частичной загрузки
+    /// и повторного объявления).
+    ///
+    /// [`download_file`]: Self::download_file
+    pub async fn handle_manifest(&self, manifest: &FileManifest) -> Result<(), StorageError> {
+        // owner_key хранит исходного публикатора (для отображения); полный
+        // список сидеров живёт в chunk_owners.
+        let owner_key = manifest
+            .original_owner()
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_default();
+        let file_record = void_db::chunks::FileRecord {
+            file_id: manifest.file_id.clone(),
+            name: manifest.name.clone(),
+            size_bytes: manifest.size_bytes,
+            total_chunks: manifest.chunks.len() as i64,
+            owner_key,
+            mime_type: manifest.mime_type.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        db_chunks::insert_file(&self.pool, &file_record).await?;
+
+        // Хэши уже имеющихся локально чанков — их не перезаписываем в remote.
+        let existing = db_chunks::get_chunks_for_file(&self.pool, &manifest.file_id).await?;
+        let local_hashes: HashSet<&str> = existing
+            .iter()
+            .filter(|c| c.is_local)
+            .map(|c| c.hash.as_str())
+            .collect();
+
+        for cm in &manifest.chunks {
+            if !local_hashes.contains(cm.hash.as_str()) {
+                let chunk = void_db::chunks::Chunk {
+                    hash: cm.hash.clone(),
+                    file_id: manifest.file_id.clone(),
+                    chunk_index: cm.index,
+                    size_bytes: cm.size,
+                    is_local: false,
+                    local_path: None,
+                };
+                db_chunks::upsert_chunk(&self.pool, &chunk).await?;
+            }
+            // Регистрируем всех заявленных владельцев чанка (мульти-сидинг).
+            for owner in &manifest.owners {
+                db_chunks::add_chunk_owner(&self.pool, &cm.hash, owner.as_str()).await?;
+                self.index.add_owner(&cm.hash, owner.clone()).await;
+            }
+        }
+
+        info!(
+            "Manifest registered: '{}' ({} chunks, {} seeder(s))",
+            manifest.name,
+            manifest.chunks.len(),
+            manifest.owners.len(),
+        );
+        Ok(())
+    }
+
     // ─── Скачивание ──────────────────────────────────────────────────────────
 
     /// Скачивает файл из сети и сохраняет по `dest_path`.
+    /// Без поддержки отмены — обёртка над [`download_file_cancellable`].
     ///
-    /// Алгоритм:
-    /// 1. Берём список чанков файла из БД
-    /// 2. Для каждого чанка ищем владельцев в индексе
-    /// 3. Качаем параллельно (до DOWNLOAD_CONCURRENCY за раз)
-    /// 4. Собираем файл из чанков
+    /// [`download_file_cancellable`]: Self::download_file_cancellable
     pub async fn download_file(
         &self,
         file_id: &str,
         dest_path: &Path,
         peers: &[PeerInfo],
+    ) -> Result<(), StorageError> {
+        self.download_file_cancellable(file_id, dest_path, peers, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    /// Скачивает файл с возможностью отмены (пауза). Если `cancel` выставлен в
+    /// `true`, скачивание останавливается между батчами и возвращает
+    /// [`StorageError::Cancelled`]; уже полученные чанки сохраняются локально,
+    /// поэтому повторный запуск продолжит с места остановки (resume).
+    ///
+    /// Алгоритм:
+    /// 1. Берём список чанков файла из БД
+    /// 2. Для каждого чанка ищем владельцев в индексе
+    /// 3. Качаем параллельно (до DOWNLOAD_CONCURRENCY за раз)
+    /// 4. Собираем файл из чанков и объявляем себя владельцем (мульти-сидинг)
+    pub async fn download_file_cancellable(
+        &self,
+        file_id: &str,
+        dest_path: &Path,
+        peers: &[PeerInfo],
+        cancel: Arc<AtomicBool>,
     ) -> Result<(), StorageError> {
         let file_meta = db_chunks::get_file(&self.pool, file_id)
             .await?
@@ -159,6 +274,10 @@ impl StorageManager {
         let mut ordered_data: Vec<Option<Vec<u8>>> = vec![None; total];
 
         for batch in chunks.chunks(DOWNLOAD_CONCURRENCY) {
+            if cancel.load(Ordering::Relaxed) {
+                info!("Download cancelled: '{}'", file_meta.name);
+                return Err(StorageError::Cancelled);
+            }
             let mut handles = Vec::new();
 
             for chunk in batch {
@@ -221,6 +340,17 @@ impl StorageManager {
             .collect();
 
         assemble_file(&flat, dest_path).await?;
+
+        // Теперь у нас есть все чанки локально — объявляем себя их владельцем,
+        // чтобы другие узлы могли качать у нас (мульти-сидинг). Сам факт
+        // is_local уже зафиксирован при сохранении каждого чанка.
+        for chunk in &chunks {
+            if let Err(e) = db_chunks::add_chunk_owner(&self.pool, &chunk.hash, self.my_id.as_str()).await {
+                warn!("Не удалось записать себя владельцем чанка {}: {}", &chunk.hash[..8.min(chunk.hash.len())], e);
+            }
+            self.index.add_owner(&chunk.hash, self.my_id.clone()).await;
+        }
+
         info!("Downloaded '{}' → {}", file_meta.name, dest_path.display());
         Ok(())
     }
@@ -344,6 +474,242 @@ async fn fetch_chunk_with_fallback(
     }
 
     Err(StorageError::NoPeersForChunk(hash.to_string()))
+}
+
+// ─── Тесты ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use void_core::peer::Service;
+    use void_db::{open, DbPool};
+
+    fn node(seed: u8) -> NodeId {
+        NodeId::from_public_key_bytes(&[seed; 32])
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    async fn make_node(seed: u8) -> (tempfile::TempDir, DbPool, StorageManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
+        let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
+        let mgr = StorageManager::new(pool.clone(), store, node(seed)).await.unwrap();
+        (dir, pool, mgr)
+    }
+
+    /// ~600 КБ → 3 чанка (256K + 256K + остаток).
+    fn sample_content() -> Vec<u8> {
+        (0..600_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Публикация: файл и чанки регистрируются локально, прогресс = 100%.
+    #[tokio::test]
+    async fn publish_creates_local_state() {
+        let (dir, pool, mgr) = make_node(1).await;
+        let content = sample_content();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+
+        let file_id = mgr.publish_file(&path).await.unwrap();
+
+        let frec = void_db::chunks::get_file(&pool, &file_id).await.unwrap().unwrap();
+        assert_eq!(frec.name, "data.bin");
+        assert_eq!(frec.size_bytes, 600_000);
+
+        let chunks = void_db::chunks::get_chunks_for_file(&pool, &file_id).await.unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.is_local));
+
+        let progress = mgr.download_progress(&file_id).await.unwrap();
+        assert!((progress - 1.0).abs() < 1e-9, "ожидался прогресс 1.0, получено {progress}");
+    }
+
+    /// Сквозной P2P: A публикует и раздаёт, B скачивает через chunk-сервер.
+    /// Метаданные файла/чанков реплицируются вручную (имитация будущего протокола
+    /// анонсов из Фазы 2), владелец чанков — A.
+    #[tokio::test]
+    async fn publish_then_download_between_two_nodes() {
+        let (dir_a, pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+
+        // chunk-сервер A
+        let a_port = free_port();
+        let srv = mgr_a.clone();
+        tokio::spawn(async move { let _ = srv.start_server(a_port).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Узел B знает метаданные файла, но чанков локально нет; владелец — A.
+        let (dir_b, pool_b, mgr_b) = make_node(2).await;
+        let frec = void_db::chunks::get_file(&pool_a, &file_id).await.unwrap().unwrap();
+        void_db::chunks::insert_file(&pool_b, &frec).await.unwrap();
+
+        let a_chunks = void_db::chunks::get_chunks_for_file(&pool_a, &file_id).await.unwrap();
+        let mut hashes = Vec::new();
+        for c in &a_chunks {
+            let remote = void_db::chunks::Chunk {
+                hash: c.hash.clone(),
+                file_id: c.file_id.clone(),
+                chunk_index: c.chunk_index,
+                size_bytes: c.size_bytes,
+                is_local: false,
+                local_path: None,
+            };
+            void_db::chunks::upsert_chunk(&pool_b, &remote).await.unwrap();
+            hashes.push(c.hash.clone());
+        }
+        mgr_b.handle_announce(&node(1), hashes).await;
+
+        // A в списке пиров B (port = порт chunk-сервера A — туда идёт fetch)
+        let a_peer = PeerInfo {
+            id:        node(1),
+            name:      "A".into(),
+            ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port:      a_port,
+            chat_port: a_port.wrapping_add(2),
+            services:  vec![Service::Storage],
+            last_seen: 0,
+        };
+
+        let dest = dir_b.path().join("downloaded.bin");
+        mgr_b.download_file(&file_id, &dest, &[a_peer]).await.unwrap();
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got, content, "скачанный файл должен побайтово совпадать с исходным");
+
+        // После скачивания у B чанки стали локальными → прогресс 100%
+        let progress = mgr_b.download_progress(&file_id).await.unwrap();
+        assert!((progress - 1.0).abs() < 1e-9, "у B прогресс должен быть 1.0, получено {progress}");
+    }
+
+    /// Фаза 2 целиком: A публикует → строит манифест; B получает манифест через
+    /// `handle_manifest` (как по сети) и скачивает файл, не зная заранее ничего
+    /// о чанках. Проверяет, что обнаружение + скачивание работают через манифест.
+    #[tokio::test]
+    async fn manifest_announce_then_download() {
+        let (dir_a, _pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+
+        // A строит манифест для рассылки.
+        let manifest = mgr_a.file_manifest(&file_id).await.unwrap()
+            .expect("манифест опубликованного файла должен существовать");
+        assert_eq!(manifest.owners, vec![node(1)]);
+        assert_eq!(manifest.total_chunks(), 3);
+
+        // chunk-сервер A.
+        let a_port = free_port();
+        let srv = mgr_a.clone();
+        tokio::spawn(async move { let _ = srv.start_server(a_port).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // B узнаёт о файле ТОЛЬКО из манифеста (никакой ручной репликации).
+        let (dir_b, pool_b, mgr_b) = make_node(2).await;
+        mgr_b.handle_manifest(&manifest).await.unwrap();
+
+        // У B файл уже виден в списке, но чанков локально нет.
+        let frec = void_db::chunks::get_file(&pool_b, &file_id).await.unwrap().unwrap();
+        assert_eq!(frec.name, "data.bin");
+        assert!((mgr_b.download_progress(&file_id).await.unwrap()).abs() < 1e-9,
+            "до скачивания прогресс у B должен быть 0");
+
+        // A в списке активных пиров B (port = порт chunk-сервера A).
+        let a_peer = PeerInfo {
+            id:        node(1),
+            name:      "A".into(),
+            ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port:      a_port,
+            chat_port: a_port.wrapping_add(2),
+            services:  vec![Service::Storage],
+            last_seen: 0,
+        };
+
+        let dest = dir_b.path().join("downloaded.bin");
+        mgr_b.download_file(&file_id, &dest, &[a_peer]).await.unwrap();
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got, content, "скачанный по манифесту файл должен совпадать с исходным");
+        let progress = mgr_b.download_progress(&file_id).await.unwrap();
+        assert!((progress - 1.0).abs() < 1e-9, "после скачивания прогресс у B = 1.0, получено {progress}");
+
+        // Мульти-сидинг: B, скачав файл, должен числиться владельцем его чанков.
+        let chunks_b = void_db::chunks::get_chunks_for_file(&pool_b, &file_id).await.unwrap();
+        for c in &chunks_b {
+            let owners = void_db::chunks::get_chunk_owners(&pool_b, &c.hash).await.unwrap();
+            assert!(owners.iter().any(|o| o == node(2).as_str()),
+                "после скачивания B должен быть владельцем чанка {}", &c.hash[..8]);
+        }
+    }
+
+    /// Мульти-сидинг через merge: узел, получив манифесты одного файла от двух
+    /// разных сидеров, регистрирует обоих как владельцев чанков.
+    #[tokio::test]
+    async fn manifest_merge_registers_multiple_seeders() {
+        let (dir_a, _pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+
+        // Манифест от публикатора A (owners=[A]).
+        let m1 = mgr_a.file_manifest(&file_id).await.unwrap().unwrap();
+        assert_eq!(m1.owners, vec![node(1)]);
+
+        // Тот же файл, но объявленный другим сидером B (owners=[B]).
+        let mut m2 = m1.clone();
+        m2.owners = vec![node(2)];
+
+        // Узел C получает оба объявления.
+        let (_dir_c, pool_c, mgr_c) = make_node(3).await;
+        mgr_c.handle_manifest(&m1).await.unwrap();
+        mgr_c.handle_manifest(&m2).await.unwrap();
+
+        // У каждого чанка теперь два владельца: A и B.
+        let chunks = void_db::chunks::get_chunks_for_file(&pool_c, &file_id).await.unwrap();
+        assert_eq!(chunks.len(), 3);
+        for c in &chunks {
+            let owners = void_db::chunks::get_chunk_owners(&pool_c, &c.hash).await.unwrap();
+            assert!(owners.iter().any(|o| o == node(1).as_str()), "владелец A отсутствует");
+            assert!(owners.iter().any(|o| o == node(2).as_str()), "владелец B отсутствует");
+        }
+    }
+
+    /// Отмена (пауза) скачивания: при выставленном флаге скачивание прекращается
+    /// и возвращает `Cancelled`, не докачивая файл.
+    #[tokio::test]
+    async fn download_can_be_cancelled() {
+        let (dir_a, _pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+
+        // B знает манифест, но чанков нет.
+        let (dir_b, _pool_b, mgr_b) = make_node(2).await;
+        let manifest = mgr_a.file_manifest(&file_id).await.unwrap().unwrap();
+        mgr_b.handle_manifest(&manifest).await.unwrap();
+
+        // Флаг отмены выставлен заранее → скачивание прекращается сразу.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let dest = dir_b.path().join("out.bin");
+        let res = mgr_b
+            .download_file_cancellable(&file_id, &dest, &[], cancel)
+            .await;
+
+        assert!(matches!(res, Err(StorageError::Cancelled)),
+            "ожидалась отмена, получено {res:?}");
+        assert!(!dest.exists(), "файл не должен быть собран при отмене");
+        let progress = mgr_b.download_progress(&file_id).await.unwrap();
+        assert!(progress.abs() < 1e-9, "прогресс должен остаться 0 после отмены, получено {progress}");
+    }
 }
 
 /// Простое определение MIME типа по расширению файла.

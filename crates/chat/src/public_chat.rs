@@ -21,12 +21,16 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use void_core::identity::NodeId;
+use void_core::manifest::FileManifest;
 use void_core::peer::{PeerInfo, PeerProfile};
 use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
 
-const MAX_MESSAGE_LEN: usize = 65536;
+/// Потолок размера одного пакета на проводе. Поднят до 16 МиБ, чтобы вмещать
+/// манифесты крупных файлов (список хэшей чанков): при 256 КБ/чанк это
+/// ~176 000 чанков ≈ 43 ГБ файл. Текстовые сообщения/профили на порядки меньше.
+const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 const BROADCAST_BUFFER: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEDUP_WINDOW: usize = 256;
@@ -43,6 +47,8 @@ pub enum ChatPacket {
     /// hello_port = chat_port этого узла (нужен для матчинга stub-пиров на loopback)
     Hello { node_id: NodeId, name: String, chat_port: u16 },
     ProfileUpdate(PeerProfile),
+    /// Объявление о публикации файла — рассылается всем (как ProfileUpdate).
+    FileAnnounce(FileManifest),
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -95,6 +101,10 @@ struct PublicChatInner {
     profiles:    Mutex<HashMap<NodeId, PeerProfile>>,
     /// Наш собственный профиль (для рассылки при подключении)
     my_profile:  Mutex<Option<PeerProfile>>,
+    /// Известные манифесты файлов (file_id → манифест) — для рассылки и дедупа
+    manifests:   Mutex<HashMap<String, FileManifest>>,
+    /// Уведомление backend о новых (впервые увиденных) манифестах
+    manifest_tx: broadcast::Sender<FileManifest>,
     /// Счётчик поколений соединения — чтобы старый read-task не затёр новый outbox
     conn_gen:    AtomicU64,
 }
@@ -102,6 +112,7 @@ struct PublicChatInner {
 impl PublicChat {
     fn new(my_peer: PeerInfo, peer_list: PeerList, chat_port: u16, signing_kp: Arc<SigningKeypair>) -> Self {
         let (incoming_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
                 my_peer, peer_list, chat_port, signing_kp, incoming_tx,
@@ -114,6 +125,8 @@ impl PublicChat {
                 clients:     Mutex::new(HashMap::new()),
                 profiles:    Mutex::new(HashMap::new()),
                 my_profile:  Mutex::new(None),
+                manifests:   Mutex::new(HashMap::new()),
+                manifest_tx,
                 conn_gen:    AtomicU64::new(0),
             }),
         }
@@ -142,6 +155,64 @@ impl PublicChat {
         let outbox = self.inner.outbox_tx.lock().await;
         if let Some(tx) = outbox.as_ref() {
             let _ = tx.try_send(ChatPacket::ProfileUpdate(profile));
+        }
+    }
+
+    /// Подписка backend на новые манифесты файлов, пришедшие из сети.
+    pub fn subscribe_manifests(&self) -> broadcast::Receiver<FileManifest> {
+        self.inner.manifest_tx.subscribe()
+    }
+
+    /// Все известные на данный момент манифесты файлов.
+    pub async fn get_manifests(&self) -> Vec<FileManifest> {
+        self.inner.manifests.lock().await.values().cloned().collect()
+    }
+
+    /// Объявляет наш файл сети: добавляет себя в список сидеров манифеста и
+    /// рассылает объединённый манифест всем (клиентам — если мы релей; релею —
+    /// если мы клиент). Релей затем форвардит объявление остальным.
+    pub async fn announce_file(&self, manifest: FileManifest) {
+        // Сливаем с уже известным (мы могли знать других сидеров) и рассылаем
+        // объединённый вариант. Даже если ничего нового не добавилось, шлём
+        // нашу версию — получатели дедуплицируют сами.
+        let merged = self.merge_manifest(manifest.clone()).await.unwrap_or(manifest);
+        self.broadcast_manifest(merged).await;
+    }
+
+    /// Объединяет входящий манифест с уже известным по `file_id`: добавляет
+    /// новых сидеров. Возвращает обновлённый манифест, если появилась новая
+    /// информация (новый файл или новый владелец), иначе `None` (дедуп — это
+    /// гасит петли форвардинга).
+    async fn merge_manifest(&self, incoming: FileManifest) -> Option<FileManifest> {
+        let mut map = self.inner.manifests.lock().await;
+        match map.get_mut(&incoming.file_id) {
+            Some(existing) => {
+                let mut changed = false;
+                for owner in &incoming.owners {
+                    if existing.add_owner(owner.clone()) {
+                        changed = true;
+                    }
+                }
+                if changed { Some(existing.clone()) } else { None }
+            }
+            None => {
+                map.insert(incoming.file_id.clone(), incoming.clone());
+                Some(incoming)
+            }
+        }
+    }
+
+    /// Рассылает манифест всем подключённым (клиентам и/или релею).
+    async fn broadcast_manifest(&self, manifest: FileManifest) {
+        {
+            let clients = self.inner.clients.lock().await;
+            for tx in clients.values() {
+                let _ = tx.try_send(ChatPacket::FileAnnounce(manifest.clone()));
+            }
+        }
+        let outbox = self.inner.outbox_tx.lock().await;
+        if let Some(tx) = outbox.as_ref() {
+            let _ = tx.try_send(ChatPacket::FileAnnounce(manifest));
         }
     }
 }
@@ -257,6 +328,15 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
         let _ = send_packet(&mut stream, &ChatPacket::ProfileUpdate(my_p.clone())).await;
     }
 
+    // Шаг 3.5: шлём известные манифесты файлов (чтобы новый клиент увидел
+    // ранее опубликованные в сети файлы)
+    {
+        let manifests = chat.inner.manifests.lock().await;
+        for manifest in manifests.values() {
+            let _ = send_packet(&mut stream, &ChatPacket::FileAnnounce(manifest.clone())).await;
+        }
+    }
+
     // Шаг 4: регистрируем клиента
     let (fwd_tx, mut fwd_rx) = mpsc::channel::<ChatPacket>(64);
     chat.inner.clients.lock().await.insert(node_id.clone(), fwd_tx.clone());
@@ -276,6 +356,10 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
                 Ok(ChatPacket::ProfileUpdate(prof)) => {
                     debug!("ProfileUpdate from client {}", nid);
                     chat_r.handle_profile_update(prof).await;
+                }
+                Ok(ChatPacket::FileAnnounce(manifest)) => {
+                    debug!("FileAnnounce from client {}: {}", nid, manifest.name);
+                    chat_r.handle_file_announce(manifest).await;
                 }
                 Ok(ChatPacket::Ping) => {
                     debug!("Ping from client {}", nid);
@@ -394,6 +478,26 @@ impl PublicChat {
             if *id != profile.node_id {
                 let _ = tx.try_send(ChatPacket::ProfileUpdate(profile.clone()));
             }
+        }
+    }
+
+    /// Обрабатывает входящее объявление о файле из сети: сливает манифест с
+    /// известным (объединяя сидеров), уведомляет backend (запись в БД + индекс
+    /// владельцев) и — если мы релей — форвардит объединённый манифест
+    /// остальным клиентам. Дедуп через `merge_manifest`: если новой информации
+    /// нет, обработка прекращается, что гасит петли форвардинга.
+    async fn handle_file_announce(&self, manifest: FileManifest) {
+        let Some(merged) = self.merge_manifest(manifest).await else {
+            return; // ничего нового — не пересылаем повторно
+        };
+
+        // Уведомляем backend (персистентность + регистрация владельцев чанков)
+        let _ = self.inner.manifest_tx.send(merged.clone());
+
+        // Роль релея: форвардим объединённый манифест остальным клиентам.
+        let clients = self.inner.clients.lock().await;
+        for tx in clients.values() {
+            let _ = tx.try_send(ChatPacket::FileAnnounce(merged.clone()));
         }
     }
 
@@ -589,6 +693,15 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
         send_packet_wr(&mut wr, &ChatPacket::ProfileUpdate(profile.clone())).await?;
     }
 
+    // Отправляем известные нам манифесты файлов ретранслятору (на случай если
+    // файл был опубликован до установления текущего соединения с релеем)
+    {
+        let manifests = chat.inner.manifests.lock().await;
+        for manifest in manifests.values() {
+            send_packet_wr(&mut wr, &ChatPacket::FileAnnounce(manifest.clone())).await?;
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel::<ChatPacket>(64);
 
     // Таск записи (наши пакеты → ретранслятор)
@@ -616,6 +729,10 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
                 Ok(ChatPacket::ProfileUpdate(prof)) => {
                     debug!("ProfileUpdate from relay: {}", prof.node_id);
                     chat_r.handle_profile_update(prof).await;
+                }
+                Ok(ChatPacket::FileAnnounce(manifest)) => {
+                    debug!("FileAnnounce from relay: {}", manifest.name);
+                    chat_r.handle_file_announce(manifest).await;
                 }
                 Ok(ChatPacket::Ping) => {
                     // Ретранслятор пингует нас — отвечаем Pong через outbox
@@ -651,6 +768,9 @@ impl ChatHandle {
     pub async fn recent(&self, n: usize) -> Vec<ChatMessage> { self.chat.recent(n).await }
     pub async fn set_profile(&self, profile: PeerProfile) { self.chat.set_profile(profile).await }
     pub async fn get_profiles(&self) -> Vec<PeerProfile> { self.chat.get_profiles().await }
+    pub async fn announce_file(&self, manifest: FileManifest) { self.chat.announce_file(manifest).await }
+    pub fn subscribe_manifests(&self) -> broadcast::Receiver<FileManifest> { self.chat.subscribe_manifests() }
+    pub async fn get_manifests(&self) -> Vec<FileManifest> { self.chat.get_manifests().await }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -700,6 +820,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
     use tokio::time::timeout;
+    use void_core::manifest::{ChunkMeta, FileManifest};
     use void_core::peer::Service;
 
     fn free_port() -> u16 {
@@ -887,5 +1008,73 @@ mod tests {
         }
         assert!(got_b, "узел B не получил сообщение от A");
         assert!(got_c, "узел C не получил сообщение от A");
+    }
+
+    /// Ждёт в приёмнике манифест с заданным file_id (пропуская прочие).
+    async fn wait_for_manifest(
+        rx: &mut broadcast::Receiver<FileManifest>,
+        file_id: &str,
+        secs: u64,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { return false; }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Ok(m)) if m.file_id == file_id => return true,
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Объявление о файле, сделанное одним узлом, доходит до второго через relay
+    /// (механизм Фазы 2 — обнаружение файлов в сети). Тест нейтрален к тому,
+    /// какой узел стал релеем.
+    #[tokio::test]
+    async fn file_announce_propagates_to_peer() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id.clone(), a_port);
+        let b_peer = test_peer("bob", b_id.clone(), b_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+
+        let mut bob_manifests = bob.subscribe_manifests();
+
+        let manifest = FileManifest {
+            file_id:    "deadbeefcafe".into(),
+            name:       "photo.jpg".into(),
+            size_bytes: 1000,
+            mime_type:  Some("image/jpeg".into()),
+            owners:     vec![a_id.clone()],
+            chunks:     vec![ChunkMeta { hash: "a".repeat(64), index: 0, size: 1000 }],
+        };
+
+        // Повторяем анонс, пока relay-соединение не установится и объявление
+        // не дойдёт до Bob (первые попытки могут прийтись на момент до связи).
+        let mut delivered = false;
+        for _ in 0..40 {
+            alice.announce_file(manifest.clone()).await;
+            if wait_for_manifest(&mut bob_manifests, "deadbeefcafe", 1).await {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "Bob не получил объявление о файле от Alice");
+
+        // Манифест должен осесть в известных у Bob (доступен для скачивания).
+        let known = bob.get_manifests().await;
+        assert!(known.iter().any(|m| m.file_id == "deadbeefcafe"),
+            "манифест должен сохраниться в списке известных у Bob");
     }
 }

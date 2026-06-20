@@ -3,14 +3,40 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
-use void_chat::public_chat::{start_public_chat, ChatMessage};
+use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage};
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_discovery::PeerList;
+use void_storage::{ChunkStore, StorageManager};
+
+/// Запись о файле в хранилище — снимок для GUI.
+#[derive(Clone)]
+pub struct StorageFileInfo {
+    pub file_id:      String,
+    pub name:         String,
+    pub size_bytes:   i64,
+    pub total_chunks: i64,
+    /// Доля локально имеющихся чанков, 0.0..1.0
+    pub progress:     f64,
+    /// Опубликован нами (мы владелец)
+    pub is_mine:      bool,
+    /// Сколько узлов раздают файл (по данным манифеста)
+    pub seeders:      i64,
+}
+
+/// Команда GUI → backend для управления скачиванием файла.
+#[derive(Clone, Debug)]
+pub enum DownloadCmd {
+    /// Начать (или продолжить) скачивание файла по его file_id.
+    Start(String),
+    /// Поставить на паузу скачивание файла по его file_id.
+    Pause(String),
+}
 
 pub struct BackendHandle {
     pub chat_inbox:    Arc<Mutex<VecDeque<ChatMessage>>>,
@@ -43,6 +69,14 @@ pub struct BackendHandle {
     /// История общего чата, загруженная из БД при старте.
     /// `None` пока бэкенд не загрузил; GUI забирает её один раз (`take`).
     pub chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>,
+    /// Канал GUI → backend: опубликовать файл по указанному пути.
+    pub publish_tx:    tokio::sync::mpsc::UnboundedSender<PathBuf>,
+    /// Канал GUI → backend: управление скачиванием (старт/пауза).
+    pub download_tx:   tokio::sync::mpsc::UnboundedSender<DownloadCmd>,
+    /// Снимок списка файлов хранилища (обновляется бэкендом каждые ~2с).
+    pub storage_files: Arc<Mutex<Vec<StorageFileInfo>>>,
+    /// Папка, куда сохраняются скачанные файлы (для «Открыть» в UI).
+    pub downloads_dir: PathBuf,
 }
 
 pub fn start_backend(
@@ -59,11 +93,14 @@ pub fn start_backend(
     let peer_profiles: Arc<Mutex<HashMap<NodeId, PeerProfile>>>  = Arc::new(Mutex::new(HashMap::new()));
     let dm_inbox:      Arc<Mutex<VecDeque<IncomingDm>>>          = Arc::new(Mutex::new(VecDeque::new()));
     let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
+    let storage_files: Arc<Mutex<Vec<StorageFileInfo>>>         = Arc::new(Mutex::new(Vec::new()));
 
     let (chat_tx,    chat_rx)    = tokio::sync::mpsc::unbounded_channel::<String>();
     let (connect_tx, connect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (profile_tx, profile_rx) = tokio::sync::mpsc::unbounded_channel::<PeerProfile>();
     let (dm_tx,      dm_rx)      = tokio::sync::mpsc::unbounded_channel::<DmSendCmd>();
+    let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadCmd>();
 
     let my_ip = if local_mode {
         IpAddr::from([127, 0, 0, 1])
@@ -96,6 +133,9 @@ pub fn start_backend(
     let enc_kp_bg   = Arc::clone(&enc_kp);
     let sign_kp_bg  = Arc::clone(&sign_kp);
     let history_bg  = Arc::clone(&chat_history);
+    let storage_bg  = Arc::clone(&storage_files);
+
+    let downloads_dir = data_dir.join("downloads");
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -106,6 +146,7 @@ pub fn start_backend(
                 enc_kp_bg, sign_kp_bg, dm_port,
                 chat_rx, connect_rx, profile_rx, dm_rx,
                 data_dir, history_bg,
+                publish_rx, download_rx, storage_bg,
             ).await;
         });
     });
@@ -130,6 +171,10 @@ pub fn start_backend(
         dm_sender: dm_tx,
         dm_port,
         chat_history,
+        publish_tx,
+        download_tx,
+        storage_files,
+        downloads_dir,
     }
 }
 
@@ -153,6 +198,9 @@ async fn backend_main(
     mut dm_rx:      tokio::sync::mpsc::UnboundedReceiver<DmSendCmd>,
     data_dir:       PathBuf,
     chat_history_out: Arc<Mutex<Option<Vec<ChatMessage>>>>,
+    publish_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+    download_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadCmd>,
+    storage_files_out: Arc<Mutex<Vec<StorageFileInfo>>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -335,9 +383,196 @@ async fn backend_main(
         }
     });
 
+    // ── Подсистема хранилища (требует БД) ─────────────────────────────────────
+    // chunk-сервер слушает base_port (он свободен: чат на +2, DM на +3),
+    // download у пиров идёт именно на их base_port.
+    if let Some(pool) = db_pool.clone() {
+        match ChunkStore::new(data_dir.join("chunks")).await {
+            Ok(store) => match StorageManager::new(pool.clone(), store, my_peer.id.clone()).await {
+                Ok(manager) => {
+                    start_storage_tasks(
+                        manager, pool, chat.clone(), peer_list.clone(),
+                        my_peer.id.clone(), base_port, data_dir.clone(),
+                        publish_rx, download_rx, storage_files_out,
+                    );
+                    tracing::info!("Storage subsystem ready (chunk server on {})", base_port);
+                }
+                Err(e) => tracing::error!("StorageManager init failed: {}", e),
+            },
+            Err(e) => tracing::error!("ChunkStore init failed: {}", e),
+        }
+    } else {
+        tracing::warn!("Хранилище отключено: нет БД");
+    }
+
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
+}
+
+/// Запускает фоновые задачи хранилища: chunk-сервер, обработку публикаций
+/// (с рассылкой манифеста по сети), приём чужих манифестов, скачивание по
+/// запросу и периодическое обновление списка файлов для GUI.
+#[allow(clippy::too_many_arguments)]
+fn start_storage_tasks(
+    manager:    StorageManager,
+    pool:       void_db::DbPool,
+    chat:       ChatHandle,
+    peer_list:  PeerList,
+    my_id:      NodeId,
+    base_port:  u16,
+    data_dir:   PathBuf,
+    mut publish_rx:  tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+    mut download_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadCmd>,
+    files_out:  Arc<Mutex<Vec<StorageFileInfo>>>,
+) {
+    // chunk-сервер
+    let srv = manager.clone();
+    tokio::spawn(async move {
+        if let Err(e) = srv.start_server(base_port).await {
+            tracing::error!("Chunk server failed on {}: {}", base_port, e);
+        }
+    });
+
+    // публикация файлов из GUI + рассылка манифеста сети
+    let pub_mgr  = manager.clone();
+    let pub_chat = chat.clone();
+    tokio::spawn(async move {
+        while let Some(path) = publish_rx.recv().await {
+            match pub_mgr.publish_file(&path).await {
+                Ok(fid) => {
+                    tracing::info!("Опубликован {} → file_id={}",
+                        path.display(), &fid[..8.min(fid.len())]);
+                    // Объявляем файл сети, чтобы пиры его обнаружили.
+                    match pub_mgr.file_manifest(&fid).await {
+                        Ok(Some(manifest)) => pub_chat.announce_file(manifest).await,
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("Не удалось построить манифест {}: {}",
+                            &fid[..8.min(fid.len())], e),
+                    }
+                }
+                Err(e) => tracing::warn!("Публикация не удалась ({}): {}", path.display(), e),
+            }
+        }
+    });
+
+    // приём манифестов файлов из сети → регистрация файла локально
+    let ann_mgr = manager.clone();
+    let mut manifest_rx = chat.subscribe_manifests();
+    tokio::spawn(async move {
+        loop {
+            match manifest_rx.recv().await {
+                Ok(manifest) => {
+                    let name = manifest.name.clone();
+                    let n = manifest.chunks.len();
+                    if let Err(e) = ann_mgr.handle_manifest(&manifest).await {
+                        tracing::warn!("Не удалось обработать манифест '{}': {}", name, e);
+                    } else {
+                        tracing::info!("Обнаружен файл в сети: '{}' ({} чанков)", name, n);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
+                    tracing::warn!("Manifest stream lagged by {}", k);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // скачивание по запросу из GUI: старт/пауза, по задаче на файл.
+    // Для каждого активного скачивания держим флаг отмены (пауза = выставить).
+    let dl_mgr   = manager.clone();
+    let dl_chat  = chat.clone();
+    let dl_pool  = pool.clone();
+    let dl_pl    = peer_list.clone();
+    let downloads_dir = data_dir.join("downloads");
+    tokio::spawn(async move {
+        let mut cancels: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+        while let Some(cmd) = download_rx.recv().await {
+            match cmd {
+                DownloadCmd::Pause(file_id) => {
+                    if let Some(flag) = cancels.get(&file_id) {
+                        flag.store(true, Ordering::Relaxed);
+                        tracing::info!("Пауза скачивания {}", &file_id[..8.min(file_id.len())]);
+                    }
+                }
+                DownloadCmd::Start(file_id) => {
+                    let name = match void_db::chunks::get_file(&dl_pool, &file_id).await {
+                        Ok(Some(f)) => f.name,
+                        Ok(None) => {
+                            tracing::warn!("Скачивание: файл {} неизвестен", &file_id[..8.min(file_id.len())]);
+                            continue;
+                        }
+                        Err(e) => { tracing::warn!("Скачивание: ошибка БД: {}", e); continue; }
+                    };
+                    if let Err(e) = tokio::fs::create_dir_all(&downloads_dir).await {
+                        tracing::warn!("Не удалось создать папку загрузок: {}", e);
+                        continue;
+                    }
+                    // Свежий (сброшенный) флаг отмены на этот запуск.
+                    let flag = Arc::new(AtomicBool::new(false));
+                    cancels.insert(file_id.clone(), Arc::clone(&flag));
+
+                    let dest  = downloads_dir.join(&name);
+                    let peers = dl_pl.all().await;
+                    let mgr   = dl_mgr.clone();
+                    let chat  = dl_chat.clone();
+                    tracing::info!("Скачивание '{}' → {}", name, dest.display());
+                    tokio::spawn(async move {
+                        match mgr.download_file_cancellable(&file_id, &dest, &peers, flag).await {
+                            Ok(()) => {
+                                tracing::info!("Файл '{}' скачан в {}", name, dest.display());
+                                // Мульти-сидинг: объявляем себя новым сидером.
+                                if let Ok(Some(manifest)) = mgr.file_manifest(&file_id).await {
+                                    chat.announce_file(manifest).await;
+                                }
+                            }
+                            Err(void_storage::StorageError::Cancelled) =>
+                                tracing::info!("Скачивание '{}' приостановлено", name),
+                            Err(e) =>
+                                tracing::warn!("Скачивание '{}' не удалось: {}", name, e),
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // периодический снимок списка файлов для GUI (с числом сидеров из манифестов)
+    let my_key = my_id.as_str().to_string();
+    let snap_chat = chat.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let files = match void_db::chunks::list_files(&pool).await {
+                Ok(f)  => f,
+                Err(e) => { tracing::warn!("list_files failed: {}", e); continue; }
+            };
+            // Число сидеров берём из объединённых манифестов чата.
+            let seeders: HashMap<String, i64> = snap_chat.get_manifests().await
+                .into_iter()
+                .map(|m| (m.file_id, m.owners.len() as i64))
+                .collect();
+            let mut out = Vec::with_capacity(files.len());
+            for f in files {
+                let progress = manager.download_progress(&f.file_id).await.unwrap_or(0.0);
+                let is_mine  = f.owner_key == my_key;
+                let seeders  = seeders.get(&f.file_id).copied()
+                    .unwrap_or(if is_mine { 1 } else { 0 });
+                out.push(StorageFileInfo {
+                    is_mine,
+                    seeders,
+                    file_id:      f.file_id,
+                    name:         f.name,
+                    size_bytes:   f.size_bytes,
+                    total_chunks: f.total_chunks,
+                    progress,
+                });
+            }
+            *files_out.lock().unwrap() = out;
+        }
+    });
 }
 
 // ─── Определение реального LAN-IP ────────────────────────────────────────────

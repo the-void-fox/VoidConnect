@@ -98,11 +98,18 @@ impl VoidApp {
         // Загружаем историю с диска
         private.load_history_from_disk();
 
+        // Страница хранилища: подключаем канал публикации и список файлов.
+        let mut storage = StoragePage::default();
+        storage.publish_tx    = Some(backend.publish_tx.clone());
+        storage.download_tx   = Some(backend.download_tx.clone());
+        storage.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
+        storage.downloads_dir = Some(backend.downloads_dir.clone());
+
         Self {
             current_page: Page::Chat,
             chat,
             private,
-            storage: StoragePage::default(),
+            storage,
             sites:   SitesPage::default(),
             profile,
             graph,

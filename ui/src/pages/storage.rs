@@ -1,7 +1,15 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use eframe::egui;
 use egui::{Align, Button, Frame, Label, ProgressBar, RichText, ScrollArea, TextEdit};
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::backend::{DownloadCmd, StorageFileInfo};
 
 pub struct FileEntry {
+    pub file_id: String,
     pub name: String,
     pub size: String,
     pub chunks: u32,
@@ -42,127 +50,32 @@ pub struct StoragePage {
     pub files: Vec<FileEntry>,
     pub search: String,
     pub report_target: Option<usize>,
+    /// Канал GUI → backend: опубликовать файл по пути.
+    pub publish_tx: Option<UnboundedSender<PathBuf>>,
+    /// Канал GUI → backend: управление скачиванием (старт/пауза).
+    pub download_tx: Option<UnboundedSender<DownloadCmd>>,
+    /// Реальный список файлов из backend (снимок обновляется бэкендом).
+    pub storage_files: Option<Arc<Mutex<Vec<StorageFileInfo>>>>,
+    /// Поле ввода пути к публикуемому файлу.
+    pub publish_path: String,
+    /// file_id файлов, для которых мы запросили скачивание (пока не завершено).
+    pub downloading: HashSet<String>,
+    /// Папка скачанных файлов (для действия «Открыть»).
+    pub downloads_dir: Option<PathBuf>,
 }
 
 impl Default for StoragePage {
     fn default() -> Self {
         Self {
-            files: vec![
-                FileEntry {
-                    name: "arch-setup.tar.gz".into(),
-                    size: "1.2 GB".into(),
-                    chunks: 4800,
-                    chunks_total: 4800,
-                    seeders: 3,
-                    status: FileStatus::Complete,
-                },
-                FileEntry {
-                    name: "project_docs.zip".into(),
-                    size: "48 MB".into(),
-                    chunks: 192,
-                    chunks_total: 192,
-                    seeders: 2,
-                    status: FileStatus::Seeding,
-                },
-                FileEntry {
-                    name: "video_sample.mp4".into(),
-                    size: "320 MB".into(),
-                    chunks: 850,
-                    chunks_total: 1280,
-                    seeders: 4,
-                    status: FileStatus::Downloading(0.66),
-                },
-                FileEntry {
-                    name: "backup_2024.tar".into(),
-                    size: "780 MB".into(),
-                    chunks: 150,
-                    chunks_total: 3120,
-                    seeders: 1,
-                    status: FileStatus::Downloading(0.05),
-                },
-                FileEntry {
-                    name: "music_pack.zip".into(),
-                    size: "95 MB".into(),
-                    chunks: 380,
-                    chunks_total: 380,
-                    seeders: 5,
-                    status: FileStatus::Complete,
-                },
-                FileEntry {
-                    name: "dataset_2025.csv".into(),
-                    size: "210 MB".into(),
-                    chunks: 0,
-                    chunks_total: 840,
-                    seeders: 7,
-                    status: FileStatus::NotStarted,
-                },
-                FileEntry {
-                    name: "presentation.pdf".into(),
-                    size: "15 MB".into(),
-                    chunks: 0,
-                    chunks_total: 60,
-                    seeders: 3,
-                    status: FileStatus::NotStarted,
-                },
-                FileEntry {
-                    name: "photo_album.png".into(),
-                    size: "45 MB".into(),
-                    chunks: 0,
-                    chunks_total: 180,
-                    seeders: 2,
-                    status: FileStatus::NotStarted,
-                },
-                FileEntry {
-                    name: "audiobook.mp3".into(),
-                    size: "180 MB".into(),
-                    chunks: 450,
-                    chunks_total: 720,
-                    seeders: 6,
-                    status: FileStatus::Downloading(0.625),
-                },
-                FileEntry {
-                    name: "config.toml".into(),
-                    size: "4 KB".into(),
-                    chunks: 0,
-                    chunks_total: 1,
-                    seeders: 10,
-                    status: FileStatus::NotStarted,
-                },
-                FileEntry {
-                    name: "main.rs".into(),
-                    size: "25 KB".into(),
-                    chunks: 0,
-                    chunks_total: 10,
-                    seeders: 1,
-                    status: FileStatus::NotStarted,
-                },
-                FileEntry {
-                    name: "windows_installer.exe".into(),
-                    size: "4.5 GB".into(),
-                    chunks: 9000,
-                    chunks_total: 18000,
-                    seeders: 15,
-                    status: FileStatus::Downloading(0.5),
-                },
-                FileEntry {
-                    name: "bookmark_fonts.otf".into(),
-                    size: "2.1 MB".into(),
-                    chunks: 0,
-                    chunks_total: 42,
-                    seeders: 4,
-                    status: FileStatus::NotStarted,
-                },
-                FileEntry {
-                    name: "system_backup.img".into(),
-                    size: "8 GB".into(),
-                    chunks: 8000,
-                    chunks_total: 32000,
-                    seeders: 8,
-                    status: FileStatus::Seeding,
-                },
-            ],
+            files: Vec::new(),
             search: String::new(),
             report_target: None,
+            publish_tx: None,
+            download_tx: None,
+            storage_files: None,
+            publish_path: String::new(),
+            downloading: HashSet::new(),
+            downloads_dir: None,
         }
     }
 }
@@ -180,8 +93,99 @@ const COL_REPORT: f32 = 32.0;
 const ROW_H: f32 = 32.0;
 const HEADER_H: f32 = 22.0;
 
+/// Человекочитаемый размер файла.
+fn human_size(bytes: i64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9      { format!("{:.1} GB", b / 1e9) }
+    else if b >= 1e6 { format!("{:.1} MB", b / 1e6) }
+    else if b >= 1e3 { format!("{:.1} KB", b / 1e3) }
+    else             { format!("{} B", bytes) }
+}
+
 impl StoragePage {
+    /// Обновляет отображаемый список из снимка backend.
+    fn sync_from_backend(&mut self) {
+        let Some(shared) = &self.storage_files else { return };
+        let snapshot = shared.lock().unwrap().clone();
+        let mut entries = Vec::with_capacity(snapshot.len());
+        for f in snapshot {
+            // Файл докачан — снимаем флаг "скачивается".
+            if f.progress >= 1.0 {
+                self.downloading.remove(&f.file_id);
+            }
+            let done = (f.progress * f.total_chunks as f64).round() as u32;
+            let status = if f.is_mine {
+                FileStatus::Seeding
+            } else if f.progress >= 1.0 {
+                FileStatus::Complete
+            } else if self.downloading.contains(&f.file_id) {
+                FileStatus::Downloading(f.progress as f32)
+            } else {
+                FileStatus::NotStarted
+            };
+            entries.push(FileEntry {
+                file_id:      f.file_id,
+                name:         f.name,
+                size:         human_size(f.size_bytes),
+                chunks:       done,
+                chunks_total: f.total_chunks.max(0) as u32,
+                seeders:      f.seeders.max(0) as u32,
+                status,
+            });
+        }
+        self.files = entries;
+    }
+
+    /// Отправляет путь из поля ввода в backend на публикацию.
+    fn publish_current(&mut self) {
+        let path = self.publish_path.trim().to_string();
+        if path.is_empty() { return; }
+        if let Some(tx) = &self.publish_tx {
+            let _ = tx.send(PathBuf::from(path));
+        }
+        self.publish_path.clear();
+    }
+
+    /// Запрашивает у backend скачивание (или возобновление) файла по индексу.
+    fn start_download(&mut self, idx: usize) {
+        let Some(file) = self.files.get(idx) else { return };
+        let file_id = file.file_id.clone();
+        if file_id.is_empty() { return; }
+        if let Some(tx) = &self.download_tx {
+            let _ = tx.send(DownloadCmd::Start(file_id.clone()));
+        }
+        self.downloading.insert(file_id);
+        if let Some(f) = self.files.get_mut(idx) {
+            f.status = FileStatus::Downloading(0.0);
+        }
+    }
+
+    /// Ставит скачивание на паузу. Уже полученные чанки сохранены, поэтому
+    /// кнопка «Загрузить» затем продолжит с места остановки (resume).
+    fn pause_download(&mut self, idx: usize) {
+        let Some(file) = self.files.get(idx) else { return };
+        let file_id = file.file_id.clone();
+        if let Some(tx) = &self.download_tx {
+            let _ = tx.send(DownloadCmd::Pause(file_id.clone()));
+        }
+        self.downloading.remove(&file_id);
+        if let Some(f) = self.files.get_mut(idx) {
+            f.status = FileStatus::NotStarted;
+        }
+    }
+
+    /// Открывает скачанный файл системным приложением (xdg-open).
+    fn open_file(&self, idx: usize) {
+        let Some(file) = self.files.get(idx) else { return };
+        let Some(dir) = &self.downloads_dir else { return };
+        let path = dir.join(&file.name);
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        // Подтягиваем актуальный список файлов из backend.
+        self.sync_from_backend();
+
         // === Заголовок ===
         ui.add_space(8.0);
         ui.heading("Хранилище");
@@ -217,6 +221,32 @@ impl StoragePage {
                 // TODO
             }
         });
+
+        ui.add_space(6.0);
+
+        // === Публикация файла ===
+        let mut do_publish = false;
+        ui.horizontal(|ui| {
+            let btn_w = 130.0;
+            let gap = ui.spacing().item_spacing.x;
+            let path_w = (ui.available_width() - btn_w - gap).max(120.0);
+            let resp = ui.add(
+                TextEdit::singleline(&mut self.publish_path)
+                    .hint_text("󰉓  Путь к файлу для публикации…")
+                    .desired_width(path_w - 4.0),
+            );
+            // Enter в поле = опубликовать
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                do_publish = true;
+            }
+            let enabled = self.publish_tx.is_some() && !self.publish_path.trim().is_empty();
+            if ui.add_enabled(enabled, Button::new("󰐕  Опубликовать").min_size(egui::vec2(btn_w, 28.0))).clicked() {
+                do_publish = true;
+            }
+        });
+        if do_publish {
+            self.publish_current();
+        }
 
         ui.add_space(8.0);
 
@@ -273,23 +303,10 @@ impl StoragePage {
         // === Обработка действий ===
         if let Some((idx, act)) = action {
             match act {
-                RowAction::Download => {
-                    self.files[idx].status = FileStatus::Downloading(0.0);
-                }
-                RowAction::Pause => {
-                    // TODO
-                }
-                RowAction::Resume => {
-                    if let FileStatus::NotStarted = self.files[idx].status {
-                        self.files[idx].status = FileStatus::Downloading(0.0);
-                    }
-                }
-                RowAction::Open => {
-                    // TODO
-                }
-                RowAction::Report => {
-                    self.report_target = Some(idx);
-                }
+                RowAction::Download => self.start_download(idx),
+                RowAction::Pause    => self.pause_download(idx),
+                RowAction::Open     => self.open_file(idx),
+                RowAction::Report   => self.report_target = Some(idx),
             }
         }
 
@@ -794,7 +811,6 @@ fn file_icon(name: &str) -> &'static str {
 enum RowAction {
     Download,
     Pause,
-    Resume,
     Open,
     Report,
 }
