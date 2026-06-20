@@ -143,8 +143,11 @@ impl ReportManager {
             return Err(ReputationError::SelfReport);
         }
 
-        // 5. Сохраняем жалобу в БД
+        // 5. Сохраняем жалобу в БД. Сначала гарантируем наличие узла-цели —
+        //    reputation_reports.target_key ссылается на peers (FK), а строка
+        //    репутации нужна для последующего штрафа.
         let target_id = NodeId(payload.target_key.clone());
+        let _ = self.score_manager.init(&target_id).await;
         db_peers::add_report(
             &self.pool,
             &payload.target_key,
@@ -208,5 +211,61 @@ impl ReportManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use void_core::identity::NodeId;
+    use void_db::open;
+
+    use crate::score::ScoreManager;
+
+    fn reporter(seed: u8) -> (SigningKeypair, NodeId) {
+        let kp = SigningKeypair::from_seed(&[seed; 32]).unwrap();
+        let id = NodeId::from_public_key_bytes(&kp.public_bytes());
+        (kp, id)
+    }
+
+    /// Три уникальные жалобы достигают порога и снижают репутацию цели;
+    /// подмена подписанта отклоняется.
+    #[tokio::test]
+    async fn three_unique_reports_apply_penalty() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
+        let score = ScoreManager::new(pool.clone());
+        let mgr = ReportManager::new(pool, score.clone());
+
+        let target = NodeId::from_public_key_bytes(&[200u8; 32]);
+        let before = score.score(&target).await;
+
+        for seed in 1..=3u8 {
+            let (kp, rid) = reporter(seed);
+            let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
+            mgr.receive_report(signed, &rid).await.unwrap();
+        }
+
+        assert_eq!(mgr.report_count(&target).await.unwrap(), 3);
+        let after = score.score(&target).await;
+        assert!(after < before, "после 3 жалоб репутация падает (before={before}, after={after})");
+    }
+
+    /// Жалоба с подписантом, не совпадающим с reporter_id, отклоняется.
+    #[tokio::test]
+    async fn report_signer_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
+        let score = ScoreManager::new(pool.clone());
+        let mgr = ReportManager::new(pool, score);
+
+        let target = NodeId::from_public_key_bytes(&[200u8; 32]);
+        let (kp, _real) = reporter(1);
+        let (_kp2, other) = reporter(2);
+        let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
+
+        // reporter_id (other) ≠ подписант (real) → отклонение.
+        let res = mgr.receive_report(signed, &other).await;
+        assert!(matches!(res, Err(ReputationError::SignerMismatch)));
     }
 }

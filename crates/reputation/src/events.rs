@@ -14,7 +14,6 @@ use tracing::{debug, info, warn};
 use void_core::identity::NodeId;
 use void_network::rate_limit::RateLimiter;
 
-use crate::error::ReputationError;
 use crate::score::ScoreManager;
 
 // ─── Константы ───────────────────────────────────────────────────────────────
@@ -174,5 +173,58 @@ impl EventProcessor {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use void_db::open;
+    use void_network::rate_limit::RateLimiter;
+
+    fn node(seed: u8) -> NodeId {
+        NodeId::from_public_key_bytes(&[seed; 32])
+    }
+
+    async fn make_processor() -> (tempfile::TempDir, ScoreManager, EventProcessor) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
+        let score = ScoreManager::new(pool);
+        let proc = EventProcessor::new(score.clone(), Arc::new(RateLimiter::new()));
+        (dir, score, proc)
+    }
+
+    /// Валидный чанк поднимает репутацию, поток битых чанков уводит её в минус.
+    #[tokio::test]
+    async fn chunk_events_move_score_in_expected_direction() {
+        let (_dir, score, proc) = make_processor().await;
+        let peer = node(1);
+
+        proc.process(ReputationEvent::ValidChunk { peer_id: peer.clone(), size_bytes: 1000 }).await;
+        let after_valid = score.score(&peer).await;
+        assert!(after_valid > 0.0, "валидный чанк должен поднять score, получено {after_valid}");
+
+        for _ in 0..50 {
+            proc.process(ReputationEvent::BadChunk { peer_id: peer.clone() }).await;
+        }
+        let after_bad = score.score(&peer).await;
+        assert!(after_bad < after_valid, "битые чанки должны понизить score");
+        assert!(after_bad < 0.0, "поток битых чанков уводит score в минус, получено {after_bad}");
+    }
+
+    /// Сессия онлайн (connect → disconnect) начисляет аптайм-бонус.
+    #[tokio::test]
+    async fn uptime_session_is_recorded() {
+        let (_dir, score, proc) = make_processor().await;
+        let peer = node(2);
+
+        proc.process(ReputationEvent::PeerConnected { peer_id: peer.clone() }).await;
+        // Имитируем «час онлайн», чтобы аптайм-бонус был заметен.
+        score.record_uptime(&peer, std::time::Duration::from_secs(3600)).await;
+        proc.process(ReputationEvent::PeerDisconnected { peer_id: peer.clone() }).await;
+
+        let rep = score.get(&peer).await.expect("запись репутации должна существовать");
+        assert!(rep.uptime_seconds >= 3600, "аптайм должен учитываться, получено {}", rep.uptime_seconds);
+        assert!(rep.score > 0.0, "аптайм даёт положительный score, получено {}", rep.score);
     }
 }

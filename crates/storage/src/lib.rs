@@ -26,6 +26,7 @@
 pub mod chunk_store;
 pub mod chunker;
 pub mod error;
+pub mod events;
 pub mod index;
 pub mod integrity;
 pub mod manager;
@@ -33,5 +34,6 @@ pub mod transfer;
 
 pub use chunk_store::ChunkStore;
 pub use error::StorageError;
+pub use events::ChunkEvent;
 pub use manager::StorageManager;
 pub use transfer::{ChunkRequest, ChunkResponse, ChunkResponseStatus};

@@ -69,6 +69,7 @@ impl VoidApp {
             backend.my_id_full.clone(),
         );
         chat.messages.clear();
+        chat.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
 
         // Load saved profile values (description, status) for the profile page
         let saved = crate::profile_store::load_or_create();
@@ -85,7 +86,8 @@ impl VoidApp {
         profile.profile_tx      = Some(backend.profile_tx.clone());
         profile.my_node_id      = Some(backend.my_id_node.clone());
 
-        let graph = Graph::new(backend.my_name.clone(), backend.my_id_node.clone());
+        let mut graph = Graph::new(backend.my_name.clone(), backend.my_id_node.clone());
+        graph.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
 
         // Инициализируем страницу личных сообщений
         let mut private = PrivatePage::default();
@@ -153,6 +155,9 @@ impl eframe::App for VoidApp {
                     if let Some(peer_id) = self.chat.pending_dm.take() {
                         self.open_dm(peer_id);
                     }
+                    if let Some((target, reason)) = self.chat.pending_report.take() {
+                        let _ = self.backend.report_tx.send((target, reason));
+                    }
                 }
                 Page::Private => self.private.show(ui),
                 Page::Storage => self.storage.show(ui),
@@ -162,6 +167,9 @@ impl eframe::App for VoidApp {
                     self.graph.show(ui);
                     if let Some(peer_id) = self.graph.pending_dm.take() {
                         self.open_dm(peer_id);
+                    }
+                    if let Some((target, reason)) = self.graph.pending_report.take() {
+                        let _ = self.backend.report_tx.send((target, reason));
                     }
                 }
             }

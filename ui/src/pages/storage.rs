@@ -22,6 +22,7 @@ pub struct FileEntry {
 pub enum FileStatus {
     NotStarted,
     Downloading(f32), // 0.0..1.0
+    Paused(f32),      // частично скачан, на паузе — 0.0..1.0
     Seeding,
     Complete,
 }
@@ -31,6 +32,7 @@ impl FileStatus {
         match self {
             FileStatus::NotStarted => ui.visuals().weak_text_color(),
             FileStatus::Downloading(_) => ui.visuals().hyperlink_color,
+            FileStatus::Paused(_) => egui::Color32::from_rgb(200, 160, 70),
             FileStatus::Seeding => egui::Color32::from_rgb(180, 130, 60),
             FileStatus::Complete => egui::Color32::from_rgb(80, 180, 100),
         }
@@ -40,6 +42,7 @@ impl FileStatus {
         match self {
             FileStatus::NotStarted => "  Ожидание".into(),
             FileStatus::Downloading(p) => format!("󰇚  Загрузка ({:.0}%)", p * 100.0),
+            FileStatus::Paused(p) => format!("󰏤  Пауза ({:.0}%)", p * 100.0),
             FileStatus::Seeding => "󰕒  Раздача".into(),
             FileStatus::Complete => "󰄬  Готово".into(),
         }
@@ -120,6 +123,9 @@ impl StoragePage {
                 FileStatus::Complete
             } else if self.downloading.contains(&f.file_id) {
                 FileStatus::Downloading(f.progress as f32)
+            } else if f.progress > 0.0 {
+                // частично скачан, но не в активной загрузке → на паузе (resume)
+                FileStatus::Paused(f.progress as f32)
             } else {
                 FileStatus::NotStarted
             };
@@ -381,7 +387,7 @@ impl StoragePage {
             let pending = self
                 .files
                 .iter()
-                .filter(|f| matches!(f.status, FileStatus::NotStarted))
+                .filter(|f| matches!(f.status, FileStatus::NotStarted | FileStatus::Paused(_)))
                 .count();
 
             ui.label(
@@ -528,6 +534,7 @@ fn table_row(
                     let (label, act) = match &file.status {
                         FileStatus::NotStarted => ("󰇚  Загрузить", RowAction::Download),
                         FileStatus::Downloading(_) => ("  Пауза", RowAction::Pause),
+                        FileStatus::Paused(_) => ("󰐊  Продолжить", RowAction::Download),
                         FileStatus::Complete | FileStatus::Seeding => ("󰈔  Открыть", RowAction::Open),
                     };
                     let btn = ui.add_sized([COL_ACTION - 4.0, 24.0], Button::new(label).wrap(false));

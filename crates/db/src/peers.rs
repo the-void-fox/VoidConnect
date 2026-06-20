@@ -243,13 +243,19 @@ pub async fn apply_reputation_delta(
             spam_strikes      = spam_strikes      + ?,
             uptime_seconds    = uptime_seconds    + ?,
             bootstrap_bonus   = bootstrap_bonus   + ?,
-            -- упрощённая формула score; пересчитай в reputation::score.rs при желании
+            -- Веса согласованы с константами в reputation::score.rs:
+            --   upload   0.05 / МБ  → 0.05 / 1048576 за байт
+            --   valid    +0.1 за чанк   (BONUS_VALID_CHUNK)
+            --   bad      -2.0 за чанк   (PENALTY_BAD_CHUNK)
+            --   spam     -3.0 за страйк (PENALTY_SPAM_STRIKE)
+            --   uptime   0.5 / час  → 0.5 / 3600 за секунду
             score = score
-                + (? * 0.01)          -- upload ratio
-                - (? * 0.5)           -- bad chunks penalty
-                - (? * 1.0)           -- spam penalty
-                + (? * 0.001)         -- uptime bonus
-                + ?,                  -- bootstrap bonus
+                + (? * 0.0000000476837158)  -- upload: 0.05 / МБ
+                + (? * 0.1)                 -- valid chunk bonus
+                - (? * 2.0)                 -- bad chunk penalty
+                - (? * 3.0)                 -- spam penalty
+                + (? * 0.0001388888888889)  -- uptime: 0.5 / час
+                + ?,                        -- bootstrap / прямая дельта (sync, штрафы жалоб)
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE public_key = ?
         "#,
@@ -262,6 +268,7 @@ pub async fn apply_reputation_delta(
         delta.bootstrap_bonus,
         // score formula args:
         delta.upload_bytes,
+        delta.valid_chunks_sent,
         delta.bad_chunks_sent,
         delta.spam_strikes,
         delta.uptime_seconds,

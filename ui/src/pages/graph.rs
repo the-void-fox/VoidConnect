@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use eframe::egui;
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
@@ -12,11 +13,21 @@ pub struct Graph {
     selected: Option<NodeId>,
     /// Сигнал в VoidApp: открыть личный чат с этим пиром
     pub pending_dm: Option<NodeId>,
+    /// Снимок репутации узлов из backend (NodeId → score).
+    pub reputation: Option<Arc<Mutex<HashMap<NodeId, f64>>>>,
+    /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
+    pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
 }
 
 impl Graph {
     pub fn new(my_name: String, my_id: NodeId) -> Self {
-        Self { my_name, my_id, peers: Vec::new(), profiles: HashMap::new(), selected: None, pending_dm: None }
+        Self { my_name, my_id, peers: Vec::new(), profiles: HashMap::new(), selected: None, pending_dm: None, reputation: None, pending_report: None }
+    }
+
+    /// Текущая репутация узла из снимка backend (если есть).
+    fn peer_score(&self, id: &NodeId) -> Option<f64> {
+        self.reputation.as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
     }
 
     pub fn update_peers(&mut self, peers: Vec<PeerInfo>, profiles: HashMap<NodeId, PeerProfile>) {
@@ -44,6 +55,7 @@ impl Graph {
 
         let mut close_popup = false;
         let mut start_dm_id: Option<NodeId> = None;
+        let mut report_reason: Option<void_reputation::ReportReason> = None;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -55,10 +67,15 @@ impl Graph {
                     .resizable(false)
                     .default_width(320.0)
                     .show(ui.ctx(), |ui| {
-                        let start_dm = show_peer_profile(ui, Some(&peer), profile.as_ref());
+                        let rep = self.peer_score(&sel_id);
+                        let action = show_peer_profile(ui, Some(&peer), profile.as_ref(), rep);
                         ui.add_space(6.0);
-                        if start_dm {
+                        if action.start_dm {
                             start_dm_id = Some(sel_id.clone());
+                            close_popup = true;
+                        }
+                        if let Some(reason) = action.report {
+                            report_reason = Some(reason);
                             close_popup = true;
                         }
                         if ui.button("Закрыть").clicked() {
@@ -67,6 +84,9 @@ impl Graph {
                     });
             } else {
                 close_popup = true;
+            }
+            if let Some(reason) = report_reason {
+                self.pending_report = Some((sel_id.clone(), reason));
             }
         }
         if close_popup { self.selected = None; }

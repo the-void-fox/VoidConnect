@@ -49,6 +49,10 @@ pub enum ChatPacket {
     ProfileUpdate(PeerProfile),
     /// Объявление о публикации файла — рассылается всем (как ProfileUpdate).
     FileAnnounce(FileManifest),
+    /// Подписанный снимок репутации от узла `from` (gossip по сети).
+    ReputationSync { from: NodeId, signed: SignedMessage },
+    /// Подписанная жалоба на узел (reporter = signed.signer).
+    ReputationReport { signed: SignedMessage },
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -70,6 +74,16 @@ impl ChatMessage {
     pub fn new(from: NodeId, from_name: String, text: String, seq: u64) -> Self {
         ChatMessage { from, from_name, text, timestamp: Utc::now().timestamp(), seq, signature: None }
     }
+}
+
+/// Входящее событие репутации, переданное backend'у (он трактует подпись/payload).
+/// Чат сам в репутацию не лезет — лишь переносит подписанные пакеты.
+#[derive(Debug, Clone)]
+pub enum RepGossip {
+    /// Снимок оценок от узла `from`.
+    Sync { from: NodeId, signed: SignedMessage },
+    /// Жалоба (reporter = signed.signer).
+    Report { signed: SignedMessage },
 }
 
 // ─── Состояние ───────────────────────────────────────────────────────────────
@@ -105,6 +119,8 @@ struct PublicChatInner {
     manifests:   Mutex<HashMap<String, FileManifest>>,
     /// Уведомление backend о новых (впервые увиденных) манифестах
     manifest_tx: broadcast::Sender<FileManifest>,
+    /// Входящие пакеты репутации (sync/жалобы) → backend
+    rep_tx:      broadcast::Sender<RepGossip>,
     /// Счётчик поколений соединения — чтобы старый read-task не затёр новый outbox
     conn_gen:    AtomicU64,
 }
@@ -113,6 +129,7 @@ impl PublicChat {
     fn new(my_peer: PeerInfo, peer_list: PeerList, chat_port: u16, signing_kp: Arc<SigningKeypair>) -> Self {
         let (incoming_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
                 my_peer, peer_list, chat_port, signing_kp, incoming_tx,
@@ -127,6 +144,7 @@ impl PublicChat {
                 my_profile:  Mutex::new(None),
                 manifests:   Mutex::new(HashMap::new()),
                 manifest_tx,
+                rep_tx,
                 conn_gen:    AtomicU64::new(0),
             }),
         }
@@ -213,6 +231,60 @@ impl PublicChat {
         let outbox = self.inner.outbox_tx.lock().await;
         if let Some(tx) = outbox.as_ref() {
             let _ = tx.try_send(ChatPacket::FileAnnounce(manifest));
+        }
+    }
+
+    // ─── Репутация (gossip) ───────────────────────────────────────────────────
+
+    /// Подписка backend на входящие пакеты репутации (sync/жалобы).
+    pub fn subscribe_reputation(&self) -> broadcast::Receiver<RepGossip> {
+        self.inner.rep_tx.subscribe()
+    }
+
+    /// Рассылает наш снимок репутации сети.
+    pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
+        self.broadcast_rep_packet(ChatPacket::ReputationSync { from, signed }).await;
+    }
+
+    /// Рассылает нашу жалобу на узел.
+    pub async fn broadcast_report(&self, signed: SignedMessage) {
+        self.broadcast_rep_packet(ChatPacket::ReputationReport { signed }).await;
+    }
+
+    async fn broadcast_rep_packet(&self, pkt: ChatPacket) {
+        {
+            let clients = self.inner.clients.lock().await;
+            for tx in clients.values() {
+                let _ = tx.try_send(pkt.clone());
+            }
+        }
+        let outbox = self.inner.outbox_tx.lock().await;
+        if let Some(tx) = outbox.as_ref() {
+            let _ = tx.try_send(pkt);
+        }
+    }
+
+    /// Обрабатывает входящий пакет репутации: отдаёт backend'у и — если мы релей
+    /// — форвардит остальным клиентам (кроме отправителя). Получатели в backend
+    /// сами проверяют подпись; чат лишь переносит.
+    async fn handle_reputation(&self, gossip: RepGossip) {
+        let _ = self.inner.rep_tx.send(gossip.clone());
+
+        let (excl, pkt) = match gossip {
+            RepGossip::Sync { from, signed } => {
+                let excl = from.as_str().to_string();
+                (excl, ChatPacket::ReputationSync { from, signed })
+            }
+            RepGossip::Report { signed } => {
+                let excl = signed.signer.clone();
+                (excl, ChatPacket::ReputationReport { signed })
+            }
+        };
+        let clients = self.inner.clients.lock().await;
+        for (id, tx) in clients.iter() {
+            if id.as_str() != excl {
+                let _ = tx.try_send(pkt.clone());
+            }
         }
     }
 }
@@ -360,6 +432,12 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
                 Ok(ChatPacket::FileAnnounce(manifest)) => {
                     debug!("FileAnnounce from client {}: {}", nid, manifest.name);
                     chat_r.handle_file_announce(manifest).await;
+                }
+                Ok(ChatPacket::ReputationSync { from, signed }) => {
+                    chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
+                }
+                Ok(ChatPacket::ReputationReport { signed }) => {
+                    chat_r.handle_reputation(RepGossip::Report { signed }).await;
                 }
                 Ok(ChatPacket::Ping) => {
                     debug!("Ping from client {}", nid);
@@ -734,6 +812,12 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
                     debug!("FileAnnounce from relay: {}", manifest.name);
                     chat_r.handle_file_announce(manifest).await;
                 }
+                Ok(ChatPacket::ReputationSync { from, signed }) => {
+                    chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
+                }
+                Ok(ChatPacket::ReputationReport { signed }) => {
+                    chat_r.handle_reputation(RepGossip::Report { signed }).await;
+                }
                 Ok(ChatPacket::Ping) => {
                     // Ретранслятор пингует нас — отвечаем Pong через outbox
                     let outbox = chat_r.inner.outbox_tx.lock().await;
@@ -771,6 +855,11 @@ impl ChatHandle {
     pub async fn announce_file(&self, manifest: FileManifest) { self.chat.announce_file(manifest).await }
     pub fn subscribe_manifests(&self) -> broadcast::Receiver<FileManifest> { self.chat.subscribe_manifests() }
     pub async fn get_manifests(&self) -> Vec<FileManifest> { self.chat.get_manifests().await }
+    pub fn subscribe_reputation(&self) -> broadcast::Receiver<RepGossip> { self.chat.subscribe_reputation() }
+    pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
+        self.chat.broadcast_reputation_sync(from, signed).await
+    }
+    pub async fn broadcast_report(&self, signed: SignedMessage) { self.chat.broadcast_report(signed).await }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────

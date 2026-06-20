@@ -120,11 +120,32 @@ impl ScoreManager {
     /// Создаёт запись репутации для нового узла (score = 0).
     /// Идемпотентно — безопасно вызывать повторно.
     pub async fn init(&self, peer_id: &NodeId) -> crate::error::ReputationError {
+        self.ensure_peer(peer_id).await;
         db_peers::init_reputation(&self.pool, peer_id.as_str())
             .await
             .map_err(crate::error::ReputationError::from)
             .err()
             .unwrap_or(crate::error::ReputationError::Ok)
+    }
+
+    /// Гарантирует наличие строки в таблице `peers` — она нужна как FK-цель для
+    /// записи в `reputation` (иначе INSERT падает по внешнему ключу). Создаёт
+    /// минимальную запись (только публичный ключ), не затирая уже известные поля.
+    async fn ensure_peer(&self, peer_id: &NodeId) {
+        let peer = db_peers::Peer {
+            public_key: peer_id.as_str().to_string(),
+            username: None,
+            avatar_url: None,
+            status_text: None,
+            ip_address: None,
+            port: None,
+            is_bootstrap: false,
+            last_seen_at: None,
+            first_seen_at: chrono::Utc::now(),
+        };
+        if let Err(e) = db_peers::upsert_peer(&self.pool, &peer).await {
+            warn!("Failed to ensure peer row for {}: {}", peer_id, e);
+        }
     }
 
     // ─── Применение событий ───────────────────────────────────────────────────
@@ -199,6 +220,7 @@ impl ScoreManager {
 
     async fn apply(&self, peer_id: &NodeId, delta: ReputationDelta) {
         // Гарантируем что запись существует перед обновлением
+        self.ensure_peer(peer_id).await;
         let _ = db_peers::init_reputation(&self.pool, peer_id.as_str()).await;
 
         if let Err(e) =

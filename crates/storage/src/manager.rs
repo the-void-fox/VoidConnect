@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use void_core::identity::NodeId;
 use void_core::manifest::{ChunkMeta, FileManifest};
@@ -28,6 +29,7 @@ use void_db::DbPool;
 use crate::chunk_store::ChunkStore;
 use crate::chunker::{split_file, assemble_file};
 use crate::error::StorageError;
+use crate::events::ChunkEvent;
 use crate::index::ChunkIndex;
 use crate::integrity::verify_chunk;
 use crate::transfer::{fetch_chunk_from_peer, run_chunk_server};
@@ -41,6 +43,8 @@ pub struct StorageManager {
     store: ChunkStore,
     index: ChunkIndex,
     my_id: NodeId,
+    /// Опциональный канал событий о качестве чанков (для репутации).
+    events: Option<mpsc::UnboundedSender<ChunkEvent>>,
 }
 
 impl StorageManager {
@@ -70,7 +74,14 @@ impl StorageManager {
             store,
             index,
             my_id,
+            events: None,
         })
+    }
+
+    /// Подключает канал событий о качестве чанков (для системы репутации).
+    /// Без него storage работает как прежде (события просто не шлются).
+    pub fn set_event_sink(&mut self, tx: mpsc::UnboundedSender<ChunkEvent>) {
+        self.events = Some(tx);
     }
 
     /// Запускает TCP chunk-сервер.
@@ -301,6 +312,7 @@ impl StorageManager {
                 let owners_clone = owners.clone();
                 let pool = self.pool.clone();
                 let store = self.store.clone();
+                let events = self.events.clone();
 
                 handles.push(tokio::spawn(async move {
                     fetch_chunk_with_fallback(
@@ -311,6 +323,7 @@ impl StorageManager {
                         &my_id,
                         &store,
                         &pool,
+                        events.as_ref(),
                     )
                     .await
                 }));
@@ -411,6 +424,7 @@ impl StorageManager {
 
 /// Скачивает чанк, перебирая владельцев по очереди.
 /// При успехе — сохраняет локально и обновляет БД.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_chunk_with_fallback(
     hash: &str,
     index: usize,
@@ -419,6 +433,7 @@ async fn fetch_chunk_with_fallback(
     my_id: &NodeId,
     store: &ChunkStore,
     pool: &DbPool,
+    events: Option<&mpsc::UnboundedSender<ChunkEvent>>,
 ) -> Result<(usize, Vec<u8>), StorageError> {
     for owner_id in owners {
         // Найдём IP:port этого узла в списке активных пиров
@@ -452,10 +467,18 @@ async fn fetch_chunk_with_fallback(
                 // Только обновляем is_local и local_path для существующей записи
                 let _ = db_chunks::upsert_chunk(pool, &record).await;
 
+                // Репутация: пир отдал валидный чанк.
+                if let Some(tx) = events {
+                    let _ = tx.send(ChunkEvent::Valid {
+                        peer: owner_id.clone(),
+                        size_bytes: data.len() as i64,
+                    });
+                }
+
                 return Ok((index, data));
             }
             Err(StorageError::IntegrityFailure { expected, actual }) => {
-                // Плохой чанк — логируем, продолжаем к следующему узлу
+                // Плохой чанк — логируем, штрафуем репутацию, идём к следующему узлу
                 warn!(
                     "Integrity failure from {}: chunk {}, expected {}, got {}",
                     owner_id,
@@ -463,7 +486,9 @@ async fn fetch_chunk_with_fallback(
                     &expected[..8],
                     &actual[..8]
                 );
-                // TODO: передать штраф репутации через канал events
+                if let Some(tx) = events {
+                    let _ = tx.send(ChunkEvent::Bad { peer: owner_id.clone() });
+                }
                 continue;
             }
             Err(e) => {
@@ -709,6 +734,57 @@ mod tests {
         assert!(!dest.exists(), "файл не должен быть собран при отмене");
         let progress = mgr_b.download_progress(&file_id).await.unwrap();
         assert!(progress.abs() < 1e-9, "прогресс должен остаться 0 после отмены, получено {progress}");
+    }
+
+    /// Репутация: успешное скачивание чанков у пира порождает события Valid
+    /// с указанием владельца и размера (питают начисление репутации).
+    #[tokio::test]
+    async fn download_emits_valid_chunk_events() {
+        let (dir_a, _pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+
+        let a_port = free_port();
+        let srv = mgr_a.clone();
+        tokio::spawn(async move { let _ = srv.start_server(a_port).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // B с подключённым каналом событий.
+        let (dir_b, _pool_b, mut mgr_b) = make_node(2).await;
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkEvent>();
+        mgr_b.set_event_sink(ev_tx);
+        let manifest = mgr_a.file_manifest(&file_id).await.unwrap().unwrap();
+        mgr_b.handle_manifest(&manifest).await.unwrap();
+
+        let a_peer = PeerInfo {
+            id:        node(1),
+            name:      "A".into(),
+            ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port:      a_port,
+            chat_port: a_port.wrapping_add(2),
+            services:  vec![Service::Storage],
+            last_seen: 0,
+        };
+        let dest = dir_b.path().join("out.bin");
+        mgr_b.download_file(&file_id, &dest, &[a_peer]).await.unwrap();
+
+        // Собираем все события: должно быть 3 Valid от node(1), суммарно = размер файла.
+        let mut total = 0i64;
+        let mut count = 0;
+        while let Ok(ev) = ev_rx.try_recv() {
+            match ev {
+                ChunkEvent::Valid { peer, size_bytes } => {
+                    assert_eq!(peer, node(1), "владелец валидного чанка — A");
+                    total += size_bytes;
+                    count += 1;
+                }
+                ChunkEvent::Bad { .. } => panic!("неожиданное Bad-событие"),
+            }
+        }
+        assert_eq!(count, 3, "ожидалось 3 события Valid (по чанку)");
+        assert_eq!(total, content.len() as i64, "сумма размеров чанков = размер файла");
     }
 }
 

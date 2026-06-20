@@ -41,13 +41,17 @@ use std::sync::Arc;
 use void_core::identity::NodeId;
 use void_crypto::keys::SigningKeypair;
 use void_db::DbPool;
-use void_network::{rate_limit::RateLimiter, router::Router};
+use void_network::router::Router;
 
 pub use error::ReputationError;
 pub use events::{EventProcessor, ReputationEvent};
 pub use reports::{ReportManager, ReportReason};
 pub use score::{ReputationLevel, ScoreManager};
 pub use sync::SyncManager;
+
+/// Re-export, чтобы потребители (например, UI) могли создать `RateLimiter`
+/// для `EventProcessor` без прямой зависимости на `void-network`.
+pub use void_network::rate_limit::RateLimiter;
 
 /// Единая точка входа в систему репутации.
 ///

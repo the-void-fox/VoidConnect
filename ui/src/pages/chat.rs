@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui::{Button, Frame, ScrollArea, TextEdit};
 use void_core::identity::NodeId;
@@ -26,6 +27,10 @@ pub struct ChatPage {
     selected: Option<NodeId>,
     /// Сигнал в VoidApp: открыть личный чат с этим пиром
     pub pending_dm: Option<NodeId>,
+    /// Снимок репутации узлов из backend (NodeId → score).
+    pub reputation: Option<Arc<Mutex<HashMap<NodeId, f64>>>>,
+    /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
+    pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
 }
 
 impl ChatPage {
@@ -46,6 +51,8 @@ impl ChatPage {
             profiles:         HashMap::new(),
             selected:         None,
             pending_dm:       None,
+            reputation:       None,
+            pending_report:   None,
         }
     }
 
@@ -53,6 +60,12 @@ impl ChatPage {
         self.peers    = peers;
         self.profiles = profiles;
         // Don't auto-close popup — we now show it from profile cache even when offline
+    }
+
+    /// Текущая репутация узла из снимка backend (если есть).
+    fn peer_score(&self, id: &NodeId) -> Option<f64> {
+        self.reputation.as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
     }
 }
 
@@ -70,6 +83,8 @@ impl Default for ChatPage {
             profiles:         HashMap::new(),
             selected:         None,
             pending_dm:       None,
+            reputation:       None,
+            pending_report:   None,
         }
     }
 }
@@ -79,6 +94,7 @@ impl ChatPage {
         // Profile popup — shown from cache even if peer is offline
         let mut close_popup = false;
         let mut start_dm_id: Option<NodeId> = None;
+        let mut report_reason: Option<void_reputation::ReportReason> = None;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -90,10 +106,15 @@ impl ChatPage {
                     .resizable(false)
                     .default_width(320.0)
                     .show(ui.ctx(), |ui| {
-                        let start_dm = show_peer_profile(ui, peer.as_ref(), profile.as_ref());
+                        let rep = self.peer_score(&sel_id);
+                        let action = show_peer_profile(ui, peer.as_ref(), profile.as_ref(), rep);
                         ui.add_space(6.0);
-                        if start_dm {
+                        if action.start_dm {
                             start_dm_id = Some(sel_id.clone());
+                            close_popup = true;
+                        }
+                        if let Some(reason) = action.report {
+                            report_reason = Some(reason);
                             close_popup = true;
                         }
                         if ui.button("Закрыть").clicked() {
@@ -102,6 +123,9 @@ impl ChatPage {
                     });
             } else {
                 close_popup = true;
+            }
+            if let Some(reason) = report_reason {
+                self.pending_report = Some((sel_id.clone(), reason));
             }
         }
         if close_popup { self.selected = None; }

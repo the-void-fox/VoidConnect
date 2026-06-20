@@ -1,6 +1,6 @@
 //! Мост между асинхронным бэкендом (tokio) и синхронным GUI (egui).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,11 +8,14 @@ use std::sync::{Arc, Mutex};
 
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
-use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage};
+use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip};
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_discovery::PeerList;
-use void_storage::{ChunkStore, StorageManager};
+use void_storage::{ChunkEvent, ChunkStore, StorageManager};
+use void_reputation::{
+    EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager, SyncManager,
+};
 
 /// Запись о файле в хранилище — снимок для GUI.
 #[derive(Clone)]
@@ -36,6 +39,17 @@ pub enum DownloadCmd {
     Start(String),
     /// Поставить на паузу скачивание файла по его file_id.
     Pause(String),
+}
+
+/// Компоненты системы репутации, разделяемые между фоновыми задачами.
+#[derive(Clone)]
+struct Reputation {
+    score:   ScoreManager,
+    events:  EventProcessor,
+    sync:    Arc<SyncManager>,
+    reports: ReportManager,
+    /// Наш ключ подписи — для создания подписанных жалоб.
+    keypair: Arc<SigningKeypair>,
 }
 
 pub struct BackendHandle {
@@ -77,6 +91,10 @@ pub struct BackendHandle {
     pub storage_files: Arc<Mutex<Vec<StorageFileInfo>>>,
     /// Папка, куда сохраняются скачанные файлы (для «Открыть» в UI).
     pub downloads_dir: PathBuf,
+    /// Снимок репутации известных узлов: NodeId → score (обновляется ~2с).
+    pub peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>,
+    /// Канал GUI → backend: пожаловаться на узел (target, причина).
+    pub report_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, ReportReason)>,
 }
 
 pub fn start_backend(
@@ -94,6 +112,7 @@ pub fn start_backend(
     let dm_inbox:      Arc<Mutex<VecDeque<IncomingDm>>>          = Arc::new(Mutex::new(VecDeque::new()));
     let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
     let storage_files: Arc<Mutex<Vec<StorageFileInfo>>>         = Arc::new(Mutex::new(Vec::new()));
+    let peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>       = Arc::new(Mutex::new(HashMap::new()));
 
     let (chat_tx,    chat_rx)    = tokio::sync::mpsc::unbounded_channel::<String>();
     let (connect_tx, connect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -101,6 +120,7 @@ pub fn start_backend(
     let (dm_tx,      dm_rx)      = tokio::sync::mpsc::unbounded_channel::<DmSendCmd>();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadCmd>();
+    let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, ReportReason)>();
 
     let my_ip = if local_mode {
         IpAddr::from([127, 0, 0, 1])
@@ -134,6 +154,7 @@ pub fn start_backend(
     let sign_kp_bg  = Arc::clone(&sign_kp);
     let history_bg  = Arc::clone(&chat_history);
     let storage_bg  = Arc::clone(&storage_files);
+    let reputation_bg = Arc::clone(&peer_reputation);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -147,6 +168,7 @@ pub fn start_backend(
                 chat_rx, connect_rx, profile_rx, dm_rx,
                 data_dir, history_bg,
                 publish_rx, download_rx, storage_bg,
+                reputation_bg, report_rx,
             ).await;
         });
     });
@@ -175,6 +197,8 @@ pub fn start_backend(
         download_tx,
         storage_files,
         downloads_dir,
+        peer_reputation,
+        report_tx,
     }
 }
 
@@ -201,6 +225,8 @@ async fn backend_main(
     publish_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
     download_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadCmd>,
     storage_files_out: Arc<Mutex<Vec<StorageFileInfo>>>,
+    reputation_out: Arc<Mutex<HashMap<NodeId, f64>>>,
+    mut report_rx: tokio::sync::mpsc::UnboundedReceiver<(NodeId, ReportReason)>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -224,6 +250,40 @@ async fn backend_main(
         None => Vec::new(),
     };
     *chat_history_out.lock().unwrap() = Some(loaded);
+
+    // ── Система репутации (локальный скоринг + сетевая синхронизация) ─────────
+    // Доступна, если есть БД.
+    let reputation: Option<Reputation> = db_pool.clone().map(|pool| {
+        let score = ScoreManager::new(pool.clone());
+        let rate_limiter = Arc::new(RateLimiter::new());
+        let events = EventProcessor::new(score.clone(), rate_limiter);
+        let sync = Arc::new(SyncManager::new(
+            pool.clone(), score.clone(), events.clone(),
+            sign_kp.clone(), my_peer.id.clone(),
+        ));
+        let reports = ReportManager::new(pool, score.clone());
+        Reputation { score, events, sync, reports, keypair: sign_kp.clone() }
+    });
+
+    // Канал событий о качестве чанков из storage → события репутации.
+    let chunk_ev_tx: Option<tokio::sync::mpsc::UnboundedSender<ChunkEvent>> =
+        reputation.as_ref().map(|rep| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChunkEvent>();
+            let ev = rep.events.clone();
+            tokio::spawn(async move {
+                while let Some(e) = rx.recv().await {
+                    match e {
+                        ChunkEvent::Valid { peer, size_bytes } => {
+                            ev.process(ReputationEvent::ValidChunk { peer_id: peer, size_bytes }).await;
+                        }
+                        ChunkEvent::Bad { peer } => {
+                            ev.process(ReputationEvent::BadChunk { peer_id: peer }).await;
+                        }
+                    }
+                }
+            });
+            tx
+        });
 
     let peer_list = PeerList::new();
 
@@ -367,21 +427,109 @@ async fn backend_main(
         }
     });
 
-    // Задача: периодически снимаем peer_list и профили для GUI
-    let pl      = peer_list.clone();
-    let chat_p  = chat.clone();
+    // Задача: периодически снимаем peer_list и профили для GUI.
+    // Здесь же ведём репутацию: события подключения/отключения (аптайм) и
+    // обновление снимка score для GUI.
+    let pl       = peer_list.clone();
+    let chat_p   = chat.clone();
+    let rep_snap = reputation.clone();
+    let rep_out  = Arc::clone(&reputation_out);
+    let my_rep_id = my_peer.id.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        let mut prev_ids: HashSet<NodeId> = HashSet::new();
         loop {
             interval.tick().await;
-            *peers_out.lock().unwrap()   = pl.all().await;
+            let peers = pl.all().await;
+            *peers_out.lock().unwrap() = peers.clone();
             let profiles = chat_p.get_profiles().await;
-            let mut map = profiles_out.lock().unwrap();
-            for p in profiles {
-                map.insert(p.node_id.clone(), p);
+            {
+                let mut map = profiles_out.lock().unwrap();
+                for p in profiles {
+                    map.insert(p.node_id.clone(), p);
+                }
+            }
+
+            if let Some(rep) = &rep_snap {
+                // Только реальные узлы (64-hex), не stub-заглушки.
+                let cur_ids: HashSet<NodeId> = peers.iter()
+                    .filter(|p| p.id.as_str().len() == 64)
+                    .map(|p| p.id.clone())
+                    .collect();
+                let newly: Vec<NodeId> = cur_ids.difference(&prev_ids).cloned().collect();
+                for id in &newly {
+                    rep.events.process(ReputationEvent::PeerConnected { peer_id: id.clone() }).await;
+                }
+                for id in prev_ids.difference(&cur_ids) {
+                    rep.events.process(ReputationEvent::PeerDisconnected { peer_id: id.clone() }).await;
+                }
+                // Появились новые узлы — рассылаем им наш снимок оценок (gossip).
+                if !newly.is_empty() {
+                    if let Ok(signed) = rep.sync.build_signed_sync().await {
+                        chat_p.broadcast_reputation_sync(my_rep_id.clone(), signed).await;
+                    }
+                }
+                // Снимок репутации для GUI.
+                let mut snapshot = HashMap::with_capacity(cur_ids.len());
+                for id in &cur_ids {
+                    snapshot.insert(id.clone(), rep.score.score(id).await);
+                }
+                *rep_out.lock().unwrap() = snapshot;
+                prev_ids = cur_ids;
             }
         }
     });
+
+    // Задача: входящие пакеты репутации из сети (sync/жалобы) → применяем.
+    if let Some(rep) = reputation.clone() {
+        let mut rep_rx = chat.subscribe_reputation();
+        tokio::spawn(async move {
+            loop {
+                match rep_rx.recv().await {
+                    Ok(RepGossip::Sync { from, signed }) => {
+                        if let Err(e) = rep.sync.apply_signed_sync(&from, &signed).await {
+                            tracing::debug!("Отклонён sync репутации от {}: {}", from, e);
+                        }
+                    }
+                    Ok(RepGossip::Report { signed }) => {
+                        let reporter = NodeId(signed.signer.clone());
+                        if let Err(e) = rep.reports.receive_report(signed, &reporter).await {
+                            tracing::debug!("Отклонена жалоба от {}: {}", reporter, e);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Reputation gossip lagged by {}", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Задача: исходящие жалобы из GUI → подписываем, применяем локально, рассылаем.
+    if let Some(rep) = reputation.clone() {
+        let chat_rep = chat.clone();
+        let my_report_id = my_peer.id.clone();
+        tokio::spawn(async move {
+            while let Some((target, reason)) = report_rx.recv().await {
+                if target == my_report_id {
+                    tracing::warn!("Нельзя пожаловаться на себя");
+                    continue;
+                }
+                match ReportManager::create_report(&target, reason, &rep.keypair) {
+                    Ok(signed) => {
+                        // Учитываем свою жалобу локально и рассылаем сети.
+                        if let Err(e) = rep.reports.receive_report(signed.clone(), &my_report_id).await {
+                            tracing::warn!("Локальная жалоба не принята: {}", e);
+                        }
+                        chat_rep.broadcast_report(signed).await;
+                        tracing::info!("Отправлена жалоба на {}", target);
+                    }
+                    Err(e) => tracing::warn!("Не удалось создать жалобу: {}", e),
+                }
+            }
+        });
+    }
 
     // ── Подсистема хранилища (требует БД) ─────────────────────────────────────
     // chunk-сервер слушает base_port (он свободен: чат на +2, DM на +3),
@@ -389,7 +537,11 @@ async fn backend_main(
     if let Some(pool) = db_pool.clone() {
         match ChunkStore::new(data_dir.join("chunks")).await {
             Ok(store) => match StorageManager::new(pool.clone(), store, my_peer.id.clone()).await {
-                Ok(manager) => {
+                Ok(mut manager) => {
+                    // Подключаем события качества чанков к репутации (если включена).
+                    if let Some(tx) = chunk_ev_tx.clone() {
+                        manager.set_event_sink(tx);
+                    }
                     start_storage_tasks(
                         manager, pool, chat.clone(), peer_list.clone(),
                         my_peer.id.clone(), base_port, data_dir.clone(),
@@ -486,12 +638,15 @@ fn start_storage_tasks(
     let dl_pool  = pool.clone();
     let dl_pl    = peer_list.clone();
     let downloads_dir = data_dir.join("downloads");
+    // Флаги отмены активных скачиваний. Завершившаяся задача убирает свой флаг,
+    // поэтому карта не растёт бесконечно.
+    let cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(async move {
-        let mut cancels: HashMap<String, Arc<AtomicBool>> = HashMap::new();
         while let Some(cmd) = download_rx.recv().await {
             match cmd {
                 DownloadCmd::Pause(file_id) => {
-                    if let Some(flag) = cancels.get(&file_id) {
+                    let flag = cancels.lock().unwrap().get(&file_id).cloned();
+                    if let Some(flag) = flag {
                         flag.store(true, Ordering::Relaxed);
                         tracing::info!("Пауза скачивания {}", &file_id[..8.min(file_id.len())]);
                     }
@@ -511,15 +666,17 @@ fn start_storage_tasks(
                     }
                     // Свежий (сброшенный) флаг отмены на этот запуск.
                     let flag = Arc::new(AtomicBool::new(false));
-                    cancels.insert(file_id.clone(), Arc::clone(&flag));
+                    cancels.lock().unwrap().insert(file_id.clone(), Arc::clone(&flag));
 
                     let dest  = downloads_dir.join(&name);
                     let peers = dl_pl.all().await;
                     let mgr   = dl_mgr.clone();
                     let chat  = dl_chat.clone();
+                    let cancels_task = Arc::clone(&cancels);
                     tracing::info!("Скачивание '{}' → {}", name, dest.display());
                     tokio::spawn(async move {
-                        match mgr.download_file_cancellable(&file_id, &dest, &peers, flag).await {
+                        let dl_flag = Arc::clone(&flag);
+                        match mgr.download_file_cancellable(&file_id, &dest, &peers, dl_flag).await {
                             Ok(()) => {
                                 tracing::info!("Файл '{}' скачан в {}", name, dest.display());
                                 // Мульти-сидинг: объявляем себя новым сидером.
@@ -532,6 +689,11 @@ fn start_storage_tasks(
                             Err(e) =>
                                 tracing::warn!("Скачивание '{}' не удалось: {}", name, e),
                         }
+                        // Убираем флаг этого запуска (если его не вытеснил новый старт).
+                        let mut map = cancels_task.lock().unwrap();
+                        if map.get(&file_id).map(|f| Arc::ptr_eq(f, &flag)).unwrap_or(false) {
+                            map.remove(&file_id);
+                        }
                     });
                 }
             }
@@ -541,6 +703,7 @@ fn start_storage_tasks(
     // периодический снимок списка файлов для GUI (с числом сидеров из манифестов)
     let my_key = my_id.as_str().to_string();
     let snap_chat = chat.clone();
+    let snap_pl   = peer_list.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         loop {
@@ -549,10 +712,22 @@ fn start_storage_tasks(
                 Ok(f)  => f,
                 Err(e) => { tracing::warn!("list_files failed: {}", e); continue; }
             };
-            // Число сидеров берём из объединённых манифестов чата.
+            // Живые узлы: активные пиры + мы сами. Сидером считаем только тех
+            // владельцев из манифеста, кто сейчас на связи (приблизительно).
+            let live: HashSet<String> = snap_pl.all().await
+                .into_iter()
+                .map(|p| p.id.as_str().to_string())
+                .chain(std::iter::once(my_key.clone()))
+                .collect();
+            // Число живых сидеров из объединённых манифестов чата.
             let seeders: HashMap<String, i64> = snap_chat.get_manifests().await
                 .into_iter()
-                .map(|m| (m.file_id, m.owners.len() as i64))
+                .map(|m| {
+                    let live_count = m.owners.iter()
+                        .filter(|o| live.contains(o.as_str()))
+                        .count() as i64;
+                    (m.file_id, live_count)
+                })
                 .collect();
             let mut out = Vec::with_capacity(files.len());
             for f in files {

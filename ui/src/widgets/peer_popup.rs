@@ -1,5 +1,15 @@
 use eframe::egui;
 use void_core::peer::{PeerInfo, PeerProfile};
+use void_reputation::ReportReason;
+
+/// Действие, выбранное пользователем в попапе профиля узла.
+#[derive(Default)]
+pub struct PeerPopupAction {
+    /// Нажата «Начать беседу».
+    pub start_dm: bool,
+    /// Выбрана причина жалобы на узел.
+    pub report: Option<ReportReason>,
+}
 
 pub fn status_colors(status: Option<&str>) -> (egui::Color32, egui::Color32) {
     match status {
@@ -11,13 +21,14 @@ pub fn status_colors(status: Option<&str>) -> (egui::Color32, egui::Color32) {
     }
 }
 
-/// Показывает профиль пира.
-/// Возвращает `true` если пользователь нажал "Начать беседу".
+/// Показывает профиль пира. Возвращает выбранное действие (начать беседу /
+/// пожаловаться).
 pub fn show_peer_profile(
-    ui:      &mut egui::Ui,
-    peer:    Option<&PeerInfo>,
-    profile: Option<&PeerProfile>,
-) -> bool {
+    ui:         &mut egui::Ui,
+    peer:       Option<&PeerInfo>,
+    profile:    Option<&PeerProfile>,
+    reputation: Option<f64>,
+) -> PeerPopupAction {
     let name        = profile.map(|p| p.name.as_str())
         .or_else(|| peer.map(|p| p.name.as_str()))
         .unwrap_or("?");
@@ -92,6 +103,24 @@ pub fn show_peer_profile(
         );
     }
 
+    // Репутация узла (по локальным данным; сетевая синхронизация — отд. фаза)
+    if let Some(score) = reputation {
+        use void_reputation::ReputationLevel;
+        let (label, color) = match ReputationLevel::from_score(score) {
+            ReputationLevel::High     => ("Высокая",       egui::Color32::from_rgb(80, 180, 100)),
+            ReputationLevel::Normal   => ("Обычная",       egui::Color32::from_rgb(120, 170, 220)),
+            ReputationLevel::Low      => ("Низкая",        egui::Color32::from_rgb(200, 160, 70)),
+            ReputationLevel::Negative => ("Отрицательная", egui::Color32::from_rgb(220, 80, 60)),
+        };
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Репутация:").strong());
+            ui.label(egui::RichText::new(format!("{label}  ({score:.1})")).color(color));
+        });
+    }
+
     if !description.is_empty() {
         ui.add_space(6.0);
         ui.separator();
@@ -113,5 +142,24 @@ pub fn show_peer_profile(
     if resp.hovered() && !has_dm_key {
         resp.on_hover_text("Ключ шифрования ещё не получен. Подожди немного.");
     }
-    clicked
+
+    // Жалоба на узел
+    ui.add_space(4.0);
+    let mut report = None;
+    ui.menu_button("  󰀦  Пожаловаться", |ui| {
+        if ui.button(" 󱃈  Спам").clicked() {
+            report = Some(ReportReason::Spam);
+            ui.close_menu();
+        }
+        if ui.button(" 󰶍  Вредоносный контент").clicked() {
+            report = Some(ReportReason::MaliciousContent);
+            ui.close_menu();
+        }
+        if ui.button(" 󰇮  Битые файлы").clicked() {
+            report = Some(ReportReason::BadChunks);
+            ui.close_menu();
+        }
+    });
+
+    PeerPopupAction { start_dm: clicked, report }
 }

@@ -153,8 +153,9 @@ impl SyncManager {
 
     // ─── Построение sync-пакета ───────────────────────────────────────────────
 
-    /// Строит подписанный NetworkMessage::ReputationSync из наших локальных данных.
-    async fn build_sync_message(&self) -> Result<NetworkMessage, ReputationError> {
+    /// Строит подписанный снимок наших локальных оценок — транспорт-независимо
+    /// (используется и Router-путём, и gossip через relay чата).
+    pub async fn build_signed_sync(&self) -> Result<SignedMessage, ReputationError> {
         let all_peers = db_peers::list_peers(&self.pool)
             .await
             .map_err(ReputationError::from)?;
@@ -179,9 +180,36 @@ impl SyncManager {
             timestamp: chrono::Utc::now().timestamp(),
         };
 
-        let signed =
-            SignedMessage::sign(payload.to_bytes(), &self.my_keypair).map_err(ReputationError::from)?;
+        SignedMessage::sign(payload.to_bytes(), &self.my_keypair).map_err(ReputationError::from)
+    }
 
+    /// Применяет подписанный снимок от узла `from` (взвешенное усреднение).
+    /// Транспорт-независимый приём (для gossip через relay чата).
+    pub async fn apply_signed_sync(
+        &self,
+        from: &NodeId,
+        signed: &SignedMessage,
+    ) -> Result<(), ReputationError> {
+        if signed.signer != from.as_str() {
+            return Err(ReputationError::SignerMismatch);
+        }
+        signed.verify().map_err(ReputationError::from)?;
+
+        let sync: SyncPayload = serde_json::from_slice(&signed.payload)
+            .map_err(|e| ReputationError::Deserialize(e.to_string()))?;
+
+        let sender_score = self.score_manager.score(from).await;
+        let vote_weight = (sender_score / 100.0).clamp(MIN_VOTE_WEIGHT, 1.0);
+        debug!(
+            "Applying reputation sync from {} (weight={:.2}, entries={})",
+            from, vote_weight, sync.entries.len()
+        );
+        self.apply_sync(sync, vote_weight, from).await
+    }
+
+    /// Строит подписанный NetworkMessage::ReputationSync (Router-путь).
+    async fn build_sync_message(&self) -> Result<NetworkMessage, ReputationError> {
+        let signed = self.build_signed_sync().await?;
         Ok(NetworkMessage::ReputationSync {
             from: self.my_id.clone(),
             signed_payload: signed.payload,
@@ -283,8 +311,9 @@ impl SyncManager {
 
             let target_id = NodeId(entry.target_key.clone());
 
-            // Гарантируем существование записи
-            let _ = db_peers::init_reputation(&self.pool, &entry.target_key).await;
+            // Гарантируем существование строк peers+reputation (FK), иначе
+            // последующий UPDATE не найдёт записи.
+            let _ = self.score_manager.init(&target_id).await;
 
             // Получаем текущий score
             let current = self.score_manager.score(&target_id).await;
@@ -312,5 +341,66 @@ impl SyncManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use void_db::open;
+    use void_crypto::keys::SigningKeypair;
+
+    use crate::events::EventProcessor;
+    use crate::score::ScoreManager;
+    use void_network::rate_limit::RateLimiter;
+
+    fn keypair(seed: u8) -> (Arc<SigningKeypair>, NodeId) {
+        let kp = Arc::new(SigningKeypair::from_seed(&[seed; 32]).unwrap());
+        let id = NodeId::from_public_key_bytes(&kp.public_bytes());
+        (kp, id)
+    }
+
+    async fn manager(seed: u8) -> (tempfile::TempDir, ScoreManager, Arc<SyncManager>, NodeId) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
+        let (kp, id) = keypair(seed);
+        let score = ScoreManager::new(pool.clone());
+        let events = EventProcessor::new(score.clone(), Arc::new(RateLimiter::new()));
+        let sync = Arc::new(SyncManager::new(pool, score.clone(), events, kp, id.clone()));
+        (dir, score, sync, id)
+    }
+
+    /// Подписанный снимок оценок применяется получателем взвешенно: B, не зная
+    /// A (вес минимальный), сдвигает свою оценку X к присланной.
+    #[tokio::test]
+    async fn signed_sync_applies_weighted() {
+        // A знает X с заметным score.
+        let (_da, score_a, sync_a, _a_id) = manager(1).await;
+        let x = NodeId::from_public_key_bytes(&[9u8; 32]);
+        score_a.record_bootstrap_assist(&x, 50.0).await;
+        assert!((score_a.score(&x).await - 50.0).abs() < 1e-6);
+
+        let signed = sync_a.build_signed_sync().await.unwrap();
+        let (_a_kp, a_id) = keypair(1);
+
+        // B применяет снимок A. B не знает A → минимальный вес (0.1).
+        let (_db, score_b, sync_b, _b_id) = manager(2).await;
+        assert_eq!(score_b.score(&x).await, 0.0);
+        sync_b.apply_signed_sync(&a_id, &signed).await.unwrap();
+
+        let blended = score_b.score(&x).await;
+        assert!(blended > 0.0 && blended < 50.0,
+            "B сдвигает оценку X к присланной с малым весом, получено {blended}");
+        assert!((blended - 5.0).abs() < 0.5, "ожидался ~5.0 (вес 0.1), получено {blended}");
+    }
+
+    /// Снимок с подписантом ≠ from отклоняется.
+    #[tokio::test]
+    async fn sync_signer_mismatch_rejected() {
+        let (_da, _score_a, sync_a, _a_id) = manager(1).await;
+        let signed = sync_a.build_signed_sync().await.unwrap();
+        let (_kp, wrong) = keypair(7);
+        let res = sync_a.apply_signed_sync(&wrong, &signed).await;
+        assert!(matches!(res, Err(ReputationError::SignerMismatch)));
     }
 }
