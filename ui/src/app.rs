@@ -82,6 +82,7 @@ impl VoidApp {
         profile.dns_name        = format!("{}.void", backend.my_name);
         profile.my_ip           = backend.my_ip.clone();
         profile.base_port       = backend.base_port;
+        profile.bootstrap       = backend.bootstrap;
         profile.connect_tx      = Some(backend.connect_tx.clone());
         profile.profile_tx      = Some(backend.profile_tx.clone());
         profile.my_node_id      = Some(backend.my_id_node.clone());
@@ -107,12 +108,18 @@ impl VoidApp {
         storage.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
         storage.downloads_dir = Some(backend.downloads_dir.clone());
 
+        // Страница сайтов: канал публикации + список сайтов.
+        let mut sites = SitesPage::default();
+        sites.publish_tx     = Some(backend.publish_site_tx.clone());
+        sites.sites          = Some(std::sync::Arc::clone(&backend.sites));
+        sites.site_http_port = backend.site_http_port;
+
         Self {
             current_page: Page::Chat,
             chat,
             private,
             storage,
-            sites:   SitesPage::default(),
+            sites,
             profile,
             graph,
             backend,

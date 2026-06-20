@@ -50,11 +50,21 @@ pub struct PeerProfile {
     /// None = старый узел без поддержки DM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enc_pubkey:  Option<String>,
+    /// Узел запущен в публичном (bootstrap) режиме — точка входа в сеть.
+    /// Самодекларация: влияет только на отображение бейджа, не на репутацию.
+    #[serde(default)]
+    pub is_bootstrap: bool,
 }
 
 impl PeerProfile {
     pub fn new(node_id: NodeId, name: String) -> Self {
-        PeerProfile { node_id, name, description: String::new(), status: "online".into(), enc_pubkey: None }
+        PeerProfile {
+            node_id, name,
+            description: String::new(),
+            status: "online".into(),
+            enc_pubkey: None,
+            is_bootstrap: false,
+        }
     }
 }
 

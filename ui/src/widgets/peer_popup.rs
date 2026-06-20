@@ -35,6 +35,7 @@ pub fn show_peer_profile(
     let description = profile.map(|p| p.description.as_str()).unwrap_or("");
     let status      = profile.map(|p| p.status.as_str()).unwrap_or("online");
     let has_dm_key  = profile.and_then(|p| p.enc_pubkey.as_ref()).is_some();
+    let is_bootstrap = profile.map(|p| p.is_bootstrap).unwrap_or(false);
 
     // Avatar + name/status row
     ui.horizontal(|ui| {
@@ -65,6 +66,14 @@ pub fn show_peer_profile(
                     egui::RichText::new("🔒 E2E шифрование доступно")
                         .small()
                         .color(egui::Color32::from_rgb(80, 200, 80)),
+                );
+            }
+            if is_bootstrap {
+                ui.label(
+                    egui::RichText::new("󰒋  Bootstrap-узел")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(150, 130, 230)),
                 );
             }
         });

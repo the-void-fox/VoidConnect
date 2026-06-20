@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 use void_core::identity::NodeId;
 use void_core::manifest::FileManifest;
 use void_core::peer::{PeerInfo, PeerProfile};
+use void_core::site::SiteManifest;
 use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
@@ -49,6 +50,8 @@ pub enum ChatPacket {
     ProfileUpdate(PeerProfile),
     /// Объявление о публикации файла — рассылается всем (как ProfileUpdate).
     FileAnnounce(FileManifest),
+    /// Объявление о публикации сайта — рассылается всем (как FileAnnounce).
+    SiteAnnounce(SiteManifest),
     /// Подписанный снимок репутации от узла `from` (gossip по сети).
     ReputationSync { from: NodeId, signed: SignedMessage },
     /// Подписанная жалоба на узел (reporter = signed.signer).
@@ -119,6 +122,10 @@ struct PublicChatInner {
     manifests:   Mutex<HashMap<String, FileManifest>>,
     /// Уведомление backend о новых (впервые увиденных) манифестах
     manifest_tx: broadcast::Sender<FileManifest>,
+    /// Известные манифесты сайтов (имя → манифест) — для рассылки и дедупа
+    sites:       Mutex<HashMap<String, SiteManifest>>,
+    /// Уведомление backend о новых/обновлённых манифестах сайтов
+    site_tx:     broadcast::Sender<SiteManifest>,
     /// Входящие пакеты репутации (sync/жалобы) → backend
     rep_tx:      broadcast::Sender<RepGossip>,
     /// Счётчик поколений соединения — чтобы старый read-task не затёр новый outbox
@@ -129,6 +136,7 @@ impl PublicChat {
     fn new(my_peer: PeerInfo, peer_list: PeerList, chat_port: u16, signing_kp: Arc<SigningKeypair>) -> Self {
         let (incoming_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        let (site_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
@@ -144,6 +152,8 @@ impl PublicChat {
                 my_profile:  Mutex::new(None),
                 manifests:   Mutex::new(HashMap::new()),
                 manifest_tx,
+                sites:       Mutex::new(HashMap::new()),
+                site_tx,
                 rep_tx,
                 conn_gen:    AtomicU64::new(0),
             }),
@@ -231,6 +241,69 @@ impl PublicChat {
         let outbox = self.inner.outbox_tx.lock().await;
         if let Some(tx) = outbox.as_ref() {
             let _ = tx.try_send(ChatPacket::FileAnnounce(manifest));
+        }
+    }
+
+    // ─── Сайты (обнаружение в сети) ───────────────────────────────────────────
+
+    /// Подписка backend на манифесты сайтов, пришедшие из сети.
+    pub fn subscribe_sites(&self) -> broadcast::Receiver<SiteManifest> {
+        self.inner.site_tx.subscribe()
+    }
+
+    /// Все известные на данный момент манифесты сайтов.
+    pub async fn get_sites(&self) -> Vec<SiteManifest> {
+        self.inner.sites.lock().await.values().cloned().collect()
+    }
+
+    /// Объявляет наш сайт сети: запоминает его и рассылает всем (клиентам — если
+    /// мы релей; релею — если мы клиент). Релей форвардит объявление остальным.
+    pub async fn announce_site(&self, manifest: SiteManifest) {
+        let merged = self.merge_site(manifest.clone()).await.unwrap_or(manifest);
+        self.broadcast_site(merged).await;
+    }
+
+    /// Объединяет входящий манифест сайта с известным по имени. Возвращает
+    /// `Some`, если это новый сайт или более свежая версия (по `created_at`),
+    /// иначе `None` (дедуп — гасит петли форвардинга).
+    async fn merge_site(&self, incoming: SiteManifest) -> Option<SiteManifest> {
+        let mut map = self.inner.sites.lock().await;
+        match map.get(&incoming.name) {
+            Some(existing) if existing.site_id == incoming.site_id => None,
+            Some(existing) if existing.created_at > incoming.created_at => None,
+            _ => {
+                map.insert(incoming.name.clone(), incoming.clone());
+                Some(incoming)
+            }
+        }
+    }
+
+    /// Рассылает манифест сайта всем подключённым (клиентам и/или релею).
+    async fn broadcast_site(&self, manifest: SiteManifest) {
+        {
+            let clients = self.inner.clients.lock().await;
+            for tx in clients.values() {
+                let _ = tx.try_send(ChatPacket::SiteAnnounce(manifest.clone()));
+            }
+        }
+        let outbox = self.inner.outbox_tx.lock().await;
+        if let Some(tx) = outbox.as_ref() {
+            let _ = tx.try_send(ChatPacket::SiteAnnounce(manifest));
+        }
+    }
+
+    /// Обрабатывает входящее объявление о сайте: сливает с известным, уведомляет
+    /// backend (регистрация в реестре) и — если мы релей — форвардит остальным.
+    /// Дедуп через `merge_site` гасит петли форвардинга.
+    async fn handle_site_announce(&self, manifest: SiteManifest) {
+        let Some(merged) = self.merge_site(manifest).await else {
+            return; // ничего нового — не пересылаем повторно
+        };
+        let _ = self.inner.site_tx.send(merged.clone());
+
+        let clients = self.inner.clients.lock().await;
+        for tx in clients.values() {
+            let _ = tx.try_send(ChatPacket::SiteAnnounce(merged.clone()));
         }
     }
 
@@ -409,6 +482,15 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
         }
     }
 
+    // Шаг 3.6: шлём известные манифесты сайтов (чтобы новый клиент увидел
+    // ранее опубликованные в сети сайты)
+    {
+        let sites = chat.inner.sites.lock().await;
+        for site in sites.values() {
+            let _ = send_packet(&mut stream, &ChatPacket::SiteAnnounce(site.clone())).await;
+        }
+    }
+
     // Шаг 4: регистрируем клиента
     let (fwd_tx, mut fwd_rx) = mpsc::channel::<ChatPacket>(64);
     chat.inner.clients.lock().await.insert(node_id.clone(), fwd_tx.clone());
@@ -432,6 +514,10 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
                 Ok(ChatPacket::FileAnnounce(manifest)) => {
                     debug!("FileAnnounce from client {}: {}", nid, manifest.name);
                     chat_r.handle_file_announce(manifest).await;
+                }
+                Ok(ChatPacket::SiteAnnounce(manifest)) => {
+                    debug!("SiteAnnounce from client {}: {}", nid, manifest.name);
+                    chat_r.handle_site_announce(manifest).await;
                 }
                 Ok(ChatPacket::ReputationSync { from, signed }) => {
                     chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
@@ -780,6 +866,14 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
         }
     }
 
+    // Аналогично — известные нам манифесты сайтов
+    {
+        let sites = chat.inner.sites.lock().await;
+        for site in sites.values() {
+            send_packet_wr(&mut wr, &ChatPacket::SiteAnnounce(site.clone())).await?;
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel::<ChatPacket>(64);
 
     // Таск записи (наши пакеты → ретранслятор)
@@ -811,6 +905,10 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
                 Ok(ChatPacket::FileAnnounce(manifest)) => {
                     debug!("FileAnnounce from relay: {}", manifest.name);
                     chat_r.handle_file_announce(manifest).await;
+                }
+                Ok(ChatPacket::SiteAnnounce(manifest)) => {
+                    debug!("SiteAnnounce from relay: {}", manifest.name);
+                    chat_r.handle_site_announce(manifest).await;
                 }
                 Ok(ChatPacket::ReputationSync { from, signed }) => {
                     chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
@@ -855,6 +953,9 @@ impl ChatHandle {
     pub async fn announce_file(&self, manifest: FileManifest) { self.chat.announce_file(manifest).await }
     pub fn subscribe_manifests(&self) -> broadcast::Receiver<FileManifest> { self.chat.subscribe_manifests() }
     pub async fn get_manifests(&self) -> Vec<FileManifest> { self.chat.get_manifests().await }
+    pub async fn announce_site(&self, manifest: SiteManifest) { self.chat.announce_site(manifest).await }
+    pub fn subscribe_sites(&self) -> broadcast::Receiver<SiteManifest> { self.chat.subscribe_sites() }
+    pub async fn get_sites(&self) -> Vec<SiteManifest> { self.chat.get_sites().await }
     pub fn subscribe_reputation(&self) -> broadcast::Receiver<RepGossip> { self.chat.subscribe_reputation() }
     pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
         self.chat.broadcast_reputation_sync(from, signed).await
@@ -1165,5 +1266,70 @@ mod tests {
         let known = bob.get_manifests().await;
         assert!(known.iter().any(|m| m.file_id == "deadbeefcafe"),
             "манифест должен сохраниться в списке известных у Bob");
+    }
+
+    /// Ждёт в приёмнике манифест сайта с заданным именем (пропуская прочие).
+    async fn wait_for_site(
+        rx: &mut broadcast::Receiver<SiteManifest>,
+        name: &str,
+        secs: u64,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { return false; }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Ok(m)) if m.name == name => return true,
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Объявление о сайте, сделанное одним узлом, доходит до второго через relay
+    /// (механизм Фазы 2 сайтов — обнаружение сайтов в сети).
+    #[tokio::test]
+    async fn site_announce_propagates_to_peer() {
+        use void_core::site::SiteEntry;
+
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id.clone(), a_port);
+        let b_peer = test_peer("bob", b_id.clone(), b_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+
+        let mut bob_sites = bob.subscribe_sites();
+
+        let manifest = SiteManifest {
+            site_id:    "site-abc".into(),
+            name:       "blog".into(),
+            owner:      a_id.clone(),
+            entries:    vec![SiteEntry { path: "index.html".into(), file_id: "f1".into(), size_bytes: 10 }],
+            created_at: 1,
+        };
+
+        let mut delivered = false;
+        for _ in 0..40 {
+            alice.announce_site(manifest.clone()).await;
+            if wait_for_site(&mut bob_sites, "blog", 1).await {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "Bob не получил объявление о сайте от Alice");
+
+        let known = bob.get_sites().await;
+        assert!(known.iter().any(|m| m.name == "blog"),
+            "манифест сайта должен сохраниться у Bob");
     }
 }

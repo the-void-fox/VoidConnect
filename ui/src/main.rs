@@ -24,6 +24,10 @@ fn main() -> eframe::Result<()> {
     // Parse flags: --local / -l can appear anywhere in args
     let local_mode = args.iter().any(|a| a == "--local" || a == "-l");
 
+    // --public: запуск в bootstrap-режиме (точка входа в сеть). Сейчас влияет
+    // на бейдж в профиле/попапах; полноценные bootstrap-бонусы — в глобальной сети.
+    let public_mode = args.iter().any(|a| a == "--public");
+
     // Папка данных: --data-dir=PATH или env VOID_DATA_DIR (по умолчанию ~/.config/void-connect).
     // Удобно для запуска нескольких инстансов на одной машине — у каждого свои
     // ключи, профиль, void.db и история DM. Должно быть задано ДО profile_dir().
@@ -72,7 +76,7 @@ fn main() -> eframe::Result<()> {
     // Ключ подписи сообщений общего чата (его pubkey == node_id).
     let sign_kp = std::sync::Arc::new(identity.signing);
 
-    let backend = backend::start_backend(name, base_port, node_id, local_mode, enc_kp, sign_kp, data_dir);
+    let backend = backend::start_backend(name, base_port, node_id, local_mode, public_mode, enc_kp, sign_kp, data_dir);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

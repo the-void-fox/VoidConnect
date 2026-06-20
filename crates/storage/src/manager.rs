@@ -274,19 +274,40 @@ impl StorageManager {
             .await?
             .ok_or_else(|| StorageError::FileNotFound(file_id.to_string()))?;
 
+        info!("Downloading '{}'...", file_meta.name);
+
+        // Скачиваем все чанки в локальное хранилище (с поддержкой паузы).
+        let flat = self.fetch_all_chunks(file_id, peers, &cancel).await?;
+
+        // Все чанки получены — собираем файл на диск.
+        assemble_file(&flat, dest_path).await?;
+
+        // Теперь все чанки локально — объявляем себя их владельцем, чтобы другие
+        // узлы могли качать у нас (мульти-сидинг).
+        self.register_self_as_owner(file_id).await;
+
+        info!("Downloaded '{}' → {}", file_meta.name, dest_path.display());
+        Ok(())
+    }
+
+    /// Скачивает все чанки файла в локальное хранилище и возвращает их данные в
+    /// порядке индексов. Уже локальные чанки читаются с диска. Между батчами
+    /// проверяется флаг `cancel` (для паузы) → [`StorageError::Cancelled`].
+    async fn fetch_all_chunks(
+        &self,
+        file_id: &str,
+        peers: &[PeerInfo],
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
         let chunks = db_chunks::get_chunks_for_file(&self.pool, file_id).await?;
         let total = chunks.len();
-        info!(
-            "Downloading '{}' ({} chunks)...",
-            file_meta.name, total
-        );
 
         // Скачиваем параллельно батчами
         let mut ordered_data: Vec<Option<Vec<u8>>> = vec![None; total];
 
         for batch in chunks.chunks(DOWNLOAD_CONCURRENCY) {
             if cancel.load(Ordering::Relaxed) {
-                info!("Download cancelled: '{}'", file_meta.name);
+                info!("Download cancelled: {}", &file_id[..8.min(file_id.len())]);
                 return Err(StorageError::Cancelled);
             }
             let mut handles = Vec::new();
@@ -342,30 +363,30 @@ impl StorageManager {
             }
         }
 
-        // Все чанки получены — собираем файл
-        let flat: Vec<Vec<u8>> = ordered_data
+        Ok(ordered_data
             .into_iter()
             .enumerate()
             .map(|(i, opt)| opt.unwrap_or_else(|| {
                 error!("BUG: chunk {} missing after download loop", i);
                 Vec::new()
             }))
-            .collect();
+            .collect())
+    }
 
-        assemble_file(&flat, dest_path).await?;
-
-        // Теперь у нас есть все чанки локально — объявляем себя их владельцем,
-        // чтобы другие узлы могли качать у нас (мульти-сидинг). Сам факт
-        // is_local уже зафиксирован при сохранении каждого чанка.
+    /// Объявляет нас владельцем всех чанков файла (после полного скачивания) —
+    /// чтобы другие узлы могли качать их у нас (мульти-сидинг). `is_local` уже
+    /// зафиксирован при сохранении каждого чанка.
+    async fn register_self_as_owner(&self, file_id: &str) {
+        let chunks = match db_chunks::get_chunks_for_file(&self.pool, file_id).await {
+            Ok(c) => c,
+            Err(e) => { warn!("register_self_as_owner({}): {}", &file_id[..8.min(file_id.len())], e); return; }
+        };
         for chunk in &chunks {
             if let Err(e) = db_chunks::add_chunk_owner(&self.pool, &chunk.hash, self.my_id.as_str()).await {
                 warn!("Не удалось записать себя владельцем чанка {}: {}", &chunk.hash[..8.min(chunk.hash.len())], e);
             }
             self.index.add_owner(&chunk.hash, self.my_id.clone()).await;
         }
-
-        info!("Downloaded '{}' → {}", file_meta.name, dest_path.display());
-        Ok(())
     }
 
     // ─── Объявления о чанках ─────────────────────────────────────────────────
@@ -417,6 +438,54 @@ impl StorageManager {
     /// Возвращает процент скачанности файла (0.0 – 1.0).
     pub async fn download_progress(&self, file_id: &str) -> Result<f64, StorageError> {
         Ok(db_chunks::local_completion(&self.pool, file_id).await?)
+    }
+
+    /// Читает файл целиком из локальных чанков (в порядке индексов) и собирает
+    /// его в память. Ошибка, если какой-то чанк ещё не скачан локально.
+    /// Используется для раздачи файлов сайта HTTP-сервером.
+    pub async fn read_file(&self, file_id: &str) -> Result<Vec<u8>, StorageError> {
+        let chunks = db_chunks::get_chunks_for_file(&self.pool, file_id).await?;
+        if chunks.is_empty() {
+            return Err(StorageError::FileNotFound(file_id.to_string()));
+        }
+        let mut data = Vec::new();
+        for c in chunks {
+            if !c.is_local {
+                return Err(StorageError::ChunkNotFound(c.hash.clone()));
+            }
+            data.extend_from_slice(&self.store.get(&c.hash).await?);
+        }
+        Ok(data)
+    }
+
+    /// Читает файл из локальных чанков; если каких-то чанков нет, докачивает их
+    /// у `peers` и собирает файл в память. После докачки регистрирует нас
+    /// сидером (мульти-сидинг). Используется HTTP-сервером сайтов для раздачи
+    /// файлов чужих (сетевых) сайтов по запросу — первый запрос скачивает,
+    /// последующие идут по быстрому пути (все чанки уже локальны).
+    pub async fn read_or_fetch_file(
+        &self,
+        file_id: &str,
+        peers: &[PeerInfo],
+    ) -> Result<Vec<u8>, StorageError> {
+        let chunks = db_chunks::get_chunks_for_file(&self.pool, file_id).await?;
+        if chunks.is_empty() {
+            return Err(StorageError::FileNotFound(file_id.to_string()));
+        }
+        // Быстрый путь: все чанки уже локально.
+        if chunks.iter().all(|c| c.is_local) {
+            let mut data = Vec::new();
+            for c in &chunks {
+                data.extend_from_slice(&self.store.get(&c.hash).await?);
+            }
+            return Ok(data);
+        }
+        // Иначе докачиваем недостающие чанки и собираем файл в память.
+        let flat = self
+            .fetch_all_chunks(file_id, peers, &Arc::new(AtomicBool::new(false)))
+            .await?;
+        self.register_self_as_owner(file_id).await;
+        Ok(flat.concat())
     }
 }
 
@@ -551,6 +620,10 @@ mod tests {
 
         let progress = mgr.download_progress(&file_id).await.unwrap();
         assert!((progress - 1.0).abs() < 1e-9, "ожидался прогресс 1.0, получено {progress}");
+
+        // read_file собирает файл из локальных чанков побайтово.
+        let read_back = mgr.read_file(&file_id).await.unwrap();
+        assert_eq!(read_back, content, "read_file должен вернуть исходное содержимое");
     }
 
     /// Сквозной P2P: A публикует и раздаёт, B скачивает через chunk-сервер.

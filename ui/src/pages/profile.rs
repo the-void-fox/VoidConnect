@@ -16,6 +16,8 @@ pub struct ProfilePage {
     pub download_gb:     f32,
     pub my_ip:           String,
     pub base_port:       u16,
+    /// Запущены ли мы в публичном (bootstrap) режиме.
+    pub bootstrap:       bool,
     connect_input:       String,
     connect_error:       Option<String>,
     connect_ok:          bool,
@@ -43,6 +45,7 @@ impl Default for ProfilePage {
             download_gb:     0.0,
             my_ip:           "?".to_string(),
             base_port:       7700,
+            bootstrap:         false,
             my_node_id:        None,
             connect_input:     String::new(),
             connect_error:     None,
@@ -75,6 +78,15 @@ impl ProfilePage {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(16.0);
+
+        if self.bootstrap {
+            ui.label(
+                egui::RichText::new("󰒋  Вы — Bootstrap-узел (точка входа в сеть)")
+                    .strong()
+                    .color(egui::Color32::from_rgb(150, 130, 230)),
+            );
+            ui.add_space(12.0);
+        }
 
         // ── Аватар + основная инфо ──────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -366,11 +378,12 @@ impl ProfilePage {
         }
 
         let profile = PeerProfile {
-            node_id:     id.clone(),
-            name:        self.name.clone(),
-            description: self.description.clone(),
-            status:      self.status.clone(),
-            enc_pubkey:  None, // backend добавит enc_pubkey перед рассылкой
+            node_id:      id.clone(),
+            name:         self.name.clone(),
+            description:  self.description.clone(),
+            status:       self.status.clone(),
+            enc_pubkey:   None,  // backend добавит enc_pubkey перед рассылкой
+            is_bootstrap: false, // backend проставит флаг перед рассылкой
         };
         let _ = tx.send(profile);
         self.last_sent_profile = Some((self.name.clone(), self.description.clone(), self.status.clone()));

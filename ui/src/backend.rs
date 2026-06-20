@@ -16,6 +16,7 @@ use void_storage::{ChunkEvent, ChunkStore, StorageManager};
 use void_reputation::{
     EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager, SyncManager,
 };
+use void_web::{publish_site, SiteRegistry};
 
 /// Запись о файле в хранилище — снимок для GUI.
 #[derive(Clone)]
@@ -30,6 +31,19 @@ pub struct StorageFileInfo {
     pub is_mine:      bool,
     /// Сколько узлов раздают файл (по данным манифеста)
     pub seeders:      i64,
+}
+
+/// Запись о сайте — снимок для GUI.
+#[derive(Clone)]
+pub struct SiteInfo {
+    pub name:       String,
+    pub dns_name:   String,
+    pub file_count: usize,
+    pub size_bytes: i64,
+    /// Опубликован нами.
+    pub is_mine:    bool,
+    /// Локальный URL для открытия в браузере.
+    pub url:        String,
 }
 
 /// Команда GUI → backend для управления скачиванием файла.
@@ -95,15 +109,24 @@ pub struct BackendHandle {
     pub peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>,
     /// Канал GUI → backend: пожаловаться на узел (target, причина).
     pub report_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, ReportReason)>,
+    /// Запущены ли мы в публичном (bootstrap) режиме.
+    pub bootstrap: bool,
+    /// Канал GUI → backend: опубликовать сайт (каталог, имя).
+    pub publish_site_tx: tokio::sync::mpsc::UnboundedSender<(PathBuf, String)>,
+    /// Снимок списка сайтов (обновляется бэкендом).
+    pub sites: Arc<Mutex<Vec<SiteInfo>>>,
+    /// Порт локального HTTP-сервера сайтов (base_port + 4).
+    pub site_http_port: u16,
 }
 
 pub fn start_backend(
-    name:       String,
-    base_port:  u16,
-    my_id:      NodeId,
-    local_mode: bool,
-    enc_kp:     Arc<EncryptionKeypair>,
-    sign_kp:    Arc<SigningKeypair>,
+    name:        String,
+    base_port:   u16,
+    my_id:       NodeId,
+    local_mode:  bool,
+    public_mode: bool,
+    enc_kp:      Arc<EncryptionKeypair>,
+    sign_kp:     Arc<SigningKeypair>,
     data_dir:   PathBuf,
 ) -> BackendHandle {
     let chat_inbox:    Arc<Mutex<VecDeque<ChatMessage>>>         = Arc::new(Mutex::new(VecDeque::new()));
@@ -121,6 +144,9 @@ pub fn start_backend(
     let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadCmd>();
     let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, ReportReason)>();
+    let (publish_site_tx, publish_site_rx) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, String)>();
+    let sites: Arc<Mutex<Vec<SiteInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let site_http_port = base_port + 4;
 
     let my_ip = if local_mode {
         IpAddr::from([127, 0, 0, 1])
@@ -155,6 +181,7 @@ pub fn start_backend(
     let history_bg  = Arc::clone(&chat_history);
     let storage_bg  = Arc::clone(&storage_files);
     let reputation_bg = Arc::clone(&peer_reputation);
+    let sites_bg      = Arc::clone(&sites);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -162,13 +189,14 @@ pub fn start_backend(
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async move {
             backend_main(
-                my_peer, base_port, local_mode,
+                my_peer, base_port, local_mode, public_mode,
                 inbox_bg, peers_bg, profiles_bg, dm_inbox_bg,
                 enc_kp_bg, sign_kp_bg, dm_port,
                 chat_rx, connect_rx, profile_rx, dm_rx,
                 data_dir, history_bg,
                 publish_rx, download_rx, storage_bg,
                 reputation_bg, report_rx,
+                publish_site_rx, sites_bg, site_http_port,
             ).await;
         });
     });
@@ -199,6 +227,10 @@ pub fn start_backend(
         downloads_dir,
         peer_reputation,
         report_tx,
+        bootstrap: public_mode,
+        publish_site_tx,
+        sites,
+        site_http_port,
     }
 }
 
@@ -209,6 +241,7 @@ async fn backend_main(
     my_peer:     PeerInfo,
     base_port:   u16,
     local_mode:  bool,
+    bootstrap:   bool,
     inbox:       Arc<Mutex<VecDeque<ChatMessage>>>,
     peers_out:   Arc<Mutex<Vec<PeerInfo>>>,
     profiles_out: Arc<Mutex<HashMap<NodeId, PeerProfile>>>,
@@ -227,6 +260,9 @@ async fn backend_main(
     storage_files_out: Arc<Mutex<Vec<StorageFileInfo>>>,
     reputation_out: Arc<Mutex<HashMap<NodeId, f64>>>,
     mut report_rx: tokio::sync::mpsc::UnboundedReceiver<(NodeId, ReportReason)>,
+    publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
+    sites_out: Arc<Mutex<Vec<SiteInfo>>>,
+    site_http_port: u16,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -314,6 +350,7 @@ async fn backend_main(
     let enc_pub_hex = hex::encode(enc_kp.public_bytes());
     let mut initial_profile = PeerProfile::new(my_peer.id.clone(), my_peer.name.clone());
     initial_profile.enc_pubkey = Some(enc_pub_hex.clone());
+    initial_profile.is_bootstrap = bootstrap;
     chat.set_profile(initial_profile).await;
 
     // Запускаем DM-сервер
@@ -385,8 +422,9 @@ async fn backend_main(
     let enc_pub_hex2 = enc_pub_hex.clone();
     tokio::spawn(async move {
         while let Some(mut profile) = profile_rx.recv().await {
-            // Всегда включаем наш enc_pubkey в рассылаемый профиль
+            // Всегда включаем наш enc_pubkey и bootstrap-флаг в рассылаемый профиль
             profile.enc_pubkey = Some(enc_pub_hex2.clone());
+            profile.is_bootstrap = bootstrap;
             chat_profile.set_profile(profile).await;
         }
     });
@@ -426,6 +464,10 @@ async fn backend_main(
             }
         }
     });
+
+    // Снимок активных пиров для HTTP-сервера сайтов (докачка файлов чужих
+    // сайтов по запросу). Клонируем до того, как peers_out уедет в задачу ниже.
+    let sites_peers = Arc::clone(&peers_out);
 
     // Задача: периодически снимаем peer_list и профили для GUI.
     // Здесь же ведём репутацию: события подключения/отключения (аптайм) и
@@ -542,12 +584,19 @@ async fn backend_main(
                     if let Some(tx) = chunk_ev_tx.clone() {
                         manager.set_event_sink(tx);
                     }
+                    // Сайты: HTTP-сервер + публикация + обнаружение по сети.
+                    start_site_tasks(
+                        manager.clone(), my_peer.id.clone(), site_http_port,
+                        chat.clone(), Arc::clone(&sites_peers),
+                        publish_site_rx, sites_out,
+                    );
                     start_storage_tasks(
                         manager, pool, chat.clone(), peer_list.clone(),
                         my_peer.id.clone(), base_port, data_dir.clone(),
                         publish_rx, download_rx, storage_files_out,
                     );
-                    tracing::info!("Storage subsystem ready (chunk server on {})", base_port);
+                    tracing::info!("Storage subsystem ready (chunk server on {}, sites on {})",
+                        base_port, site_http_port);
                 }
                 Err(e) => tracing::error!("StorageManager init failed: {}", e),
             },
@@ -560,6 +609,98 @@ async fn backend_main(
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
+}
+
+/// Запускает фоновые задачи сайтов: локальный HTTP-сервер раздачи (с докачкой
+/// файлов чужих сайтов по запросу), публикацию каталогов как сайтов с рассылкой
+/// по сети и обнаружение чужих сайтов через relay чата. Реестр in-memory.
+#[allow(clippy::too_many_arguments)]
+fn start_site_tasks(
+    manager:    StorageManager,
+    my_id:      NodeId,
+    http_port:  u16,
+    chat:       ChatHandle,
+    peers:      Arc<Mutex<Vec<PeerInfo>>>,
+    mut publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
+    sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
+) {
+    let registry = SiteRegistry::new();
+    let my_key = my_id.as_str().to_string();
+
+    // HTTP-сервер сайтов (peers — источник для докачки файлов сетевых сайтов).
+    let srv_reg = registry.clone();
+    let srv_mgr = manager.clone();
+    tokio::spawn(async move {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
+        if let Err(e) = void_web::serve(addr, srv_reg, srv_mgr, peers).await {
+            tracing::error!("Site HTTP server failed on {}: {}", http_port, e);
+        }
+    });
+
+    // Обнаружение чужих сайтов: манифесты из сети → реестр + снимок для GUI.
+    let disc_reg  = registry.clone();
+    let disc_out  = Arc::clone(&sites_out);
+    let disc_key  = my_key.clone();
+    let mut site_rx = chat.subscribe_sites();
+    tokio::spawn(async move {
+        loop {
+            match site_rx.recv().await {
+                Ok(manifest) => {
+                    tracing::info!("Обнаружен сайт в сети: '{}' ({} файлов)",
+                        manifest.name, manifest.entries.len());
+                    disc_reg.register(manifest).await;
+                    refresh_sites(&disc_reg, &disc_key, http_port, &disc_out).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
+                    tracing::warn!("Site stream lagged by {}", k);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Публикация сайтов из GUI: публикуем файлы, объявляем их манифесты
+    // (чтобы пиры могли докачать), затем объявляем сам сайт.
+    let pub_chat = chat.clone();
+    tokio::spawn(async move {
+        while let Some((dir, name)) = publish_site_rx.recv().await {
+            match publish_site(&manager, &dir, &name, my_id.clone()).await {
+                Ok(manifest) => {
+                    tracing::info!("Опубликован сайт '{}' ({} файлов) → http://127.0.0.1:{}/{}",
+                        manifest.name, manifest.entries.len(), http_port, manifest.name);
+                    // Объявляем каждый файл сайта (мульти-сидинг + докачка у пиров).
+                    for entry in &manifest.entries {
+                        if let Ok(Some(fm)) = manager.file_manifest(&entry.file_id).await {
+                            pub_chat.announce_file(fm).await;
+                        }
+                    }
+                    registry.register(manifest.clone()).await;
+                    // Объявляем сайт сети.
+                    pub_chat.announce_site(manifest).await;
+                    refresh_sites(&registry, &my_key, http_port, &sites_out).await;
+                }
+                Err(e) => tracing::warn!("Публикация сайта '{}' не удалась: {}", name, e),
+            }
+        }
+    });
+}
+
+/// Обновляет снимок списка сайтов для GUI из реестра.
+async fn refresh_sites(
+    registry: &SiteRegistry,
+    my_key: &str,
+    http_port: u16,
+    out: &Arc<Mutex<Vec<SiteInfo>>>,
+) {
+    let infos: Vec<SiteInfo> = registry.list().await.into_iter().map(|m| SiteInfo {
+        url:        format!("http://127.0.0.1:{}/{}", http_port, m.name),
+        dns_name:   m.dns_name(),
+        file_count: m.entries.len(),
+        size_bytes: m.total_size(),
+        is_mine:    m.owner.as_str() == my_key,
+        name:       m.name,
+    }).collect();
+    *out.lock().unwrap() = infos;
 }
 
 /// Запускает фоновые задачи хранилища: chunk-сервер, обработку публикаций

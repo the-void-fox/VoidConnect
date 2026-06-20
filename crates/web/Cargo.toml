@@ -4,3 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+void-core    = { path = "../core" }
+void-storage = { path = "../storage" }
+
+tokio      = { workspace = true }
+axum       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+chrono     = { workspace = true }
+tracing    = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+void-db  = { path = "../db" }
+tempfile = { workspace = true }
