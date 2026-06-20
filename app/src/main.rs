@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     // Передаём base_port чтобы второй экземпляр не конфликтовал на 7701
     start_udp_broadcast(my_peer.clone(), peer_list.clone(), base_port).await?;
 
-    let chat = start_public_chat(my_peer.clone(), peer_list.clone(), chat_port, signing_kp).await?;
+    let chat = start_public_chat(my_peer.clone(), peer_list.clone(), chat_port, signing_kp, None).await?;
 
     // Входящие сообщения → консоль
     let mut rx = chat.subscribe();

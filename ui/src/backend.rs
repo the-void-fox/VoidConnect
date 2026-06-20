@@ -215,12 +215,14 @@ pub struct BackendHandle {
     pub dns_names: Arc<Mutex<Vec<DnsInfo>>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_backend(
     name:        String,
     base_port:   u16,
     my_id:       NodeId,
     local_mode:  bool,
     public_mode: bool,
+    bootstrap_addrs: Vec<String>,
     enc_kp:      Arc<EncryptionKeypair>,
     sign_kp:     Arc<SigningKeypair>,
     data_dir:   PathBuf,
@@ -287,7 +289,7 @@ pub fn start_backend(
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async move {
             backend_main(
-                my_peer, base_port, local_mode, public_mode,
+                my_peer, base_port, local_mode, public_mode, bootstrap_addrs,
                 inbox_bg, peers_bg, profiles_bg, dm_inbox_bg,
                 enc_kp_bg, sign_kp_bg, dm_port,
                 chat_rx, connect_rx, profile_rx, dm_rx,
@@ -342,6 +344,7 @@ async fn backend_main(
     base_port:   u16,
     local_mode:  bool,
     bootstrap:   bool,
+    bootstrap_addrs: Vec<String>,
     inbox:       Arc<Mutex<VecDeque<ChatMessage>>>,
     peers_out:   Arc<Mutex<Vec<PeerInfo>>>,
     profiles_out: Arc<Mutex<HashMap<NodeId, PeerProfile>>>,
@@ -388,12 +391,16 @@ async fn backend_main(
     };
     *chat_history_out.lock().unwrap() = Some(loaded);
 
+    // Ограничитель частоты (флуд-защита). ОДИН экземпляр на оба потребителя:
+    // чат (дроп пакетов сверх лимита на релее) и репутация (авто-блок узлов с
+    // отрицательным score). Clone дешёвый — состояние (bucket map) общее.
+    let rate_limiter = RateLimiter::new();
+
     // ── Система репутации (локальный скоринг + сетевая синхронизация) ─────────
     // Доступна, если есть БД.
     let reputation: Option<Reputation> = db_pool.clone().map(|pool| {
         let score = ScoreManager::new(pool.clone());
-        let rate_limiter = Arc::new(RateLimiter::new());
-        let events = EventProcessor::new(score.clone(), rate_limiter);
+        let events = EventProcessor::new(score.clone(), Arc::new(rate_limiter.clone()));
         let sync = Arc::new(SyncManager::new(
             pool.clone(), score.clone(), events.clone(),
             sign_kp.clone(), my_peer.id.clone(),
@@ -439,9 +446,70 @@ async fn backend_main(
         }
     }
 
+    // ── Глобальная сеть: bootstrap-узлы (первое знакомство между LAN) ─────────
+    // Клиент: периодически опрашиваем заданные bootstrap-адреса (host:base_port
+    // → host:base_port+5), регистрируемся и забираем известных им пиров.
+    let service_addrs: Vec<String> = bootstrap_addrs.iter()
+        .filter_map(|a| match void_discovery::bootstrap::service_addr(a) {
+            Ok(s) => Some(s),
+            Err(e) => { tracing::warn!("Неверный bootstrap-адрес '{}': {}", a, e); None }
+        })
+        .collect();
+    if !service_addrs.is_empty() {
+        tracing::info!("Bootstrap-адреса: {:?}", service_addrs);
+        void_discovery::bootstrap::start_bootstrap_client(
+            my_peer.clone(), peer_list.clone(), service_addrs,
+        );
+    }
+    // Сервер: в публичном режиме сами становимся точкой входа. Сначала узнаём
+    // свой ВНЕШНИЙ адрес (UPnP-проброс портов → внешний IP, иначе STUN-фолбэк),
+    // затем поднимаем bootstrap-сервер, рекламирующий доступный извне адрес
+    // (чтобы узлы из других сетей могли к нам подключиться, а не на LAN-IP).
+    if bootstrap {
+        let me = my_peer.clone();
+        let pl = peer_list.clone();
+        tokio::spawn(async move {
+            // 1. UPnP: открываем TCP-порты на роутере (base/+2/+3/+4/+5) + внешний IP.
+            let ports = [base_port, base_port + 2, base_port + 3, base_port + 4, base_port + 5];
+            let upnp_ip = void_discovery::nat::map_ports(me.ip, &ports, "Void Connect").await;
+            // 2. Если UPnP не дал внешний IP — пробуем STUN (публичные серверы).
+            let ext_ip = match upnp_ip {
+                Some(ip) => Some(ip),
+                None => void_discovery::stun::discover_external_ip(
+                    void_discovery::stun::DEFAULT_STUN_SERVERS,
+                ).await,
+            };
+            // 3. Объявляем доступный адрес: внешний (если определён) иначе локальный.
+            let advertised = match ext_ip {
+                Some(ip) => {
+                    tracing::info!(
+                        "Внешний адрес узла: {} — раздавайте bootstrap-адрес {}:{}",
+                        ip, ip, base_port);
+                    PeerInfo { ip, ..me.clone() }
+                }
+                None => {
+                    tracing::warn!(
+                        "Внешний IP не определён (нет UPnP/STUN) — доступ извне только \
+                         по вручную проброшенному адресу; объявляю локальный {}", me.ip);
+                    me.clone()
+                }
+            };
+            // 4. Bootstrap-сервер с рекламируемым адресом.
+            let bport = base_port + void_discovery::bootstrap::BOOTSTRAP_PORT_OFFSET;
+            if let Err(e) = void_discovery::bootstrap::start_bootstrap_server(
+                advertised, pl, bport,
+            ).await {
+                tracing::error!("Bootstrap server failed on {}: {}", bport, e);
+            }
+        });
+    }
+
     // Ключ подписи нужен и DNS (заявка имён) — клонируем до передачи в чат.
     let dns_kp = sign_kp.clone();
-    let chat = match start_public_chat(my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp).await {
+    let chat = match start_public_chat(
+        my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp,
+        Some(rate_limiter.clone()),
+    ).await {
         Ok(h)  => h,
         Err(e) => {
             tracing::error!("Chat TCP server failed on port {}: {}", my_peer.chat_port, e);
@@ -613,6 +681,7 @@ async fn backend_main(
     let rep_out  = Arc::clone(&reputation_out);
     let my_rep_id = my_peer.id.clone();
     let dns_snap = dns.clone();
+    let rl_clean = rate_limiter.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         let mut prev_ids: HashSet<NodeId> = HashSet::new();
@@ -660,6 +729,9 @@ async fn backend_main(
             if !newly.is_empty() {
                 dns_snap.reannounce().await;
             }
+            // Чистим бакеты лимитера от отключившихся узлов (не копим память).
+            let live: Vec<NodeId> = cur_ids.iter().cloned().collect();
+            rl_clean.cleanup(&live).await;
             prev_ids = cur_ids;
         }
     });
@@ -683,6 +755,36 @@ async fn backend_main(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Reputation gossip lagged by {}", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Задача: сигналы о флуде из чата → спам-страйк репутации (с дебаунсом).
+    // Лимитер уже дропает пакеты сверх лимита; здесь только наказываем репутацию
+    // (она при отрицательном score доблокирует узел через тот же лимитер).
+    if let Some(rep) = reputation.clone() {
+        let mut spam_rx = chat.subscribe_spam();
+        tokio::spawn(async move {
+            // Не чаще одного страйка на узел в 5с — чтобы флуд не завалил БД.
+            let mut last: HashMap<NodeId, std::time::Instant> = HashMap::new();
+            loop {
+                match spam_rx.recv().await {
+                    Ok(peer) => {
+                        let now = std::time::Instant::now();
+                        let fresh = last.get(&peer)
+                            .map(|t| now.duration_since(*t).as_secs() >= 5)
+                            .unwrap_or(true);
+                        if fresh {
+                            last.insert(peer.clone(), now);
+                            tracing::warn!("Флуд от {} — спам-страйк репутации", peer);
+                            rep.events.process(ReputationEvent::SpamStrike { peer_id: peer }).await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Spam stream lagged by {}", n);
                     }
                     Err(_) => break,
                 }

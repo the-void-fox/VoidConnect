@@ -24,9 +24,21 @@ fn main() -> eframe::Result<()> {
     // Parse flags: --local / -l can appear anywhere in args
     let local_mode = args.iter().any(|a| a == "--local" || a == "-l");
 
-    // --public: запуск в bootstrap-режиме (точка входа в сеть). Сейчас влияет
-    // на бейдж в профиле/попапах; полноценные bootstrap-бонусы — в глобальной сети.
+    // --public: запуск в bootstrap-режиме (точка входа в сеть). Включает
+    // bootstrap-сервер (peer-exchange) + попытку UPnP-проброса портов + бейдж.
     let public_mode = args.iter().any(|a| a == "--public");
+
+    // --bootstrap=host:port,host:port — адреса bootstrap-узлов (base_port).
+    // При старте к ним подключаемся для первого знакомства с сетью (cross-LAN).
+    let bootstrap_addrs: Vec<String> = args.iter()
+        .find_map(|a| a.strip_prefix("--bootstrap="))
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Папка данных: --data-dir=PATH или env VOID_DATA_DIR (по умолчанию ~/.config/void-connect).
     // Удобно для запуска нескольких инстансов на одной машине — у каждого свои
@@ -76,7 +88,7 @@ fn main() -> eframe::Result<()> {
     // Ключ подписи сообщений общего чата (его pubkey == node_id).
     let sign_kp = std::sync::Arc::new(identity.signing);
 
-    let backend = backend::start_backend(name, base_port, node_id, local_mode, public_mode, enc_kp, sign_kp, data_dir);
+    let backend = backend::start_backend(name, base_port, node_id, local_mode, public_mode, bootstrap_addrs, enc_kp, sign_kp, data_dir);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

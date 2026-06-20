@@ -27,6 +27,7 @@ use void_core::site::SiteManifest;
 use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
+use void_network::rate_limit::RateLimiter;
 
 /// Потолок размера одного пакета на проводе. Поднят до 16 МиБ, чтобы вмещать
 /// манифесты крупных файлов (список хэшей чанков): при 256 КБ/чанк это
@@ -132,17 +133,28 @@ struct PublicChatInner {
     rep_tx:      broadcast::Sender<RepGossip>,
     /// Входящие подписанные DNS-записи → backend (он проверяет/применяет)
     dns_tx:      broadcast::Sender<SignedMessage>,
+    /// Ограничитель частоты пакетов (флуд-защита на релее). None = выключен.
+    rate_limiter: Option<RateLimiter>,
+    /// Сигнал backend'у: узел превысил лимит (→ спам-страйк репутации).
+    spam_tx:     broadcast::Sender<NodeId>,
     /// Счётчик поколений соединения — чтобы старый read-task не затёр новый outbox
     conn_gen:    AtomicU64,
 }
 
 impl PublicChat {
-    fn new(my_peer: PeerInfo, peer_list: PeerList, chat_port: u16, signing_kp: Arc<SigningKeypair>) -> Self {
+    fn new(
+        my_peer: PeerInfo,
+        peer_list: PeerList,
+        chat_port: u16,
+        signing_kp: Arc<SigningKeypair>,
+        rate_limiter: Option<RateLimiter>,
+    ) -> Self {
         let (incoming_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (site_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
+        let (spam_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
                 my_peer, peer_list, chat_port, signing_kp, incoming_tx,
@@ -161,6 +173,8 @@ impl PublicChat {
                 site_tx,
                 rep_tx,
                 dns_tx,
+                rate_limiter,
+                spam_tx,
                 conn_gen:    AtomicU64::new(0),
             }),
         }
@@ -168,6 +182,24 @@ impl PublicChat {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ChatMessage> {
         self.inner.incoming_tx.subscribe()
+    }
+
+    /// Подписка backend на сигналы о превышении лимита (узел → спам-страйк).
+    pub fn subscribe_spam(&self) -> broadcast::Receiver<NodeId> {
+        self.inner.spam_tx.subscribe()
+    }
+
+    /// Проверяет лимит частоты пакетов от `from` (флуд-защита на релее).
+    /// При превышении — дропаем пакет и сигналим backend'у (спам-страйк).
+    /// Возвращает `true`, если пакет можно обрабатывать. Без лимитера — всегда `true`.
+    async fn allow_packet(&self, from: &NodeId) -> bool {
+        if let Some(rl) = &self.inner.rate_limiter {
+            if !rl.check(from).await {
+                let _ = self.inner.spam_tx.send(from.clone());
+                return false;
+            }
+        }
+        true
     }
 
     pub async fn recent(&self, n: usize) -> Vec<ChatMessage> {
@@ -413,8 +445,9 @@ pub async fn start_public_chat(
     peer_list: PeerList,
     chat_port: u16,
     signing_kp: Arc<SigningKeypair>,
+    rate_limiter: Option<RateLimiter>,
 ) -> anyhow::Result<ChatHandle> {
-    let chat = PublicChat::new(my_peer, peer_list, chat_port, signing_kp);
+    let chat = PublicChat::new(my_peer, peer_list, chat_port, signing_kp, rate_limiter);
 
     let c = chat.clone();
     tokio::spawn(async move {
@@ -546,42 +579,54 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
     let nid    = node_id.clone();
     let read_task = tokio::spawn(async move {
         loop {
-            match read_packet_rd(&mut rd).await {
-                Ok(ChatPacket::Message(msg)) => {
-                    debug!("Message from client {}: {} chars", nid, msg.text.len());
-                    chat_r.handle_incoming(msg).await;
-                }
-                Ok(ChatPacket::ProfileUpdate(prof)) => {
-                    debug!("ProfileUpdate from client {}", nid);
-                    chat_r.handle_profile_update(prof).await;
-                }
-                Ok(ChatPacket::FileAnnounce(manifest)) => {
-                    debug!("FileAnnounce from client {}: {}", nid, manifest.name);
-                    chat_r.handle_file_announce(manifest).await;
-                }
-                Ok(ChatPacket::SiteAnnounce(manifest)) => {
-                    debug!("SiteAnnounce from client {}: {}", nid, manifest.name);
-                    chat_r.handle_site_announce(manifest).await;
-                }
-                Ok(ChatPacket::ReputationSync { from, signed }) => {
-                    chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
-                }
-                Ok(ChatPacket::ReputationReport { signed }) => {
-                    chat_r.handle_reputation(RepGossip::Report { signed }).await;
-                }
-                Ok(ChatPacket::DnsAnnounce { signed }) => {
-                    chat_r.handle_dns(signed).await;
-                }
-                Ok(ChatPacket::Ping) => {
-                    debug!("Ping from client {}", nid);
-                    let _ = fwd_tx.try_send(ChatPacket::Pong);
-                }
-                Ok(ChatPacket::Pong) => {}
-                Ok(_) => {}
+            let pkt = match read_packet_rd(&mut rd).await {
+                Ok(p) => p,
                 Err(e) => {
                     debug!("Client {} disconnected (read): {}", nid, e);
                     break;
                 }
+            };
+
+            // Флуд-защита (релей): дропаем пакеты сверх лимита от этого клиента.
+            // Превышение → spam-сигнал backend'у (страйк репутации). Pong не
+            // считаем — это ответ на наш Ping.
+            if !matches!(pkt, ChatPacket::Pong) && !chat_r.allow_packet(&nid).await {
+                debug!("Rate-limited packet from client {}", nid);
+                continue;
+            }
+
+            match pkt {
+                ChatPacket::Message(msg) => {
+                    debug!("Message from client {}: {} chars", nid, msg.text.len());
+                    chat_r.handle_incoming(msg).await;
+                }
+                ChatPacket::ProfileUpdate(prof) => {
+                    debug!("ProfileUpdate from client {}", nid);
+                    chat_r.handle_profile_update(prof).await;
+                }
+                ChatPacket::FileAnnounce(manifest) => {
+                    debug!("FileAnnounce from client {}: {}", nid, manifest.name);
+                    chat_r.handle_file_announce(manifest).await;
+                }
+                ChatPacket::SiteAnnounce(manifest) => {
+                    debug!("SiteAnnounce from client {}: {}", nid, manifest.name);
+                    chat_r.handle_site_announce(manifest).await;
+                }
+                ChatPacket::ReputationSync { from, signed } => {
+                    chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
+                }
+                ChatPacket::ReputationReport { signed } => {
+                    chat_r.handle_reputation(RepGossip::Report { signed }).await;
+                }
+                ChatPacket::DnsAnnounce { signed } => {
+                    chat_r.handle_dns(signed).await;
+                }
+                ChatPacket::Ping => {
+                    debug!("Ping from client {}", nid);
+                    let _ = fwd_tx.try_send(ChatPacket::Pong);
+                }
+                ChatPacket::Pong => {}
+                _ => {}
             }
         }
     });
@@ -1013,6 +1058,7 @@ impl ChatHandle {
     pub async fn broadcast_report(&self, signed: SignedMessage) { self.chat.broadcast_report(signed).await }
     pub async fn announce_dns(&self, signed: SignedMessage) { self.chat.announce_dns(signed).await }
     pub fn subscribe_dns(&self) -> broadcast::Receiver<SignedMessage> { self.chat.subscribe_dns() }
+    pub fn subscribe_spam(&self) -> broadcast::Receiver<NodeId> { self.chat.subscribe_spam() }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -1136,7 +1182,7 @@ mod tests {
     async fn signature_roundtrip_and_tamper_detection() {
         let (kp, id) = keypair(5);
         let peer = test_peer("x", id.clone(), 1);
-        let chat = PublicChat::new(peer, PeerList::new(), 1, kp);
+        let chat = PublicChat::new(peer, PeerList::new(), 1, kp, None);
 
         let mut msg = ChatMessage::new(id.clone(), "x".into(), "secret".into(), 1);
         chat.sign_message(&mut msg);
@@ -1178,8 +1224,8 @@ mod tests {
         a_pl.upsert(b_peer.clone()).await;
         b_pl.upsert(a_peer.clone()).await;
 
-        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
-        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp, None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
 
         let mut alice_rx = alice.subscribe();
         let mut bob_rx = bob.subscribe();
@@ -1231,9 +1277,9 @@ mod tests {
         c_pl.upsert(a_peer.clone()).await;
         c_pl.upsert(b_peer.clone()).await;
 
-        let a = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
-        let b = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
-        let c = start_public_chat(c_peer.clone(), c_pl, c_port, c_kp).await.unwrap();
+        let a = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp, None).await.unwrap();
+        let b = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
+        let c = start_public_chat(c_peer.clone(), c_pl, c_port, c_kp, None).await.unwrap();
 
         let mut b_rx = b.subscribe();
         let mut c_rx = c.subscribe();
@@ -1288,8 +1334,8 @@ mod tests {
         a_pl.upsert(b_peer.clone()).await;
         b_pl.upsert(a_peer.clone()).await;
 
-        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
-        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp, None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
 
         let mut bob_manifests = bob.subscribe_manifests();
 
@@ -1357,8 +1403,8 @@ mod tests {
         a_pl.upsert(b_peer.clone()).await;
         b_pl.upsert(a_peer.clone()).await;
 
-        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp).await.unwrap();
-        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp, None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
 
         let mut bob_sites = bob.subscribe_sites();
 
@@ -1403,8 +1449,8 @@ mod tests {
         a_pl.upsert(b_peer.clone()).await;
         b_pl.upsert(a_peer.clone()).await;
 
-        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone()).await.unwrap();
-        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone(), None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
 
         let mut bob_dns = bob.subscribe_dns();
 
@@ -1441,5 +1487,36 @@ mod tests {
             if delivered { break; }
         }
         assert!(delivered, "Bob не получил DNS-запись от Alice");
+    }
+
+    /// Флуд-защита: при исчерпании лимита пакеты дропаются и backend получает
+    /// спам-сигнал; без лимитера пропускается всё.
+    #[tokio::test]
+    async fn rate_limit_drops_and_signals_spam() {
+        let (kp, id) = keypair(5);
+        let peer = test_peer("x", id, 1);
+        // Жёсткий лимит: burst=2, пополнение 1/с.
+        let rl = RateLimiter::with_limits(1, 2);
+        let chat = PublicChat::new(peer, PeerList::new(), 1, kp, Some(rl));
+        let mut spam_rx = chat.subscribe_spam();
+
+        let from = node_id(9);
+        // Первые два пакета (burst) проходят.
+        assert!(chat.allow_packet(&from).await, "1-й пакет должен пройти");
+        assert!(chat.allow_packet(&from).await, "2-й пакет должен пройти");
+        // Третий — сверх лимита → дроп.
+        assert!(!chat.allow_packet(&from).await, "3-й пакет должен быть отброшен");
+
+        // Backend получил спам-сигнал именно об этом узле.
+        let got = timeout(Duration::from_secs(1), spam_rx.recv()).await;
+        assert!(matches!(got, Ok(Ok(ref p)) if *p == from),
+            "ожидался спам-сигнал о {from}, получено {got:?}");
+
+        // Без лимитера ничего не дропается.
+        let (kp2, id2) = keypair(6);
+        let chat2 = PublicChat::new(test_peer("y", id2, 2), PeerList::new(), 2, kp2, None);
+        for _ in 0..100 {
+            assert!(chat2.allow_packet(&node_id(1)).await, "без лимитера всё проходит");
+        }
     }
 }
