@@ -5,19 +5,22 @@ use eframe::egui;
 use egui::{Button, Frame, RichText, ScrollArea, TextEdit};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::SiteInfo;
+use crate::backend::{DnsInfo, SiteInfo};
 
 pub struct SitesPage {
     /// Канал GUI → backend: опубликовать каталог как сайт (путь, имя).
     pub publish_tx:     Option<UnboundedSender<(PathBuf, String)>>,
     /// Снимок списка сайтов из backend.
     pub sites:          Option<Arc<Mutex<Vec<SiteInfo>>>>,
+    /// Снимок имён внутреннего DNS (.void) из backend.
+    pub dns_names:      Option<Arc<Mutex<Vec<DnsInfo>>>>,
     /// Порт локального HTTP-сервера сайтов (для открытия в браузере).
     pub site_http_port: u16,
     search:        String,
     publish_path:  String,
     publish_name:  String,
     snapshot:      Vec<SiteInfo>,
+    dns_snapshot:  Vec<DnsInfo>,
 }
 
 impl Default for SitesPage {
@@ -25,11 +28,13 @@ impl Default for SitesPage {
         Self {
             publish_tx:     None,
             sites:          None,
+            dns_names:      None,
             site_http_port: 0,
             search:         String::new(),
             publish_path:   String::new(),
             publish_name:   String::new(),
             snapshot:       Vec::new(),
+            dns_snapshot:   Vec::new(),
         }
     }
 }
@@ -46,6 +51,9 @@ impl SitesPage {
     fn sync(&mut self) {
         if let Some(shared) = &self.sites {
             self.snapshot = shared.lock().unwrap().clone();
+        }
+        if let Some(shared) = &self.dns_names {
+            self.dns_snapshot = shared.lock().unwrap().clone();
         }
     }
 
@@ -175,6 +183,51 @@ impl SitesPage {
                 });
                 ui.add_space(4.0);
             }
+
+            // ── Имена сети (.void) ──────────────────────────────────────────
+            ui.add_space(12.0);
+            let names: Vec<&DnsInfo> = self.dns_snapshot.iter()
+                .filter(|d| search.is_empty() || d.dns_name.to_lowercase().contains(&search))
+                .collect();
+            egui::CollapsingHeader::new(format!("󰇧  Имена сети (.void) — {}", names.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if names.is_empty() {
+                        ui.label(
+                            RichText::new("Пока нет известных имён.")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    for d in names {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&d.dns_name).strong());
+                            ui.label(
+                                RichText::new(format!("[{}]", d.kind))
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                            if d.is_mine {
+                                ui.label(
+                                    RichText::new("мой")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(80, 180, 100)),
+                                );
+                            }
+                            let detail = match &d.ip {
+                                Some(ip) => format!("{} · {}", d.owner_short, ip),
+                                None     => d.owner_short.clone(),
+                            };
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(detail)
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            });
+                        });
+                    }
+                });
         });
 
         if let Some(url) = open_url {

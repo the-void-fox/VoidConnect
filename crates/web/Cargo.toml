@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 void-core    = { path = "../core" }
+void-crypto  = { path = "../crypto" }
 void-storage = { path = "../storage" }
 
 tokio      = { workspace = true }

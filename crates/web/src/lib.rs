@@ -12,6 +12,7 @@
 //! // → http://127.0.0.1:8080/blog
 //! ```
 
+pub mod dns;
 pub mod error;
 pub mod registry;
 pub mod server;
@@ -23,6 +24,7 @@ use void_core::identity::NodeId;
 use void_core::site::{SiteEntry, SiteManifest};
 use void_storage::StorageManager;
 
+pub use dns::DnsRegistry;
 pub use error::WebError;
 pub use registry::SiteRegistry;
 pub use server::{router, serve, PeerSnapshot};

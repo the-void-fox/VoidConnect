@@ -56,6 +56,8 @@ pub enum ChatPacket {
     ReputationSync { from: NodeId, signed: SignedMessage },
     /// Подписанная жалоба на узел (reporter = signed.signer).
     ReputationReport { signed: SignedMessage },
+    /// Подписанная DNS-запись зоны `.void` (owner = signed.signer).
+    DnsAnnounce { signed: SignedMessage },
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -128,6 +130,8 @@ struct PublicChatInner {
     site_tx:     broadcast::Sender<SiteManifest>,
     /// Входящие пакеты репутации (sync/жалобы) → backend
     rep_tx:      broadcast::Sender<RepGossip>,
+    /// Входящие подписанные DNS-записи → backend (он проверяет/применяет)
+    dns_tx:      broadcast::Sender<SignedMessage>,
     /// Счётчик поколений соединения — чтобы старый read-task не затёр новый outbox
     conn_gen:    AtomicU64,
 }
@@ -138,6 +142,7 @@ impl PublicChat {
         let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (site_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
+        let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
                 my_peer, peer_list, chat_port, signing_kp, incoming_tx,
@@ -155,6 +160,7 @@ impl PublicChat {
                 sites:       Mutex::new(HashMap::new()),
                 site_tx,
                 rep_tx,
+                dns_tx,
                 conn_gen:    AtomicU64::new(0),
             }),
         }
@@ -360,6 +366,44 @@ impl PublicChat {
             }
         }
     }
+
+    // ─── Внутренний DNS (зона .void) ──────────────────────────────────────────
+
+    /// Подписка backend на входящие подписанные DNS-записи.
+    pub fn subscribe_dns(&self) -> broadcast::Receiver<SignedMessage> {
+        self.inner.dns_tx.subscribe()
+    }
+
+    /// Рассылает нашу подписанную DNS-запись (клиентам — если мы релей; релею —
+    /// если мы клиент). Релей форвардит её остальным.
+    pub async fn announce_dns(&self, signed: SignedMessage) {
+        let pkt = ChatPacket::DnsAnnounce { signed };
+        {
+            let clients = self.inner.clients.lock().await;
+            for tx in clients.values() {
+                let _ = tx.try_send(pkt.clone());
+            }
+        }
+        let outbox = self.inner.outbox_tx.lock().await;
+        if let Some(tx) = outbox.as_ref() {
+            let _ = tx.try_send(pkt);
+        }
+    }
+
+    /// Обрабатывает входящую DNS-запись: отдаёт backend'у (он проверяет подпись
+    /// и разрешает конфликт имён) и — если мы релей — форвардит остальным
+    /// клиентам, кроме владельца записи. Дедуп/разрешение конфликтов — в backend.
+    async fn handle_dns(&self, signed: SignedMessage) {
+        let _ = self.inner.dns_tx.send(signed.clone());
+
+        let excl = signed.signer.clone();
+        let clients = self.inner.clients.lock().await;
+        for (id, tx) in clients.iter() {
+            if id.as_str() != excl {
+                let _ = tx.try_send(ChatPacket::DnsAnnounce { signed: signed.clone() });
+            }
+        }
+    }
 }
 
 // ─── Запуск ──────────────────────────────────────────────────────────────────
@@ -524,6 +568,9 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
                 }
                 Ok(ChatPacket::ReputationReport { signed }) => {
                     chat_r.handle_reputation(RepGossip::Report { signed }).await;
+                }
+                Ok(ChatPacket::DnsAnnounce { signed }) => {
+                    chat_r.handle_dns(signed).await;
                 }
                 Ok(ChatPacket::Ping) => {
                     debug!("Ping from client {}", nid);
@@ -916,6 +963,9 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
                 Ok(ChatPacket::ReputationReport { signed }) => {
                     chat_r.handle_reputation(RepGossip::Report { signed }).await;
                 }
+                Ok(ChatPacket::DnsAnnounce { signed }) => {
+                    chat_r.handle_dns(signed).await;
+                }
                 Ok(ChatPacket::Ping) => {
                     // Ретранслятор пингует нас — отвечаем Pong через outbox
                     let outbox = chat_r.inner.outbox_tx.lock().await;
@@ -961,6 +1011,8 @@ impl ChatHandle {
         self.chat.broadcast_reputation_sync(from, signed).await
     }
     pub async fn broadcast_report(&self, signed: SignedMessage) { self.chat.broadcast_report(signed).await }
+    pub async fn announce_dns(&self, signed: SignedMessage) { self.chat.announce_dns(signed).await }
+    pub fn subscribe_dns(&self) -> broadcast::Receiver<SignedMessage> { self.chat.subscribe_dns() }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -1331,5 +1383,63 @@ mod tests {
         let known = bob.get_sites().await;
         assert!(known.iter().any(|m| m.name == "blog"),
             "манифест сайта должен сохраниться у Bob");
+    }
+
+    /// Подписанная DNS-запись, объявленная одним узлом, доходит до второго через
+    /// relay (механизм внутреннего DNS — синхронизация зоны `.void`).
+    #[tokio::test]
+    async fn dns_announce_propagates_to_peer() {
+        use void_core::dns::{DnsKind, DnsRecord};
+
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id.clone(), a_port);
+        let b_peer = test_peer("bob", b_id.clone(), b_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone()).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp).await.unwrap();
+
+        let mut bob_dns = bob.subscribe_dns();
+
+        let record = DnsRecord {
+            name: "alice".into(),
+            kind: DnsKind::Node,
+            node_id: a_id.clone(),
+            ip: Some("10.0.0.1".into()),
+            port: Some(a_port.wrapping_sub(2)),
+            created_at: 1,
+        };
+        let signed = SignedMessage::sign(record.to_bytes(), &a_kp).unwrap();
+
+        let mut delivered = false;
+        for _ in 0..40 {
+            alice.announce_dns(signed.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { break; }
+                match timeout(remaining, bob_dns.recv()).await {
+                    Ok(Ok(s)) if s.signer == a_id.as_str() => {
+                        let rec: DnsRecord = serde_json::from_slice(&s.payload).unwrap();
+                        assert_eq!(rec.name, "alice");
+                        assert!(s.verify().is_ok(), "подпись DNS-записи должна проверяться");
+                        delivered = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    _ => break,
+                }
+            }
+            if delivered { break; }
+        }
+        assert!(delivered, "Bob не получил DNS-запись от Alice");
     }
 }

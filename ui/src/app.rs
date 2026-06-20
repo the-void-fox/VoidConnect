@@ -108,11 +108,12 @@ impl VoidApp {
         storage.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
         storage.downloads_dir = Some(backend.downloads_dir.clone());
 
-        // Страница сайтов: канал публикации + список сайтов.
+        // Страница сайтов: канал публикации + список сайтов + имена .void.
         let mut sites = SitesPage::default();
         sites.publish_tx     = Some(backend.publish_site_tx.clone());
         sites.sites          = Some(std::sync::Arc::clone(&backend.sites));
         sites.site_http_port = backend.site_http_port;
+        sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
 
         Self {
             current_page: Page::Chat,

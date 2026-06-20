@@ -6,17 +6,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use void_core::dns::{DnsKind, DnsRecord};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
 use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip};
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
+use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
 use void_storage::{ChunkEvent, ChunkStore, StorageManager};
 use void_reputation::{
     EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager, SyncManager,
 };
-use void_web::{publish_site, SiteRegistry};
+use void_web::{publish_site, DnsRegistry, SiteRegistry};
 
 /// Запись о файле в хранилище — снимок для GUI.
 #[derive(Clone)]
@@ -44,6 +46,98 @@ pub struct SiteInfo {
     pub is_mine:    bool,
     /// Локальный URL для открытия в браузере.
     pub url:        String,
+}
+
+/// Запись внутреннего DNS (.void) — снимок для GUI.
+#[derive(Clone)]
+pub struct DnsInfo {
+    /// Полное имя в зоне, напр. `vasya.void`.
+    pub dns_name:    String,
+    /// "узел" | "сайт".
+    pub kind:        String,
+    /// Короткий ID владельца.
+    pub owner_short: String,
+    /// IP (для узлов), если известен.
+    pub ip:          Option<String>,
+    /// Запись принадлежит нам.
+    pub is_mine:     bool,
+}
+
+/// Сервис внутреннего DNS зоны `.void`: подпись/заявка наших имён, применение
+/// чужих записей и перерассылка наших новым пирам. Тонкая обёртка над
+/// [`DnsRegistry`] + relay чата. Клонируется дёшево (всё внутри — Arc/clone).
+#[derive(Clone)]
+struct DnsService {
+    registry: DnsRegistry,
+    chat:     ChatHandle,
+    keypair:  Arc<SigningKeypair>,
+    my_id:    NodeId,
+    /// Снимок известных имён для GUI.
+    snapshot: Arc<Mutex<Vec<DnsInfo>>>,
+}
+
+impl DnsService {
+    /// Заявляет наше имя (подписывает запись, применяет локально, рассылает сети).
+    /// Конфликт имён разрешит [`DnsRegistry`] (первый по времени).
+    async fn claim(&self, kind: DnsKind, name: &str, ip: Option<String>, port: Option<u16>) {
+        let record = DnsRecord {
+            name: name.to_string(),
+            kind,
+            node_id: self.my_id.clone(),
+            ip,
+            port,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let signed = match SignedMessage::sign(record.to_bytes(), &self.keypair) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("DNS: не удалось подписать запись '{}': {}", name, e); return; }
+        };
+        match self.registry.apply_signed(&signed).await {
+            Ok(Some(_)) => {
+                tracing::info!("Заявлено DNS-имя '{}.void'", name);
+                self.chat.announce_dns(signed).await;
+                self.refresh().await;
+            }
+            Ok(None) => tracing::debug!("DNS-имя '{}.void' уже занято/без изменений", name),
+            Err(e)   => tracing::warn!("DNS-заявка '{}' отклонена: {}", name, e),
+        }
+    }
+
+    /// Применяет входящую (чужую) запись из сети.
+    async fn apply_incoming(&self, signed: SignedMessage) {
+        match self.registry.apply_signed(&signed).await {
+            Ok(Some(rec)) => {
+                tracing::info!("DNS: запись '{}.void' от {}", rec.name, rec.node_id);
+                self.refresh().await;
+            }
+            Ok(None) => {}
+            Err(e)   => tracing::debug!("DNS: запись отклонена: {}", e),
+        }
+    }
+
+    /// Перерассылает наши записи (например, при появлении новых пиров).
+    async fn reannounce(&self) {
+        for signed in self.registry.mine(&self.my_id).await {
+            self.chat.announce_dns(signed).await;
+        }
+    }
+
+    /// Обновляет снимок имён для GUI.
+    async fn refresh(&self) {
+        let my_key = self.my_id.as_str();
+        let infos: Vec<DnsInfo> = self.registry.list().await.into_iter().map(|r| {
+            let owner = r.node_id.as_str();
+            let owner_short = format!("{}…", &owner[..8.min(owner.len())]);
+            DnsInfo {
+                dns_name:    r.dns_name(),
+                kind:        match r.kind { DnsKind::Node => "узел", DnsKind::Site => "сайт" }.into(),
+                owner_short,
+                ip:          r.ip,
+                is_mine:     owner == my_key,
+            }
+        }).collect();
+        *self.snapshot.lock().unwrap() = infos;
+    }
 }
 
 /// Команда GUI → backend для управления скачиванием файла.
@@ -117,6 +211,8 @@ pub struct BackendHandle {
     pub sites: Arc<Mutex<Vec<SiteInfo>>>,
     /// Порт локального HTTP-сервера сайтов (base_port + 4).
     pub site_http_port: u16,
+    /// Снимок известных имён внутреннего DNS (.void).
+    pub dns_names: Arc<Mutex<Vec<DnsInfo>>>,
 }
 
 pub fn start_backend(
@@ -146,6 +242,7 @@ pub fn start_backend(
     let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, ReportReason)>();
     let (publish_site_tx, publish_site_rx) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, String)>();
     let sites: Arc<Mutex<Vec<SiteInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let dns_names: Arc<Mutex<Vec<DnsInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let site_http_port = base_port + 4;
 
     let my_ip = if local_mode {
@@ -182,6 +279,7 @@ pub fn start_backend(
     let storage_bg  = Arc::clone(&storage_files);
     let reputation_bg = Arc::clone(&peer_reputation);
     let sites_bg      = Arc::clone(&sites);
+    let dns_bg        = Arc::clone(&dns_names);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -197,6 +295,7 @@ pub fn start_backend(
                 publish_rx, download_rx, storage_bg,
                 reputation_bg, report_rx,
                 publish_site_rx, sites_bg, site_http_port,
+                dns_bg,
             ).await;
         });
     });
@@ -231,6 +330,7 @@ pub fn start_backend(
         publish_site_tx,
         sites,
         site_http_port,
+        dns_names,
     }
 }
 
@@ -263,6 +363,7 @@ async fn backend_main(
     publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out: Arc<Mutex<Vec<SiteInfo>>>,
     site_http_port: u16,
+    dns_out: Arc<Mutex<Vec<DnsInfo>>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -338,6 +439,8 @@ async fn backend_main(
         }
     }
 
+    // Ключ подписи нужен и DNS (заявка имён) — клонируем до передачи в чат.
+    let dns_kp = sign_kp.clone();
     let chat = match start_public_chat(my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp).await {
         Ok(h)  => h,
         Err(e) => {
@@ -352,6 +455,38 @@ async fn backend_main(
     initial_profile.enc_pubkey = Some(enc_pub_hex.clone());
     initial_profile.is_bootstrap = bootstrap;
     chat.set_profile(initial_profile).await;
+
+    // ── Внутренний DNS зоны .void ─────────────────────────────────────────────
+    // Заявляем имя нашего узла и слушаем чужие записи (синхронизация через relay).
+    let dns = DnsService {
+        registry: DnsRegistry::new(),
+        chat:     chat.clone(),
+        keypair:  dns_kp,
+        my_id:    my_peer.id.clone(),
+        snapshot: Arc::clone(&dns_out),
+    };
+    {
+        // Имя узла = нормализованное отображаемое имя (иначе короткий ID).
+        let label = void_core::dns::normalize_name(&my_peer.name)
+            .unwrap_or_else(|| my_peer.id.as_str()[..8.min(my_peer.id.as_str().len())].to_string());
+        dns.claim(DnsKind::Node, &label, Some(my_peer.ip.to_string()), Some(base_port)).await;
+    }
+    // Задача: входящие DNS-записи из сети → проверяем подпись и применяем.
+    {
+        let dns_in = dns.clone();
+        let mut dns_rx = chat.subscribe_dns();
+        tokio::spawn(async move {
+            loop {
+                match dns_rx.recv().await {
+                    Ok(signed) => dns_in.apply_incoming(signed).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("DNS gossip lagged by {}", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     // Запускаем DM-сервер
     let dm_handle = match start_private_chat(my_peer.clone(), Arc::clone(&enc_kp), dm_port).await {
@@ -477,6 +612,7 @@ async fn backend_main(
     let rep_snap = reputation.clone();
     let rep_out  = Arc::clone(&reputation_out);
     let my_rep_id = my_peer.id.clone();
+    let dns_snap = dns.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         let mut prev_ids: HashSet<NodeId> = HashSet::new();
@@ -492,13 +628,14 @@ async fn backend_main(
                 }
             }
 
+            // Только реальные узлы (64-hex), не stub-заглушки.
+            let cur_ids: HashSet<NodeId> = peers.iter()
+                .filter(|p| p.id.as_str().len() == 64)
+                .map(|p| p.id.clone())
+                .collect();
+            let newly: Vec<NodeId> = cur_ids.difference(&prev_ids).cloned().collect();
+
             if let Some(rep) = &rep_snap {
-                // Только реальные узлы (64-hex), не stub-заглушки.
-                let cur_ids: HashSet<NodeId> = peers.iter()
-                    .filter(|p| p.id.as_str().len() == 64)
-                    .map(|p| p.id.clone())
-                    .collect();
-                let newly: Vec<NodeId> = cur_ids.difference(&prev_ids).cloned().collect();
                 for id in &newly {
                     rep.events.process(ReputationEvent::PeerConnected { peer_id: id.clone() }).await;
                 }
@@ -517,8 +654,13 @@ async fn backend_main(
                     snapshot.insert(id.clone(), rep.score.score(id).await);
                 }
                 *rep_out.lock().unwrap() = snapshot;
-                prev_ids = cur_ids;
             }
+
+            // Новым пирам — наши DNS-записи (работает и без репутации).
+            if !newly.is_empty() {
+                dns_snap.reannounce().await;
+            }
+            prev_ids = cur_ids;
         }
     });
 
@@ -587,7 +729,7 @@ async fn backend_main(
                     // Сайты: HTTP-сервер + публикация + обнаружение по сети.
                     start_site_tasks(
                         manager.clone(), my_peer.id.clone(), site_http_port,
-                        chat.clone(), Arc::clone(&sites_peers),
+                        chat.clone(), Arc::clone(&sites_peers), dns.clone(),
                         publish_site_rx, sites_out,
                     );
                     start_storage_tasks(
@@ -621,6 +763,7 @@ fn start_site_tasks(
     http_port:  u16,
     chat:       ChatHandle,
     peers:      Arc<Mutex<Vec<PeerInfo>>>,
+    dns:        DnsService,
     mut publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
 ) {
@@ -674,10 +817,13 @@ fn start_site_tasks(
                             pub_chat.announce_file(fm).await;
                         }
                     }
+                    let site_name = manifest.name.clone();
                     registry.register(manifest.clone()).await;
                     // Объявляем сайт сети.
                     pub_chat.announce_site(manifest).await;
                     refresh_sites(&registry, &my_key, http_port, &sites_out).await;
+                    // Заявляем DNS-имя сайта (.void) — владение + резолв.
+                    dns.claim(DnsKind::Site, &site_name, None, Some(http_port)).await;
                 }
                 Err(e) => tracing::warn!("Публикация сайта '{}' не удалась: {}", name, e),
             }

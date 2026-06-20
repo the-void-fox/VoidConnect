@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod error;
 pub mod identity;
 pub mod manifest;
