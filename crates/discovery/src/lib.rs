@@ -4,6 +4,7 @@ pub mod local_discovery;
 pub mod mdns;
 pub mod nat;
 pub mod peer_list;
+pub mod relay;
 pub mod stun;
 pub mod udp_broadcast;
 

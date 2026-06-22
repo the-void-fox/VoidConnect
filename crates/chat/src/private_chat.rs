@@ -5,7 +5,6 @@
 //! Шифрование: X25519 DH + BLAKE3 KDF + XChaCha20-Poly1305
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +64,7 @@ pub struct IncomingDm {
 }
 
 /// Команда из GUI: отправить личное сообщение пиру.
+#[derive(Clone)]
 pub struct DmSendCmd {
     pub to:               NodeId,
     /// Адрес DM-сервера пира: "ip:dm_port"
@@ -133,16 +133,19 @@ async fn run_dm_server(handle: PrivateChatHandle, port: u16) -> anyhow::Result<(
     info!("DM server listening on {}", addr);
     loop {
         match listener.accept().await {
-            Ok((stream, addr)) => {
+            Ok((stream, _addr)) => {
                 let h = handle.clone();
-                tokio::spawn(async move { accept_dm_conn(stream, addr, h).await; });
+                tokio::spawn(async move { accept_dm_conn(stream, h).await; });
             }
             Err(e) => warn!("DM accept error: {}", e),
         }
     }
 }
 
-async fn accept_dm_conn(stream: TcpStream, addr: SocketAddr, handle: PrivateChatHandle) {
+async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
+    let addr = stream.peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<relay>".to_string());
     debug!("DM incoming from {}", addr);
     let (mut rd, mut wr) = stream.into_split();
 
@@ -202,6 +205,13 @@ impl PrivateChatHandle {
         self.inner.incoming_tx.subscribe()
     }
 
+    /// Обрабатывает уже установленный поток как ВХОДЯЩЕЕ DM-соединение.
+    /// Используется для туннелей через relay (symmetric NAT): поток приходит не
+    /// из `accept()`, а из [`void-discovery`] relay-клиента, но логика та же.
+    pub async fn accept_stream(&self, stream: TcpStream) {
+        accept_dm_conn(stream, self.clone()).await;
+    }
+
     /// Получить кэшированный enc_pubkey пира (если он подключался ранее).
     pub async fn known_pubkey(&self, id: &NodeId) -> Option<[u8; 32]> {
         self.inner.known_pubkeys.lock().await.get(id).map(|(k, _)| *k)
@@ -226,7 +236,7 @@ impl PrivateChatHandle {
             timestamp:      chrono::Utc::now().timestamp(),
         };
 
-        // Пробуем существующее соединение
+        // Пробуем существующее соединение (в т.ч. ранее поднятый relay-туннель)
         {
             let conns = self.inner.connections.lock().await;
             if let Some(conn) = conns.get(&cmd.to) {
@@ -236,31 +246,46 @@ impl PrivateChatHandle {
             }
         }
 
-        // Устанавливаем новое исходящее соединение
-        self.dial_peer(cmd.to, &cmd.to_dm_addr, &cmd.their_enc_pubkey, pkt).await
+        // Устанавливаем новое исходящее соединение (прямое)
+        let stream = dial(&cmd.to_dm_addr).await?;
+        self.establish_outbound(stream, cmd.to, &cmd.their_enc_pubkey, pkt).await
     }
 
-    async fn dial_peer(
+    /// Отправляет DM по УЖЕ установленному потоку (например, relay-туннелю), когда
+    /// прямое соединение невозможно (symmetric NAT). Шифрует и проводит тот же
+    /// handshake, что и прямой дозвон, но без `TcpStream::connect`.
+    pub async fn send_dm_over_stream(
         &self,
-        to:            NodeId,
-        addr:          &str,
-        their_enc_pub: &[u8; 32],
-        first_pkt:     DmPacket,
+        cmd:    DmSendCmd,
+        stream: TcpStream,
     ) -> anyhow::Result<()> {
         use anyhow::anyhow;
 
-        let stream = match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-            Err(_) => {
-                warn!("DM: connect timeout to {}", addr);
-                anyhow::bail!("DM connect timeout to {}", addr);
-            }
-            Ok(Err(e)) => {
-                warn!("DM: connect to {} failed: {}", addr, e);
-                anyhow::bail!("DM connect to {} failed: {}", addr, e);
-            }
-            Ok(Ok(s)) => s,
+        let enc = EncryptedMessage::encrypt(
+            cmd.plaintext.as_bytes(),
+            &cmd.their_enc_pubkey,
+            &self.inner.my_enc_kp,
+        ).map_err(|e| anyhow!("DM encrypt: {:?}", e))?;
+        let blob = serde_json::to_string(&enc)?;
+        let pkt = DmPacket::Message {
+            message_id:     cmd.message_id,
+            encrypted_blob: blob,
+            timestamp:      chrono::Utc::now().timestamp(),
         };
 
+        self.establish_outbound(stream, cmd.to, &cmd.their_enc_pubkey, pkt).await
+    }
+
+    /// Общая часть исходящего соединения: handshake (наш/их Hello), кэширование
+    /// enc_pubkey, отправка первого пакета и запуск задач соединения. Работает
+    /// поверх любого подключённого потока — прямого TCP или relay-туннеля.
+    async fn establish_outbound(
+        &self,
+        stream:        TcpStream,
+        to:            NodeId,
+        their_enc_pub: &[u8; 32],
+        first_pkt:     DmPacket,
+    ) -> anyhow::Result<()> {
         let (mut rd, mut wr) = stream.into_split();
 
         // Наш Hello
@@ -299,6 +324,21 @@ impl PrivateChatHandle {
         });
 
         Ok(())
+    }
+}
+
+/// Прямой дозвон до DM-сервера пира (`ip:dm_port`).
+async fn dial(addr: &str) -> anyhow::Result<TcpStream> {
+    match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+        Err(_) => {
+            warn!("DM: connect timeout to {}", addr);
+            anyhow::bail!("DM connect timeout to {}", addr);
+        }
+        Ok(Err(e)) => {
+            warn!("DM: connect to {} failed: {}", addr, e);
+            anyhow::bail!("DM connect to {} failed: {}", addr, e);
+        }
+        Ok(Ok(s)) => Ok(s),
     }
 }
 
@@ -575,6 +615,55 @@ mod tests {
                 .unwrap();
             assert_eq!(dm.plaintext, format!("msg-{i}"));
         }
+    }
+
+    /// DM поверх ПРЕДОСТАВЛЕННОГО потока (модель relay-туннеля): Alice шлёт через
+    /// `send_dm_over_stream`, Bob принимает через `accept_stream` — оба конца это
+    /// просто пара сокетов, как если бы их состыковал relay. Доказывает, что
+    /// handshake/доставка не зависят от прямого `TcpStream::connect`.
+    #[tokio::test]
+    async fn dm_over_provided_stream() {
+        let (alice, _a_kp, a_id) = start_node("alice", 1, free_port()).await;
+        let (bob, b_kp, b_id) = start_node("bob", 2, free_port()).await;
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(200)).await;
+
+        // Состыкованная пара сокетов (эмулирует туннель relay).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (alice_side, accepted) = tokio::join!(
+            TcpStream::connect(addr),
+            listener.accept(),
+        );
+        let alice_side = alice_side.unwrap();
+        let bob_side = accepted.unwrap().0;
+
+        // Bob обрабатывает свою сторону как входящее DM-соединение.
+        let bob2 = bob.clone();
+        tokio::spawn(async move { bob2.accept_stream(bob_side).await; });
+
+        // Alice шлёт сообщение по своей стороне.
+        alice
+            .send_dm_over_stream(
+                DmSendCmd {
+                    to:               b_id.clone(),
+                    to_dm_addr:       String::new(), // не используется
+                    their_enc_pubkey: b_kp.public_bytes(),
+                    plaintext:        "через туннель".into(),
+                    message_id:       "rm1".into(),
+                },
+                alice_side,
+            )
+            .await
+            .expect("send_dm_over_stream");
+
+        let dm = timeout(Duration::from_secs(3), bob_rx.recv())
+            .await
+            .expect("таймаут ожидания DM через туннель")
+            .expect("broadcast закрыт");
+        assert_eq!(dm.plaintext, "через туннель");
+        assert_eq!(dm.from, a_id);
+        assert_eq!(dm.message_id, "rm1");
     }
 
     /// Сериализация протокольных пакетов: roundtrip + неизвестный тип → Unknown.

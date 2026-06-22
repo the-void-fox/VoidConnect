@@ -463,6 +463,12 @@ async fn backend_main(
             my_peer.clone(), peer_list.clone(), service_addrs,
         );
     }
+    // Relay-адреса тех же bootstrap-узлов (host:base+6). Через них идёт fallback
+    // DM, когда прямое соединение невозможно (symmetric NAT). Регистрация и
+    // приём входящих туннелей подключаются ниже, после старта DM-сервера.
+    let relay_addrs: Vec<String> = bootstrap_addrs.iter()
+        .filter_map(|a| void_discovery::relay::service_addr(a).ok())
+        .collect();
     // Сервер: в публичном режиме сами становимся точкой входа. Сначала узнаём
     // свой ВНЕШНИЙ адрес (UPnP-проброс портов → внешний IP, иначе STUN-фолбэк),
     // затем поднимаем bootstrap-сервер, рекламирующий доступный извне адрес
@@ -471,8 +477,8 @@ async fn backend_main(
         let me = my_peer.clone();
         let pl = peer_list.clone();
         tokio::spawn(async move {
-            // 1. UPnP: открываем TCP-порты на роутере (base/+2/+3/+4/+5) + внешний IP.
-            let ports = [base_port, base_port + 2, base_port + 3, base_port + 4, base_port + 5];
+            // 1. UPnP: открываем TCP-порты на роутере (base/+2/+3/+4/+5/+6) + внешний IP.
+            let ports = [base_port, base_port + 2, base_port + 3, base_port + 4, base_port + 5, base_port + 6];
             let upnp_ip = void_discovery::nat::map_ports(me.ip, &ports, "Void Connect").await;
             // 2. Если UPnP не дал внешний IP — пробуем STUN (публичные серверы).
             let ext_ip = match upnp_ip {
@@ -502,6 +508,11 @@ async fn backend_main(
                 advertised, pl, bport,
             ).await {
                 tracing::error!("Bootstrap server failed on {}: {}", bport, e);
+            }
+            // 5. Relay-сервер: ретранслируем DM между узлами за symmetric NAT.
+            let rport = base_port + void_discovery::relay::RELAY_PORT_OFFSET;
+            if let Err(e) = void_discovery::relay::start_relay_server(rport).await {
+                tracing::error!("Relay server failed on {}: {}", rport, e);
             }
         });
     }
@@ -566,6 +577,26 @@ async fn backend_main(
             loop { tokio::time::sleep(tokio::time::Duration::from_secs(60)).await; }
         }
     };
+
+    // Relay-клиент: регистрируемся на relay каждого известного bootstrap-узла и
+    // принимаем входящие туннели — поток скармливаем DM-серверу как входящее
+    // соединение (так доходят DM от пиров за symmetric NAT).
+    if !relay_addrs.is_empty() {
+        tracing::info!("Relay-адреса: {:?}", relay_addrs);
+        for raddr in &relay_addrs {
+            let mut accepted = void_discovery::relay::start_relay_client(
+                raddr.clone(), my_peer.id.clone(),
+            );
+            let dm_accept = dm_handle.clone();
+            tokio::spawn(async move {
+                while let Some((stream, from)) = accepted.recv().await {
+                    tracing::info!("Relay: входящий туннель от {}", from);
+                    let h = dm_accept.clone();
+                    tokio::spawn(async move { h.accept_stream(stream).await; });
+                }
+            });
+        }
+    }
 
     // Задача: входящие публичные сообщения → inbox GUI + персистентность в БД
     let mut rx = chat.subscribe();
@@ -634,12 +665,40 @@ async fn backend_main(
         }
     });
 
-    // Задача: исходящие DM из GUI → DM handle
+    // Задача: исходящие DM из GUI → DM handle. При неудаче прямого соединения
+    // (symmetric NAT) пробуем доставить через relay известных bootstrap-узлов.
     let dm_h = dm_handle.clone();
+    let dm_relay_addrs = relay_addrs.clone();
+    let dm_my_id = my_peer.id.clone();
     tokio::spawn(async move {
         while let Some(cmd) = dm_rx.recv().await {
-            if let Err(e) = dm_h.send_dm(cmd).await {
-                tracing::warn!("DM send error: {}", e);
+            let to = cmd.to.clone();
+            // send_dm переиспользует уже поднятое соединение (в т.ч. relay-туннель),
+            // иначе пытается прямой дозвон.
+            if dm_h.send_dm(cmd.clone()).await.is_ok() {
+                continue;
+            }
+            if dm_relay_addrs.is_empty() {
+                tracing::warn!("DM не доставлено: прямое соединение не удалось, relay не задан");
+                continue;
+            }
+            let mut sent = false;
+            for raddr in &dm_relay_addrs {
+                match void_discovery::relay::open_tunnel(raddr, &dm_my_id, &to).await {
+                    Ok(stream) => {
+                        if let Err(e) = dm_h.send_dm_over_stream(cmd.clone(), stream).await {
+                            tracing::debug!("DM через relay {} не прошёл: {}", raddr, e);
+                        } else {
+                            tracing::info!("DM доставлено через relay {}", raddr);
+                            sent = true;
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::debug!("relay {} недоступен: {}", raddr, e),
+                }
+            }
+            if !sent {
+                tracing::warn!("DM не доставлено: ни прямое соединение, ни relay не сработали");
             }
         }
     });

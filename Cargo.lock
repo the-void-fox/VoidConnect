@@ -5046,6 +5046,7 @@ dependencies = [
  "chrono",
  "igd-next",
  "mdns-sd",
+ "rand",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

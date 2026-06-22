@@ -19,3 +19,12 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
+
+# Для сквозного интеграционного теста relay+DM (tests/): бинарный крейт не
+# отдаёт обычные [dependencies] интеграционным тестам, поэтому дублируем здесь.
+[dev-dependencies]
+void-core      = { path = "../crates/core" }
+void-crypto    = { path = "../crates/crypto" }
+void-chat      = { path = "../crates/chat" }
+void-discovery = { path = "../crates/discovery" }
+tokio          = { workspace = true }
