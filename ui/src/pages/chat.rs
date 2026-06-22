@@ -22,6 +22,8 @@ pub struct ChatPage {
     send_tx:  Option<tokio::sync::mpsc::UnboundedSender<String>>,
     my_name:  String,
     my_id:    String,
+    /// Свой аватар (base64-PNG) — для строк собственных сообщений.
+    pub my_avatar: Option<String>,
     peers:    Vec<PeerInfo>,
     profiles: HashMap<NodeId, PeerProfile>,
     selected: Option<NodeId>,
@@ -47,6 +49,7 @@ impl ChatPage {
             send_tx:          Some(send_tx),
             my_name,
             my_id,
+            my_avatar:        None,
             peers:            Vec::new(),
             profiles:         HashMap::new(),
             selected:         None,
@@ -79,6 +82,7 @@ impl Default for ChatPage {
             send_tx:          None,
             my_name:          "Вы".into(),
             my_id:            String::new(),
+            my_avatar:        None,
             peers:            Vec::new(),
             profiles:         HashMap::new(),
             selected:         None,
@@ -166,7 +170,7 @@ impl ChatPage {
                 }
 
                 for msg in &self.messages {
-                    if let Some(id) = Self::render_message(ui, msg, &self.profiles) {
+                    if let Some(id) = Self::render_message(ui, msg, &self.profiles, self.my_avatar.as_deref()) {
                         clicked_id = Some(id);
                     }
                     ui.add_space(8.0);
@@ -225,7 +229,7 @@ impl ChatPage {
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_sized([btn_w, 36.0], Button::new("📤 Отправить")).clicked() {
+                if ui.add_sized([btn_w, 36.0], Button::new("󰒊 Отправить")).clicked() {
                     should_send = true;
                 }
             });
@@ -238,6 +242,7 @@ impl ChatPage {
         ui: &mut egui::Ui,
         msg: &ChatMessage,
         profiles: &HashMap<NodeId, PeerProfile>,
+        my_avatar: Option<&str>,
     ) -> Option<NodeId> {
         let mut clicked_id: Option<NodeId> = None;
 
@@ -252,13 +257,33 @@ impl ChatPage {
             msg.author.clone()
         };
 
+        // Статус автора (для цвета имени и запасного кружка аватара)
+        let status = if msg.is_me {
+            None
+        } else {
+            msg.from_id.as_ref()
+                .and_then(|id| profiles.get(id))
+                .map(|p| p.status.as_str())
+        };
+
+        // Аватар автора: свой для собственных сообщений, иначе из профиля пира.
+        let avatar_b64 = if msg.is_me {
+            my_avatar
+        } else {
+            msg.from_id.as_ref()
+                .and_then(|id| profiles.get(id))
+                .and_then(|p| p.avatar_png.as_deref())
+        };
+        let avatar_fill = if msg.is_me {
+            ui.visuals().hyperlink_color
+        } else {
+            status_colors(status).0
+        };
+
         // Name color: status-tinted for others, default for self
         let name_color = if msg.is_me {
             ui.visuals().strong_text_color()
         } else {
-            let status = msg.from_id.as_ref()
-                .and_then(|id| profiles.get(id))
-                .map(|p| p.status.as_str());
             let (_, stroke) = status_colors(status);
             stroke
         };
@@ -272,7 +297,9 @@ impl ChatPage {
                 ui.visuals().extreme_bg_color
             });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
+            crate::avatar::show_avatar(ui, avatar_b64, &display_name, avatar_fill, 28.0);
+            ui.add_space(6.0);
             ui.vertical(|ui| {
                 bubble.show(ui, |ui| {
                     ui.horizontal(|ui| {

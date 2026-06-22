@@ -98,13 +98,23 @@ impl SitesPage {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let btn_w = 130.0;
+                let browse_w = 96.0;
                 let gap = ui.spacing().item_spacing.x;
-                let path_w = (ui.available_width() - btn_w - gap).max(120.0);
+                let path_w = (ui.available_width() - btn_w - browse_w - gap * 2.0).max(120.0);
                 ui.add(
                     TextEdit::singleline(&mut self.publish_path)
-                        .hint_text("󰉓  Путь к каталогу сайта…")
+                        .hint_text("󰉓  Каталог сайта…")
                         .desired_width(path_w - 4.0),
                 );
+                // Нативный выбор каталога
+                if ui.add_sized([browse_w, 26.0], Button::new("󰉕  Обзор")).clicked() {
+                    if let Some(dir) = rfd::FileDialog::new()
+                        .set_title("Каталог сайта")
+                        .pick_folder()
+                    {
+                        self.publish_path = dir.display().to_string();
+                    }
+                }
                 let enabled = self.publish_tx.is_some()
                     && !self.publish_path.trim().is_empty()
                     && !self.publish_name.trim().is_empty();

@@ -21,6 +21,9 @@ pub struct SavedProfile {
     pub name:        String,
     pub description: String,
     pub status:      String,
+    /// Аватар: PNG 64×64 в base64 (как в [`PeerProfile`]). `None` — нет.
+    #[serde(default)]
+    pub avatar_png:  Option<String>,
 }
 
 impl Default for SavedProfile {
@@ -30,6 +33,7 @@ impl Default for SavedProfile {
             name:        String::new(),
             description: String::new(),
             status:      "online".into(),
+            avatar_png:  None,
         }
     }
 }

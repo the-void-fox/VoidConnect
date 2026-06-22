@@ -83,9 +83,13 @@ impl VoidApp {
         profile.my_ip           = backend.my_ip.clone();
         profile.base_port       = backend.base_port;
         profile.bootstrap       = backend.bootstrap;
+        profile.avatar_png      = saved.avatar_png.clone();
         profile.connect_tx      = Some(backend.connect_tx.clone());
         profile.profile_tx      = Some(backend.profile_tx.clone());
         profile.my_node_id      = Some(backend.my_id_node.clone());
+        // Рассылаем профиль (с аватаром/описанием) один раз при старте, чтобы
+        // пиры сразу получили актуальные данные, а не только после «Сохранить».
+        profile.send_profile();
 
         let mut graph = Graph::new(backend.my_name.clone(), backend.my_id_node.clone());
         graph.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
@@ -289,9 +293,12 @@ impl VoidApp {
 
         self.peer_count = unique.len();
         let peer_vec: Vec<_> = unique.iter().map(|p| (*p).clone()).collect();
+        // Свой аватар может меняться в рантайме — обновляем его во всех вкладках.
+        self.chat.my_avatar    = self.profile.avatar_png.clone();
+        self.private.my_avatar = self.profile.avatar_png.clone();
         self.chat.update_context(peer_vec.clone(), profiles.clone());
         self.private.update_context(peer_vec.clone(), profiles.clone());
-        self.graph.update_my_name(&self.profile.name);
+        self.graph.update_me(&self.profile.name, self.profile.avatar_png.as_deref());
         self.graph.update_peers(peer_vec, profiles);
     }
 
@@ -304,6 +311,29 @@ impl VoidApp {
         });
 
         ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // ── Карточка профиля: аватар + имя (клик → страница профиля) ──────────
+        let avatar = self.profile.avatar_png.clone();
+        let my_name = self.profile.name.clone();
+        let id_short = self.backend.my_id_short.clone();
+        let card = ui.horizontal(|ui| {
+            ui.add_space(pad);
+            crate::avatar::show_avatar(ui, avatar.as_deref(), &my_name, ui.visuals().hyperlink_color, 40.0);
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.add_space(3.0);
+                ui.label(egui::RichText::new(&my_name).strong());
+                ui.label(egui::RichText::new(&id_short).small().weak().monospace());
+            });
+        }).response.interact(egui::Sense::click());
+        if card.clicked() {
+            self.current_page = Page::Profile;
+        }
+        card.on_hover_text("Открыть профиль");
+
+        ui.add_space(10.0);
         ui.separator();
         ui.add_space(12.0);
 

@@ -1,4 +1,5 @@
 mod app;
+mod avatar;
 mod backend;
 mod pages;
 mod profile_store;
@@ -103,7 +104,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            // Загрузчики изображений (для аватарок из PNG-байтов).
+            egui_extras::install_image_loaders(&cc.egui_ctx);
 
+            // Шрифт FiraCode Nerd Font (содержит все иконки nf-md/nf-fa,
+            // используемые в интерфейсе).
             let mut fonts = egui::FontDefinitions::default();
             let font_bytes = include_bytes!("assets/fonts/FiraCode.ttf").to_vec();
             fonts.font_data.insert(

@@ -7,13 +7,13 @@ pub fn show_status_bar(ui: &mut egui::Ui, peer_count: usize, my_addr: &str, loca
         // Network mode badge
         if local_mode {
             ui.label(
-                egui::RichText::new("🖥 Local")
+                egui::RichText::new("󰍹 Local")
                     .small()
                     .color(egui::Color32::from_rgb(220, 160, 40)),
             );
         } else {
             ui.label(
-                egui::RichText::new("🔗 LAN")
+                egui::RichText::new("󰛳 LAN")
                     .small()
                     .color(egui::Color32::from_rgb(80, 180, 80)),
             );
@@ -22,9 +22,9 @@ pub fn show_status_bar(ui: &mut egui::Ui, peer_count: usize, my_addr: &str, loca
 
         // Peer count
         let peers_text = match peer_count {
-            0 => "👥 нет узлов".to_string(),
-            1 => "👥 1 узел".to_string(),
-            n => format!("👥 {} узлов", n),
+            0 => "󰡉 нет узлов".to_string(),
+            1 => "󰡉 1 узел".to_string(),
+            n => format!("󰡉 {} узлов", n),
         };
         let peers_color = if peer_count == 0 {
             egui::Color32::from_rgb(200, 120, 50)

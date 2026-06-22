@@ -147,6 +147,8 @@ pub enum DownloadCmd {
     Start(String),
     /// Поставить на паузу скачивание файла по его file_id.
     Pause(String),
+    /// Удалить файл из раздачи (стереть локально) по его file_id.
+    Remove(String),
 }
 
 /// Компоненты системы репутации, разделяемые между фоновыми задачами.
@@ -1038,6 +1040,16 @@ fn start_storage_tasks(
                     if let Some(flag) = flag {
                         flag.store(true, Ordering::Relaxed);
                         tracing::info!("Пауза скачивания {}", &file_id[..8.min(file_id.len())]);
+                    }
+                }
+                DownloadCmd::Remove(file_id) => {
+                    // Останавливаем активное скачивание (если идёт), затем стираем.
+                    if let Some(flag) = cancels.lock().unwrap().get(&file_id).cloned() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    match dl_mgr.delete_file(&file_id).await {
+                        Ok(()) => tracing::info!("Файл {} удалён из раздачи", &file_id[..8.min(file_id.len())]),
+                        Err(e) => tracing::warn!("Не удалось удалить файл {}: {}", &file_id[..8.min(file_id.len())], e),
                     }
                 }
                 DownloadCmd::Start(file_id) => {

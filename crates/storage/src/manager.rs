@@ -487,6 +487,24 @@ impl StorageManager {
         self.register_self_as_owner(file_id).await;
         Ok(flat.concat())
     }
+
+    /// Удаляет файл из раздачи: стирает локальные блобы чанков с диска и все
+    /// записи о файле из БД (чанки, владельцы, метаданные). После этого мы
+    /// больше не сидируем файл. Другие сидеры (если есть) на это не влияют.
+    pub async fn delete_file(&self, file_id: &str) -> Result<(), StorageError> {
+        let local_hashes = db_chunks::delete_file(&self.pool, file_id).await?;
+        for h in &local_hashes {
+            if let Err(e) = self.store.delete(h).await {
+                warn!("Не удалось удалить блоб чанка {}: {}", &h[..8.min(h.len())], e);
+            }
+        }
+        info!(
+            "Файл {} удалён из раздачи ({} локальных чанков стёрто)",
+            &file_id[..8.min(file_id.len())],
+            local_hashes.len()
+        );
+        Ok(())
+    }
 }
 
 // ─── Вспомогательные функции ─────────────────────────────────────────────────

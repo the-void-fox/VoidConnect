@@ -221,6 +221,32 @@ pub async fn remove_peer_chunks(pool: &DbPool, peer_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Полностью удаляет файл: его чанки (каскадом — и владельцев из `chunk_owners`)
+/// и метаданные из `files`. Возвращает хэши чанков, которые были локальными —
+/// чтобы вызывающий удалил блобы с диска.
+///
+/// Runtime-запросы (`sqlx::query`), а не макросы — чтобы не перегенерировать
+/// offline-кэш `.sqlx` ради двух DELETE.
+pub async fn delete_file(pool: &DbPool, file_id: &str) -> Result<Vec<String>> {
+    let local: Vec<String> = get_chunks_for_file(pool, file_id)
+        .await?
+        .into_iter()
+        .filter(|c| c.is_local)
+        .map(|c| c.hash)
+        .collect();
+
+    sqlx::query("DELETE FROM chunks WHERE file_id = ?")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM files WHERE file_id = ?")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+
+    Ok(local)
+}
+
 /// Процент скачанности файла (сколько чанков уже локально).
 pub async fn local_completion(pool: &DbPool, file_id: &str) -> Result<f64> {
     let row = sqlx::query!(

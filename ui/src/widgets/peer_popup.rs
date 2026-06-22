@@ -39,13 +39,9 @@ pub fn show_peer_profile(
 
     // Avatar + name/status row
     ui.horizontal(|ui| {
-        let initial = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or("?".into());
-        let size = 56.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
         let (fill, _) = status_colors(Some(status));
-        ui.painter().circle_filled(rect.center(), size / 2.0, fill);
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, &initial,
-            egui::FontId::proportional(26.0), egui::Color32::WHITE);
+        let avatar = profile.and_then(|p| p.avatar_png.as_deref());
+        crate::avatar::show_avatar(ui, avatar, name, fill, 56.0);
 
         ui.add_space(12.0);
         ui.vertical(|ui| {
@@ -63,7 +59,7 @@ pub fn show_peer_profile(
 
             if has_dm_key {
                 ui.label(
-                    egui::RichText::new("🔒 E2E шифрование доступно")
+                    egui::RichText::new("󰌾 E2E шифрование доступно")
                         .small()
                         .color(egui::Color32::from_rgb(80, 200, 80)),
                 );
@@ -144,7 +140,7 @@ pub fn show_peer_profile(
     ui.separator();
     ui.add_space(6.0);
 
-    let btn = egui::Button::new("💬  Начать беседу")
+    let btn = egui::Button::new("󰭹  Начать беседу")
         .min_size(egui::vec2(ui.available_width(), 32.0));
     let resp = ui.add_enabled(peer.is_some() || profile.is_some(), btn);
     let clicked = resp.clicked();

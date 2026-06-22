@@ -6,11 +6,15 @@ use void_core::peer::{PeerInfo, PeerProfile};
 use crate::widgets::peer_popup::{status_colors, show_peer_profile};
 
 pub struct Graph {
-    my_name:  String,
-    my_id:    NodeId,
-    peers:    Vec<PeerInfo>,
-    profiles: HashMap<NodeId, PeerProfile>,
-    selected: Option<NodeId>,
+    my_name:   String,
+    my_id:     NodeId,
+    my_avatar: Option<String>,
+    peers:     Vec<PeerInfo>,
+    profiles:  HashMap<NodeId, PeerProfile>,
+    /// Кэш загруженных текстур аватаров по узлам: NodeId → (хэш b64, текстура).
+    /// Инвалидируется при смене аватара (другой хэш) и чистится для отвалившихся.
+    avatar_tex: HashMap<NodeId, (u64, egui::TextureHandle)>,
+    selected:  Option<NodeId>,
     /// Сигнал в VoidApp: открыть личный чат с этим пиром
     pub pending_dm: Option<NodeId>,
     /// Снимок репутации узлов из backend (NodeId → score).
@@ -21,7 +25,11 @@ pub struct Graph {
 
 impl Graph {
     pub fn new(my_name: String, my_id: NodeId) -> Self {
-        Self { my_name, my_id, peers: Vec::new(), profiles: HashMap::new(), selected: None, pending_dm: None, reputation: None, pending_report: None }
+        Self {
+            my_name, my_id, my_avatar: None,
+            peers: Vec::new(), profiles: HashMap::new(), avatar_tex: HashMap::new(),
+            selected: None, pending_dm: None, reputation: None, pending_report: None,
+        }
     }
 
     /// Текущая репутация узла из снимка backend (если есть).
@@ -40,8 +48,45 @@ impl Graph {
         self.profiles = profiles;
     }
 
-    pub fn update_my_name(&mut self, name: &str) {
+    pub fn update_me(&mut self, name: &str, avatar: Option<&str>) {
         self.my_name = name.to_string();
+        self.my_avatar = avatar.map(str::to_owned);
+    }
+
+    /// Обновляет кэш текстур аватаров: декодирует новые/изменившиеся PNG и
+    /// выгружает текстуры узлов, у которых аватара больше нет (или сменился).
+    /// Ключ «себя» — `my_id`. Вызывается раз за кадр перед отрисовкой.
+    fn sync_avatar_textures(&mut self, ctx: &egui::Context) {
+        let mut wanted: HashMap<NodeId, u64> = HashMap::new();
+
+        // Собираем (id, b64) для пиров с аватаром + себя.
+        let mut sources: Vec<(NodeId, &str)> = self.peers.iter()
+            .filter_map(|p| {
+                self.profiles.get(&p.id)
+                    .and_then(|pr| pr.avatar_png.as_deref())
+                    .map(|b64| (p.id.clone(), b64))
+            })
+            .collect();
+        if let Some(b64) = self.my_avatar.as_deref() {
+            sources.push((self.my_id.clone(), b64));
+        }
+
+        for (id, b64) in sources {
+            let h = crate::avatar::avatar_hash(b64);
+            wanted.insert(id.clone(), h);
+            let fresh = self.avatar_tex.get(&id).map(|(ph, _)| *ph == h).unwrap_or(false);
+            if !fresh {
+                if let Some(img) = crate::avatar::color_image_from_b64(b64) {
+                    let tex = ctx.load_texture(
+                        format!("graph_avatar_{}", id.as_str()),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.avatar_tex.insert(id, (h, tex));
+                }
+            }
+        }
+        self.avatar_tex.retain(|id, _| wanted.contains_key(id));
     }
 }
 
@@ -94,6 +139,10 @@ impl Graph {
             self.pending_dm = Some(id);
         }
 
+        // Готовим/обновляем текстуры аватаров до отрисовки в painter.
+        let ctx = ui.ctx().clone();
+        self.sync_avatar_textures(&ctx);
+
         let avail  = ui.available_rect_before_wrap();
         let center = avail.center();
         let (rect, _) = ui.allocate_exact_size(avail.size(), egui::Sense::hover());
@@ -131,7 +180,18 @@ impl Graph {
             let circle_rect = egui::Rect::from_center_size(pos, egui::Vec2::splat(36.0));
             let resp = ui.allocate_rect(circle_rect, egui::Sense::click());
 
-            painter.circle_filled(pos, 18.0, fill);
+            // Аватар узла (если загружен) либо цветной кружок с первой буквой.
+            let display_name = profile.map(|p| p.name.as_str()).unwrap_or(peer.name.as_str());
+            if let Some((_, tex)) = self.avatar_tex.get(&peer.id) {
+                crate::avatar::paint_circle_avatar(&painter, tex.id(), pos, 18.0);
+            } else {
+                painter.circle_filled(pos, 18.0, fill);
+                let initial = display_name.chars().next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or("?".into());
+                painter.text(pos, egui::Align2::CENTER_CENTER, &initial,
+                    egui::FontId::proportional(15.0), egui::Color32::WHITE);
+            }
             painter.circle_stroke(pos, 18.0, egui::Stroke::new(stroke_w, stroke_col));
 
             if resp.hovered() {
@@ -141,13 +201,6 @@ impl Graph {
             if resp.clicked() {
                 self.selected = if is_selected { None } else { Some(peer.id.clone()) };
             }
-
-            let display_name = profile.map(|p| p.name.as_str()).unwrap_or(peer.name.as_str());
-            let initial = display_name.chars().next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or("?".into());
-            painter.text(pos, egui::Align2::CENTER_CENTER, &initial,
-                egui::FontId::proportional(15.0), egui::Color32::WHITE);
 
             painter.text(pos + egui::Vec2::new(0.0, 26.0), egui::Align2::CENTER_CENTER,
                 display_name, egui::FontId::proportional(11.0), egui::Color32::from_gray(200));
@@ -161,11 +214,15 @@ impl Graph {
             }
         }
 
-        painter.circle_filled(center, 24.0, egui::Color32::from_rgb(40, 90, 200));
+        if let Some((_, tex)) = self.avatar_tex.get(&self.my_id) {
+            crate::avatar::paint_circle_avatar(&painter, tex.id(), center, 24.0);
+        } else {
+            painter.circle_filled(center, 24.0, egui::Color32::from_rgb(40, 90, 200));
+            painter.text(center, egui::Align2::CENTER_CENTER,
+                self.my_name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or("?".into()),
+                egui::FontId::proportional(18.0), egui::Color32::WHITE);
+        }
         painter.circle_stroke(center, 24.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 140, 255)));
-        painter.text(center, egui::Align2::CENTER_CENTER,
-            self.my_name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or("?".into()),
-            egui::FontId::proportional(18.0), egui::Color32::WHITE);
         painter.text(center + egui::Vec2::new(0.0, 32.0), egui::Align2::CENTER_CENTER,
             &format!("{} (я)", self.my_name),
             egui::FontId::proportional(11.0), egui::Color32::from_gray(200));

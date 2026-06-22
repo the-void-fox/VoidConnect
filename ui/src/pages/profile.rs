@@ -18,6 +18,8 @@ pub struct ProfilePage {
     pub base_port:       u16,
     /// Запущены ли мы в публичном (bootstrap) режиме.
     pub bootstrap:       bool,
+    /// Аватар (PNG 64×64 в base64), если задан.
+    pub avatar_png:      Option<String>,
     connect_input:       String,
     connect_error:       Option<String>,
     connect_ok:          bool,
@@ -46,6 +48,7 @@ impl Default for ProfilePage {
             my_ip:           "?".to_string(),
             base_port:       7700,
             bootstrap:         false,
+            avatar_png:        None,
             my_node_id:        None,
             connect_input:     String::new(),
             connect_error:     None,
@@ -90,16 +93,32 @@ impl ProfilePage {
 
         // ── Аватар + основная инфо ──────────────────────────────────────────
         ui.horizontal(|ui| {
-            let initials = self.name.chars().next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "?".into());
-            let size = 72.0;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), size / 2.0, ui.visuals().hyperlink_color);
-            ui.painter().text(
-                rect.center(), egui::Align2::CENTER_CENTER, &initials,
-                egui::FontId::proportional(32.0), egui::Color32::WHITE,
-            );
+            ui.vertical(|ui| {
+                let fill = ui.visuals().hyperlink_color;
+                crate::avatar::show_avatar(ui, self.avatar_png.as_deref(), &self.name, fill, 72.0);
+                ui.add_space(4.0);
+                if ui.add_sized([72.0, 22.0],
+                    egui::Button::new(egui::RichText::new("󰏫 Сменить").size(11.0))).clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+                        .set_title("Выбор аватара")
+                        .pick_file()
+                    {
+                        if let Some(b64) = crate::avatar::process_image_file(&path) {
+                            self.avatar_png = Some(b64);
+                            self.send_profile();
+                        }
+                    }
+                }
+                if self.avatar_png.is_some()
+                    && ui.add_sized([72.0, 18.0],
+                        egui::Button::new(egui::RichText::new("Убрать").size(10.0))).clicked()
+                {
+                    self.avatar_png = None;
+                    self.send_profile();
+                }
+            });
 
             ui.add_space(16.0);
             ui.vertical(|ui| {
@@ -165,7 +184,7 @@ impl ProfilePage {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("💾 Сохранить и поделиться").clicked() {
+            if ui.button("󰆓 Сохранить и поделиться").clicked() {
                 self.send_profile();
             }
             ui.label(
@@ -204,7 +223,7 @@ impl ProfilePage {
         ui.label(egui::RichText::new("Статистика").strong());
         ui.add_space(8.0);
         egui::Grid::new("stats_grid").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
-            ui.label("⏱ Аптайм:");
+            ui.label("󰔛 Аптайм:");
             ui.label(format!("{} ч", self.uptime_hours));
             ui.end_row();
             ui.label("⬆ Отдано:");
@@ -232,7 +251,7 @@ impl ProfilePage {
                     .monospace()
                     .color(ui.visuals().hyperlink_color),
             );
-            if ui.small_button("📋 Копировать").clicked() {
+            if ui.small_button("󰆏 Копировать").clicked() {
                 ui.output_mut(|o| o.copied_text = my_addr);
             }
         });
@@ -276,7 +295,7 @@ impl ProfilePage {
             }
 
             let can_test = !self.connect_input.trim().is_empty() && !self.tcp_test_running;
-            if ui.add_enabled(can_test, egui::Button::new("🔍 Тест TCP")).clicked() {
+            if ui.add_enabled(can_test, egui::Button::new("󰍉 Тест TCP")).clicked() {
                 self.start_tcp_test();
             }
         });
@@ -285,7 +304,7 @@ impl ProfilePage {
         if let Some(err) = &self.connect_error {
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(format!("⚠  {}", err))
+                egui::RichText::new(format!("󰀦  {}", err))
                     .color(egui::Color32::from_rgb(220, 80, 60))
                     .small(),
             );
@@ -302,7 +321,7 @@ impl ProfilePage {
         // Результат TCP-теста
         if self.tcp_test_running {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("⏳ Проверяем TCP соединение...").small());
+            ui.label(egui::RichText::new("󰔛 Проверяем TCP соединение...").small());
         }
         if let Some(ref result) = self.tcp_test_result {
             ui.add_space(4.0);
@@ -316,7 +335,7 @@ impl ProfilePage {
                 }
                 Err(msg) => {
                     ui.label(
-                        egui::RichText::new(format!("✗  {}", msg))
+                        egui::RichText::new(format!("󰅖  {}", msg))
                             .color(egui::Color32::from_rgb(220, 80, 60))
                             .small(),
                     );
@@ -368,7 +387,7 @@ impl ProfilePage {
         }
     }
 
-    fn send_profile(&mut self) {
+    pub fn send_profile(&mut self) {
         let Some(tx) = &self.profile_tx else { return };
         let Some(id) = &self.my_node_id else { return };
 
@@ -384,6 +403,7 @@ impl ProfilePage {
             status:       self.status.clone(),
             enc_pubkey:   None,  // backend добавит enc_pubkey перед рассылкой
             is_bootstrap: false, // backend проставит флаг перед рассылкой
+            avatar_png:   self.avatar_png.clone(),
         };
         let _ = tx.send(profile);
         self.last_sent_profile = Some((self.name.clone(), self.description.clone(), self.status.clone()));
@@ -394,6 +414,7 @@ impl ProfilePage {
             name:        self.name.clone(),
             description: self.description.clone(),
             status:      self.status.clone(),
+            avatar_png:  self.avatar_png.clone(),
         });
     }
 

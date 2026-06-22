@@ -65,6 +65,8 @@ pub struct StoragePage {
     pub downloading: HashSet<String>,
     /// Папка скачанных файлов (для действия «Открыть»).
     pub downloads_dir: Option<PathBuf>,
+    /// Индекс файла, ожидающего подтверждения удаления (показывается диалог).
+    pending_delete: Option<usize>,
 }
 
 impl Default for StoragePage {
@@ -79,6 +81,7 @@ impl Default for StoragePage {
             publish_path: String::new(),
             downloading: HashSet::new(),
             downloads_dir: None,
+            pending_delete: None,
         }
     }
 }
@@ -188,6 +191,19 @@ impl StoragePage {
         let _ = std::process::Command::new("xdg-open").arg(path).spawn();
     }
 
+    /// Удаляет файл из раздачи: просит backend стереть его и сразу убирает из
+    /// списка (снимок backend подтвердит на следующем тике).
+    fn remove_file(&mut self, idx: usize) {
+        let Some(file) = self.files.get(idx) else { return };
+        let file_id = file.file_id.clone();
+        if file_id.is_empty() { return; }
+        if let Some(tx) = &self.download_tx {
+            let _ = tx.send(DownloadCmd::Remove(file_id.clone()));
+        }
+        self.downloading.remove(&file_id);
+        self.files.retain(|f| f.file_id != file_id);
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) {
         // Подтягиваем актуальный список файлов из backend.
         self.sync_from_backend();
@@ -199,54 +215,42 @@ impl StoragePage {
         ui.separator();
         ui.add_space(8.0);
 
-        // === Панель инструментов ===
-        ui.horizontal(|ui| {
-            let toolbar_h = 28.0;
-            let btn_w = 110.0;
-            let gap = ui.spacing().item_spacing.x;
-            let search_w = ui.available_width() - (btn_w + gap) * 2.0 - gap;
-
-            ui.allocate_ui(egui::vec2(search_w, toolbar_h), |ui| {
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            TextEdit::singleline(&mut self.search)
-                                .hint_text("󰍉  Поиск файлов...")
-                                .desired_width(search_w - 4.0),
-                        );
-                    },
-                );
-            });
-
-            if ui.add_sized([btn_w, toolbar_h], Button::new("Добавить")).clicked() {
-                // TODO
-            }
-
-            if ui.add_sized([btn_w, toolbar_h], Button::new("Моя раздача")).clicked() {
-                // TODO
-            }
-        });
+        // === Поиск ===
+        ui.add(
+            TextEdit::singleline(&mut self.search)
+                .hint_text("󰍉  Поиск файлов...")
+                .desired_width(f32::INFINITY),
+        );
 
         ui.add_space(6.0);
 
         // === Публикация файла ===
         let mut do_publish = false;
         ui.horizontal(|ui| {
-            let btn_w = 130.0;
+            let pub_w = 130.0;
+            let browse_w = 96.0;
             let gap = ui.spacing().item_spacing.x;
-            let path_w = (ui.available_width() - btn_w - gap).max(120.0);
+            let path_w = (ui.available_width() - pub_w - browse_w - gap * 2.0).max(120.0);
             let resp = ui.add(
                 TextEdit::singleline(&mut self.publish_path)
-                    .hint_text("󰉓  Путь к файлу для публикации…")
+                    .hint_text("󰉓  Путь к файлу…")
                     .desired_width(path_w - 4.0),
             );
             // Enter в поле = опубликовать
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 do_publish = true;
             }
+            // Нативный выбор файла
+            if ui.add_sized([browse_w, 28.0], Button::new("󰉕  Обзор")).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Файл для публикации")
+                    .pick_file()
+                {
+                    self.publish_path = path.display().to_string();
+                }
+            }
             let enabled = self.publish_tx.is_some() && !self.publish_path.trim().is_empty();
-            if ui.add_enabled(enabled, Button::new("󰐕  Опубликовать").min_size(egui::vec2(btn_w, 28.0))).clicked() {
+            if ui.add_enabled(enabled, Button::new("󰐕  Опубликовать").min_size(egui::vec2(pub_w, 28.0))).clicked() {
                 do_publish = true;
             }
         });
@@ -313,6 +317,59 @@ impl StoragePage {
                 RowAction::Pause    => self.pause_download(idx),
                 RowAction::Open     => self.open_file(idx),
                 RowAction::Report   => self.report_target = Some(idx),
+                RowAction::Delete   => self.pending_delete = Some(idx),
+            }
+        }
+
+        // === Диалог подтверждения удаления ===
+        if let Some(idx) = self.pending_delete {
+            let Some(file) = self.files.get(idx) else {
+                self.pending_delete = None;
+                return;
+            };
+            let name = file.name.clone();
+            let is_mine = matches!(file.status, FileStatus::Seeding);
+            let mut close = false;
+            let mut confirm = false;
+            egui::Window::new("󰩺  Удалить файл")
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size([380.0, 0.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&name).strong());
+                    ui.add_space(6.0);
+                    let msg = if is_mine {
+                        "Файл будет убран из вашей раздачи, а его чанки удалены с диска. \
+                         Если других сидеров нет — файл станет недоступен в сети."
+                    } else {
+                        "Локальная копия и метаданные файла будут удалены. Файл можно будет \
+                         скачать снова, пока есть сидеры."
+                    };
+                    ui.label(RichText::new(msg).small().color(ui.visuals().weak_text_color()));
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Отмена").clicked() {
+                            close = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let del = Button::new(RichText::new("󰩺  Удалить").color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(180, 60, 50));
+                            if ui.add(del).clicked() {
+                                confirm = true;
+                            }
+                        });
+                    });
+                });
+            if confirm {
+                self.remove_file(idx);
+                close = true;
+            }
+            if close {
+                self.pending_delete = None;
             }
         }
 
@@ -451,12 +508,9 @@ impl StoragePage {
                     ui.add(Label::new(RichText::new("Действие").strong().size(12.0)).wrap(false));
                 });
             });
-            // Репорт
+            // Колонка меню действий — без подписи в шапке
             ui.allocate_ui(egui::vec2(COL_REPORT, HEADER_H), |ui| {
                 ui.set_width(COL_REPORT);
-                ui.centered_and_justified(|ui| {
-                    ui.add(Label::new(RichText::new(" ").size(12.0).color(ui.visuals().weak_text_color())).wrap(false));
-                });
             });
         });
     }
@@ -543,15 +597,22 @@ fn table_row(
                     }
                 });
             });
-            // Репорт
+            // Меню действий (кебаб): пожаловаться / удалить из раздачи
             ui.allocate_ui(egui::vec2(COL_REPORT, ROW_H), |ui| {
                 ui.set_width(COL_REPORT);
                 ui.centered_and_justified(|ui| {
-                    let resp = ui.add(Button::new(RichText::new("").size(14.0).color(ui.visuals().weak_text_color())).frame(false).wrap(false));
-                    resp.clone().on_hover_text("Пожаловаться на файл");
-                    if resp.clicked() {
-                        *action = Some((idx, RowAction::Report));
-                    }
+                    ui.menu_button(RichText::new("\u{F01D9}").size(15.0).color(ui.visuals().weak_text_color()), |ui| {
+                        if ui.button("\u{F0026}  Пожаловаться").clicked() {
+                            *action = Some((idx, RowAction::Report));
+                            ui.close_menu();
+                        }
+                        if ui.button(RichText::new("\u{F0A7A}  Удалить из раздачи")
+                            .color(egui::Color32::from_rgb(220, 90, 70))).clicked()
+                        {
+                            *action = Some((idx, RowAction::Delete));
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
         });
@@ -746,7 +807,7 @@ fn file_icon(name: &str) -> &'static str {
     }
     // macOS приложения
     if n.ends_with(".app") {
-        return "  � Yates";
+        return "  \u{f0035}";
     }
     // Шрифты
     if n.ends_with(".ttf")
@@ -757,7 +818,7 @@ fn file_icon(name: &str) -> &'static str {
     {
         return "  󰛖";
     }
-    // Сublic библиотеки
+    // Динамические библиотеки
     if n.ends_with(".dll") || n.ends_with(".so") || n.ends_with(".dylib") {
         return "  󰌲";
     }
@@ -820,4 +881,5 @@ enum RowAction {
     Pause,
     Open,
     Report,
+    Delete,
 }

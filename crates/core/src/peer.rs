@@ -54,6 +54,10 @@ pub struct PeerProfile {
     /// Самодекларация: влияет только на отображение бейджа, не на репутацию.
     #[serde(default)]
     pub is_bootstrap: bool,
+    /// Аватар: маленький PNG (64×64), закодированный в base64. `None` — нет.
+    /// Рассылается с профилем, поэтому держим компактным (лимит на стороне UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_png: Option<String>,
 }
 
 impl PeerProfile {
@@ -64,6 +68,7 @@ impl PeerProfile {
             status: "online".into(),
             enc_pubkey: None,
             is_bootstrap: false,
+            avatar_png: None,
         }
     }
 }

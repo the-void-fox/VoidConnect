@@ -8,6 +8,7 @@ use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
 use void_chat::private_chat::{DmSendCmd, IncomingDm};
 use void_crypto::keys::EncryptionKeypair;
+use crate::widgets::peer_popup::status_colors;
 
 // ── Модели ────────────────────────────────────────────────────────────────────
 
@@ -41,6 +42,8 @@ pub struct PrivatePage {
     pub my_enc_pub: [u8; 32],
     pub my_node_id: Option<NodeId>,
     pub my_name:    String,
+    /// Свой аватар (base64-PNG) — для строк собственных сообщений.
+    pub my_avatar:  Option<String>,
     pub base_port:  u16,
 
     // Актуальные данные о пирах (обновляется каждый кадр из app.rs)
@@ -59,6 +62,7 @@ impl Default for PrivatePage {
             my_enc_pub:    [0u8; 32],
             my_node_id:    None,
             my_name:       "Вы".into(),
+            my_avatar:     None,
             base_port:     7700,
             peers:         Vec::new(),
             peer_profiles: HashMap::new(),
@@ -246,6 +250,11 @@ impl PrivatePage {
                     let peer_name    = self.conversations[i].peer_name.clone();
                     let last_msg     = self.conversations[i].last_message.clone();
                     let unread       = self.conversations[i].unread;
+                    let peer_id      = self.conversations[i].peer_id.clone();
+                    let avatar_b64   = self.peer_profiles.get(&peer_id)
+                        .and_then(|p| p.avatar_png.clone());
+                    let status       = self.peer_profiles.get(&peer_id)
+                        .map(|p| p.status.clone());
 
                     let frame_fill = if is_selected {
                         ui.visuals().widgets.active.bg_fill
@@ -260,15 +269,9 @@ impl PrivatePage {
                     let resp = frame.show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            // Аватар (первая буква)
-                            let initial = peer_name.chars().next()
-                                .map(|c| c.to_uppercase().to_string())
-                                .unwrap_or_else(|| "?".into());
-                            let sz = egui::vec2(30.0, 30.0);
-                            let (rect, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 15.0, ui.visuals().extreme_bg_color);
-                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, &initial,
-                                egui::FontId::proportional(13.0), ui.visuals().strong_text_color());
+                            // Аватар пира (или цветной кружок с буквой, как запасной).
+                            let (fill, _) = status_colors(status.as_deref());
+                            crate::avatar::show_avatar(ui, avatar_b64.as_deref(), &peer_name, fill, 30.0);
 
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
@@ -337,6 +340,9 @@ impl PrivatePage {
         let selected  = self.selected;
         let peer_name = self.conversations[selected].peer_name.clone();
         let peer_id   = self.conversations[selected].peer_id.clone();
+        let peer_avatar = self.peer_profiles.get(&peer_id).and_then(|p| p.avatar_png.clone());
+        let peer_status = self.peer_profiles.get(&peer_id).map(|p| p.status.clone());
+        let my_avatar   = self.my_avatar.clone();
 
         // Заголовок: имя + признак шифрования
         ui.horizontal(|ui| {
@@ -347,13 +353,13 @@ impl PrivatePage {
                 .is_some();
             if has_key {
                 ui.label(
-                    egui::RichText::new("🔒 E2E")
+                    egui::RichText::new("󰌾 E2E")
                         .small()
                         .color(egui::Color32::from_rgb(80, 200, 80)),
                 );
             } else {
                 ui.label(
-                    egui::RichText::new("⏳ ожидание ключа…")
+                    egui::RichText::new("󰔛 ожидание ключа…")
                         .small()
                         .color(ui.visuals().weak_text_color()),
                 );
@@ -387,7 +393,12 @@ impl PrivatePage {
                             (m.text.clone(), m.time.clone(), m.is_me)
                         };
                         let sender = if is_me { self.my_name.clone() } else { peer_name.clone() };
-                        render_message(ui, &text, &time, is_me, &sender);
+                        let (avatar, fill) = if is_me {
+                            (my_avatar.as_deref(), ui.visuals().hyperlink_color)
+                        } else {
+                            (peer_avatar.as_deref(), status_colors(peer_status.as_deref()).0)
+                        };
+                        render_message(ui, &text, &time, is_me, &sender, avatar, fill);
                         ui.add_space(8.0);
                     }
 
@@ -455,7 +466,7 @@ impl PrivatePage {
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(can_send, Button::new("📤 Отправить").min_size(egui::vec2(btn_w, 36.0))).clicked() {
+                if ui.add_enabled(can_send, Button::new("󰒊 Отправить").min_size(egui::vec2(btn_w, 36.0))).clicked() {
                     should_send = true;
                 }
             });
@@ -553,7 +564,15 @@ impl PeerInfoExt for PeerInfo {
 
 // ── Рендер пузырька ───────────────────────────────────────────────────────────
 
-fn render_message(ui: &mut egui::Ui, text: &str, time: &str, is_me: bool, sender: &str) {
+fn render_message(
+    ui: &mut egui::Ui,
+    text: &str,
+    time: &str,
+    is_me: bool,
+    sender: &str,
+    avatar: Option<&str>,
+    avatar_fill: egui::Color32,
+) {
     let bubble = Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8.0))
         .outer_margin(egui::Margin::symmetric(4.0, 2.0))
@@ -563,8 +582,12 @@ fn render_message(ui: &mut egui::Ui, text: &str, time: &str, is_me: bool, sender
             ui.visuals().extreme_bg_color
         });
 
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         if is_me { ui.add_space(40.0); }
+        if !is_me {
+            crate::avatar::show_avatar(ui, avatar, sender, avatar_fill, 28.0);
+            ui.add_space(6.0);
+        }
         ui.vertical(|ui| {
             bubble.show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -586,6 +609,10 @@ fn render_message(ui: &mut egui::Ui, text: &str, time: &str, is_me: bool, sender
                 ui.label(text);
             });
         });
+        if is_me {
+            ui.add_space(6.0);
+            crate::avatar::show_avatar(ui, avatar, sender, avatar_fill, 28.0);
+        }
         if !is_me { ui.add_space(40.0); }
     });
 }

@@ -30,3 +30,8 @@ rand               = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 hex                = { workspace = true }
+# Нативные диалоги выбора файлов (xdg-portal backend — без GTK-зависимостей сборки).
+rfd                = "0.14"
+# Декодирование/масштабирование аватарок (в PNG 64×64 для рассылки).
+image              = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64             = "0.22"
