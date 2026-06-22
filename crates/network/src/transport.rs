@@ -1,4 +1,4 @@
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -13,7 +13,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,6 @@ use crate::chunker::{split_file, assemble_file};
 use crate::error::StorageError;
 use crate::events::ChunkEvent;
 use crate::index::ChunkIndex;
-use crate::integrity::verify_chunk;
 use crate::transfer::{fetch_chunk_from_peer, run_chunk_server};
 
 /// Параллельность при скачивании (одновременно N чанков)

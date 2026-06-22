@@ -1,6 +1,12 @@
 use eframe::egui;
 
-pub fn show_status_bar(ui: &mut egui::Ui, peer_count: usize, my_addr: &str, local_mode: bool) {
+pub fn show_status_bar(
+    ui: &mut egui::Ui,
+    peer_count: usize,
+    my_addr: &str,
+    local_mode: bool,
+    reachable: Option<bool>,
+) {
     ui.horizontal(|ui| {
         ui.add_space(8.0);
 
@@ -36,6 +42,21 @@ pub fn show_status_bar(ui: &mut egui::Ui, peer_count: usize, my_addr: &str, loca
 
         // My address
         ui.label(egui::RichText::new(my_addr).small().weak());
+
+        // Предупреждение о заблокированных портах (входящие недоступны извне).
+        if reachable == Some(false) {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("\u{F0026} порты закрыты")
+                    .small()
+                    .strong()
+                    .color(egui::Color32::from_rgb(220, 150, 60)),
+            )
+            .on_hover_text(
+                "Bootstrap-узел не смог подключиться к вам: входящие соединения \
+                 блокируются (провайдер/файрвол/NAT). Подробнее — на странице «Профиль».",
+            );
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);

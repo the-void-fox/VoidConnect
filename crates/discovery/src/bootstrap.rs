@@ -12,6 +12,7 @@
 //! Bootstrap-сервис слушает на `base_port + BOOTSTRAP_PORT_OFFSET`.
 
 use std::io;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,9 @@ use crate::peer_list::PeerList;
 pub const BOOTSTRAP_PORT_OFFSET: u16 = 5;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Таймаут обратной пробы доступности (bootstrap → клиент). Короткий: успех на
+/// открытом порту мгновенен, а блокировка/CGNAT выглядит как зависший connect.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Списки пиров невелики; ограничиваем размер пакета.
 const MAX_MSG: usize = 1024 * 1024;
 /// Как часто переопрашивать bootstrap-узлы (на случай новых участников/рестарта).
@@ -44,10 +48,38 @@ enum BootstrapMsg {
     /// Сервер отдаёт известных ему пиров (включая себя).
     /// Struct-вариант, а не newtype-над-Vec: внутренне-тегированные enum'ы
     /// (`tag = "kind"`) не умеют тегировать последовательность.
-    Peers { peers: Vec<PeerInfo> },
+    ///
+    /// `reachable` — результат обратной пробы: смог ли bootstrap-узел сам
+    /// подключиться к base-порту клиента по его ВНЕШНЕМУ адресу (источник TCP).
+    /// `Some(true)` — порт открыт извне, `Some(false)` — заблокирован
+    /// (провайдер/файрвол/CGNAT), `None` — проба не делалась (стар. версия/stub).
+    Peers {
+        peers: Vec<PeerInfo>,
+        #[serde(default)]
+        reachable: Option<bool>,
+    },
     /// Неизвестный тип — игнорируется (совместимость версий).
     #[serde(other)]
     Unknown,
+}
+
+/// Доступность наших портов извне (по результату обратной пробы bootstrap-узла).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reachability {
+    /// Ещё не проверяли (нет bootstrap-узлов или первый обмен не прошёл).
+    Unknown,
+    /// Bootstrap-узел успешно подключился к нам — порты открыты извне.
+    Reachable,
+    /// Bootstrap-узел не смог подключиться — входящие соединения блокируются.
+    Blocked,
+}
+
+/// Результат одного обмена с bootstrap-узлом.
+pub struct ExchangeOutcome {
+    /// Сколько пиров узнали впервые.
+    pub learned: usize,
+    /// Доступны ли наши порты извне (если узел делал пробу).
+    pub reachable: Option<bool>,
 }
 
 /// Преобразует базовый адрес `host:base_port` в адрес bootstrap-сервиса
@@ -98,14 +130,27 @@ async fn handle_bootstrap_client(
     my_peer: PeerInfo,
     peer_list: PeerList,
 ) -> io::Result<()> {
+    // Внешний адрес клиента — это источник TCP-соединения (не LAN-IP из Hello).
+    let src_ip = stream.peer_addr().ok().map(|a| a.ip());
+
     // Шаг 1: читаем Hello и регистрируем новичка (только реальные узлы).
+    let mut probe_port: Option<u16> = None;
     if let BootstrapMsg::Hello { peer } = read_msg(&mut stream).await? {
         if peer.id.as_str().len() == REAL_ID_LEN {
             debug!("Bootstrap: registered peer {} ({})", peer.name, peer.id);
+            probe_port = Some(peer.port);
             peer_list.upsert(peer).await;
         }
     }
-    // Шаг 2: отдаём известных пиров + себя.
+
+    // Шаг 2: обратная проба — пробуем подключиться к base-порту клиента по его
+    // внешнему адресу. Так клиент узнаёт, открыты ли его порты извне.
+    let reachable = match (src_ip, probe_port) {
+        (Some(ip), Some(port)) => Some(probe_reachable(ip, port).await),
+        _ => None,
+    };
+
+    // Шаг 3: отдаём известных пиров + себя + вердикт по доступности.
     let mut peers: Vec<PeerInfo> = peer_list
         .all()
         .await
@@ -113,7 +158,16 @@ async fn handle_bootstrap_client(
         .filter(|p| p.id.as_str().len() == REAL_ID_LEN)
         .collect();
     peers.push(my_peer);
-    write_msg(&mut stream, &BootstrapMsg::Peers { peers }).await
+    write_msg(&mut stream, &BootstrapMsg::Peers { peers, reachable }).await
+}
+
+/// Пробует за короткий таймаут подключиться к `ip:port`. `true` — порт принимает
+/// входящие (открыт извне), `false` — отказ/таймаут (заблокирован/недоступен).
+async fn probe_reachable(ip: IpAddr, port: u16) -> bool {
+    matches!(
+        timeout(PROBE_TIMEOUT, TcpStream::connect((ip, port))).await,
+        Ok(Ok(_))
+    )
 }
 
 // ─── Клиент ───────────────────────────────────────────────────────────────────
@@ -125,7 +179,7 @@ pub async fn bootstrap_exchange(
     my_peer: &PeerInfo,
     peer_list: &PeerList,
     service_addr: &str,
-) -> io::Result<usize> {
+) -> io::Result<ExchangeOutcome> {
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(service_addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
@@ -133,7 +187,9 @@ pub async fn bootstrap_exchange(
     write_msg(&mut stream, &BootstrapMsg::Hello { peer: my_peer.clone() }).await?;
 
     let mut learned = 0usize;
-    if let BootstrapMsg::Peers { peers } = read_msg(&mut stream).await? {
+    let mut reachable = None;
+    if let BootstrapMsg::Peers { peers, reachable: r } = read_msg(&mut stream).await? {
+        reachable = r;
         for p in peers {
             if p.id != my_peer.id && p.id.as_str().len() == REAL_ID_LEN {
                 let known = peer_list.get(&p.id).await.is_some();
@@ -144,7 +200,7 @@ pub async fn bootstrap_exchange(
             }
         }
     }
-    Ok(learned)
+    Ok(ExchangeOutcome { learned, reachable })
 }
 
 /// Периодически опрашивает заданные bootstrap-сервисы (точные адреса
@@ -154,6 +210,7 @@ pub fn start_bootstrap_client(
     my_peer: PeerInfo,
     peer_list: PeerList,
     service_addrs: Vec<String>,
+    reach: std::sync::Arc<std::sync::Mutex<Reachability>>,
 ) {
     if service_addrs.is_empty() {
         return;
@@ -162,10 +219,28 @@ pub fn start_bootstrap_client(
         let mut interval = tokio::time::interval(REFRESH_INTERVAL);
         loop {
             interval.tick().await; // первый тик немедленный
+            // Доступность за тик: достаточно одного «дозвонились» (true побеждает).
+            let mut tick_reach: Option<bool> = None;
             for addr in &service_addrs {
                 match bootstrap_exchange(&my_peer, &peer_list, addr).await {
-                    Ok(n) => info!("Bootstrap {} → узнали {} новых пир(ов)", addr, n),
+                    Ok(out) => {
+                        info!("Bootstrap {} → узнали {} новых пир(ов)", addr, out.learned);
+                        if let Some(r) = out.reachable {
+                            tick_reach = Some(tick_reach.unwrap_or(false) || r);
+                        }
+                    }
                     Err(e) => debug!("Bootstrap {} недоступен: {}", addr, e),
+                }
+            }
+            if let Some(r) = tick_reach {
+                let verdict = if r { Reachability::Reachable } else { Reachability::Blocked };
+                *reach.lock().unwrap() = verdict;
+                match verdict {
+                    Reachability::Blocked => info!(
+                        "Проверка портов: ВХОДЯЩИЕ заблокированы (провайдер/файрвол/NAT) — \
+                         прямые подключения извне недоступны"),
+                    Reachability::Reachable => info!("Проверка портов: порты открыты извне"),
+                    Reachability::Unknown => {}
                 }
             }
         }
@@ -244,7 +319,7 @@ mod tests {
         let b = peer(2, free_port());
         let pl_b = PeerList::new();
         let svc = format!("127.0.0.1:{svc_port}");
-        let learned = bootstrap_exchange(&b, &pl_b, &svc).await.unwrap();
+        let learned = bootstrap_exchange(&b, &pl_b, &svc).await.unwrap().learned;
 
         assert_eq!(learned, 1, "B должен узнать ровно A");
         assert!(pl_b.get(&a.id).await.is_some(), "B знает A");
@@ -269,7 +344,7 @@ mod tests {
         // C знакомится позже — должен узнать и A, и B.
         let c = peer(3, free_port());
         let pl_c = PeerList::new();
-        let learned = bootstrap_exchange(&c, &pl_c, &svc).await.unwrap();
+        let learned = bootstrap_exchange(&c, &pl_c, &svc).await.unwrap().learned;
 
         assert_eq!(learned, 2, "C узнаёт A и B");
         assert!(pl_c.get(&a.id).await.is_some(), "C знает A");
@@ -288,7 +363,33 @@ mod tests {
 
         let b = peer(2, free_port());
         let pl_b = PeerList::new();
-        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc).await.unwrap(), 1);
-        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc).await.unwrap(), 0, "A уже известен");
+        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc).await.unwrap().learned, 1);
+        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc).await.unwrap().learned, 0, "A уже известен");
+    }
+
+    /// Обратная проба: если у клиента открыт base-порт (есть листенер), bootstrap
+    /// сообщает `reachable = Some(true)`; если порт закрыт — `Some(false)`.
+    #[tokio::test]
+    async fn reachability_probe_reflects_open_port() {
+        let a = peer(1, free_port());
+        let svc_port = free_port();
+        let pl_a = PeerList::new();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let svc = format!("127.0.0.1:{svc_port}");
+
+        // Клиент B с ОТКРЫТЫМ base-портом (поднимаем листенер на нём).
+        let b_base = free_port();
+        let _b_listener = tokio::net::TcpListener::bind(("127.0.0.1", b_base)).await.unwrap();
+        let mut b = peer(2, free_port());
+        b.port = b_base; // base-порт, который пробует bootstrap
+        let out = bootstrap_exchange(&b, &PeerList::new(), &svc).await.unwrap();
+        assert_eq!(out.reachable, Some(true), "открытый порт → reachable");
+
+        // Клиент C с ЗАКРЫТЫМ base-портом (никто не слушает).
+        let mut c = peer(3, free_port());
+        c.port = free_port(); // свободный, но без листенера → connection refused
+        let out_c = bootstrap_exchange(&c, &PeerList::new(), &svc).await.unwrap();
+        assert_eq!(out_c.reachable, Some(false), "закрытый порт → not reachable");
     }
 }

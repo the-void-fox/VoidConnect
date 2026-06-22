@@ -2758,16 +2758,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
-name = "mac_address"
-version = "1.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
-dependencies = [
- "nix 0.29.0",
- "winapi",
-]
-
-[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5014,7 +5004,6 @@ dependencies = [
  "gethostname 0.4.3",
  "hex",
  "hmac",
- "mac_address",
  "rand",
  "rand_core",
  "serde",

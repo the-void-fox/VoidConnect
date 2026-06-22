@@ -66,7 +66,6 @@ impl VoidApp {
         let mut chat = ChatPage::new(
             backend.chat_sender.clone(),
             backend.my_name.clone(),
-            backend.my_id_full.clone(),
         );
         chat.messages.clear();
         chat.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
@@ -152,12 +151,13 @@ impl eframe::App for VoidApp {
 
         let peer_count = self.peer_count;
         let local_mode = self.backend.local_mode;
+        let reachable  = self.profile.port_reachable;
         let my_addr    = format!("{} ({}:{})",
             self.profile.name, self.backend.my_ip, self.backend.base_port);
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(26.0)
             .show(ctx, |ui| {
-                crate::widgets::status_bar::show_status_bar(ui, peer_count, &my_addr, local_mode);
+                crate::widgets::status_bar::show_status_bar(ui, peer_count, &my_addr, local_mode, reachable);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -300,6 +300,14 @@ impl VoidApp {
         self.private.update_context(peer_vec.clone(), profiles.clone());
         self.graph.update_me(&self.profile.name, self.profile.avatar_png.as_deref());
         self.graph.update_peers(peer_vec, profiles);
+
+        // Доступность наших портов извне (по обратной пробе bootstrap-узла).
+        use void_discovery::bootstrap::Reachability;
+        self.profile.port_reachable = match *self.backend.reachability.lock().unwrap() {
+            Reachability::Reachable => Some(true),
+            Reachability::Blocked   => Some(false),
+            Reachability::Unknown   => None,
+        };
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {

@@ -7,7 +7,7 @@
 //! появление тысяч файлов в одной директории.
 
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::StorageError;
 use crate::integrity::verify_chunk;

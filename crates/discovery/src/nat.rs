@@ -10,6 +10,7 @@
 //! продолжает работать в LAN-режиме.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -19,20 +20,28 @@ use tracing::{info, warn};
 /// узел не продлит — защищает от «протухших» проброшенных портов.
 const LEASE_SECS: u32 = 3600;
 
-/// Пытается пробросить TCP-порт `port` на роутере через UPnP/IGD.
-///
-/// `local_ip` — наш LAN-адрес (внутренний клиент проброса). Возвращает внешний
-/// IP роутера при успехе, иначе `None` (нет UPnP / нет шлюза / loopback).
-pub async fn try_map_port(local_ip: IpAddr, port: u16, description: &str) -> Option<IpAddr> {
+/// Таймаут поиска UPnP-шлюза. По умолчанию igd ждёт 10с; укорачиваем — если
+/// роутера с IGD нет (или SSDP заблокирован), нет смысла ждать так долго.
+const GATEWAY_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Пробрасывает набор портов узла через UPnP. Шлюз ищется ОДИН раз и
+/// переиспользуется для всех портов. Возвращает внешний IP, если удался хотя бы
+/// один проброс (для информирования оператора о публичном адресе).
+pub async fn map_ports(local_ip: IpAddr, ports: &[u16], description: &str) -> Option<IpAddr> {
     // На loopback/неопределённом адресе проброс бессмысленен.
     if local_ip.is_loopback() || local_ip.is_unspecified() {
         return None;
     }
 
-    let gateway = match search_gateway(SearchOptions::default()).await {
+    // Ищем UPnP-шлюз ОДИН раз (а не на каждый порт) с укороченным таймаутом.
+    let opts = SearchOptions {
+        timeout: Some(GATEWAY_SEARCH_TIMEOUT),
+        ..Default::default()
+    };
+    let gateway = match search_gateway(opts).await {
         Ok(g) => g,
         Err(e) => {
-            warn!("UPnP: шлюз не найден ({}), проброс порта {} пропущен", e, port);
+            warn!("UPnP: шлюз не найден ({}) — проброс портов пропущен, узел работает без него", e);
             return None;
         }
     };
@@ -45,30 +54,26 @@ pub async fn try_map_port(local_ip: IpAddr, port: u16, description: &str) -> Opt
         }
     };
 
-    let local = SocketAddr::new(local_ip, port);
-    match gateway
-        .add_port(PortMappingProtocol::TCP, port, local, LEASE_SECS, description)
-        .await
-    {
-        Ok(()) => {
-            info!("UPnP: порт {} проброшен (внешний {}:{})", port, external_ip, port);
-            Some(external_ip)
-        }
-        Err(e) => {
-            warn!("UPnP: не удалось пробросить порт {}: {}", port, e);
-            None
+    let mut mapped = 0usize;
+    for &port in ports {
+        let local = SocketAddr::new(local_ip, port);
+        match gateway
+            .add_port(PortMappingProtocol::TCP, port, local, LEASE_SECS, description)
+            .await
+        {
+            Ok(()) => {
+                mapped += 1;
+                info!("UPnP: порт {} проброшен (внешний {}:{})", port, external_ip, port);
+            }
+            Err(e) => warn!("UPnP: не удалось пробросить порт {}: {}", port, e),
         }
     }
+
+    (mapped > 0).then_some(external_ip)
 }
 
-/// Пробрасывает набор портов узла. Возвращает внешний IP, если хотя бы один
-/// проброс удался (для информирования оператора о публичном адресе).
-pub async fn map_ports(local_ip: IpAddr, ports: &[u16], description: &str) -> Option<IpAddr> {
-    let mut external = None;
-    for &port in ports {
-        if let Some(ip) = try_map_port(local_ip, port, description).await {
-            external = Some(ip);
-        }
-    }
-    external
+/// Пробрасывает один порт через UPnP (обёртка над [`map_ports`]). Возвращает
+/// внешний IP роутера при успехе.
+pub async fn try_map_port(local_ip: IpAddr, port: u16, description: &str) -> Option<IpAddr> {
+    map_ports(local_ip, &[port], description).await
 }

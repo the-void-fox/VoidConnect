@@ -1,6 +1,7 @@
 mod app;
 mod avatar;
 mod backend;
+mod device_lock;
 mod pages;
 mod profile_store;
 mod private_store;
@@ -77,6 +78,17 @@ fn main() -> eframe::Result<()> {
     };
 
     let data_dir = profile_store::profile_dir();
+
+    // Привязка аккаунта к устройству: если папка аккаунта скопирована с другого
+    // ПК — блокируем доступ ко всем функциям (бэкенд не запускаем) и показываем
+    // экран с пояснением. machine-id стабилен, ложных блокировок не будет.
+    if let device_lock::DeviceStatus::Locked { recorded, current } =
+        device_lock::check_or_bind(&data_dir)
+    {
+        tracing::warn!("Аккаунт привязан к другому устройству — доступ заблокирован");
+        return run_locked_ui(data_dir, recorded, current);
+    }
+
     let identity = void_crypto::Identity::load_or_create(&data_dir)
         .expect("Failed to load or create crypto identity");
     let node_id = NodeId(identity.id.as_str().to_string());
@@ -106,29 +118,119 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             // Загрузчики изображений (для аватарок из PNG-байтов).
             egui_extras::install_image_loaders(&cc.egui_ctx);
-
-            // Шрифт FiraCode Nerd Font (содержит все иконки nf-md/nf-fa,
-            // используемые в интерфейсе).
-            let mut fonts = egui::FontDefinitions::default();
-            let font_bytes = include_bytes!("assets/fonts/FiraCode.ttf").to_vec();
-            fonts.font_data.insert(
-                "FiraCode".to_owned(),
-                egui::FontData::from_owned(font_bytes).into(),
-            );
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "FiraCode".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "FiraCode".to_owned());
-            cc.egui_ctx.set_fonts(fonts);
+            install_fonts(&cc.egui_ctx);
             cc.egui_ctx.set_pixels_per_point(1.5);
 
             Box::new(app::VoidApp::new(backend))
         }),
     )
+}
+
+/// Устанавливает встроенный FiraCode Nerd Font (иконки nf-md/nf-fa) как первый
+/// в обоих семействах. Общая настройка для рабочего и заблокированного окна.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let font_bytes = include_bytes!("assets/fonts/FiraCode.ttf").to_vec();
+    fonts.font_data.insert(
+        "FiraCode".to_owned(),
+        egui::FontData::from_owned(font_bytes).into(),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().insert(0, "FiraCode".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// Окно «доступ заблокирован»: бэкенд НЕ запускается (никаких сетевых/файловых
+/// функций) — только сообщение о привязке аккаунта к другому устройству.
+fn run_locked_ui(
+    data_dir: std::path::PathBuf,
+    recorded: String,
+    current: String,
+) -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([580.0, 380.0])
+            .with_min_inner_size([460.0, 300.0])
+            .with_title("Void Connect — доступ заблокирован"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Void Connect",
+        options,
+        Box::new(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            install_fonts(&cc.egui_ctx);
+            cc.egui_ctx.set_pixels_per_point(1.4);
+            Box::new(LockedApp {
+                data_dir: data_dir.display().to_string(),
+                recorded,
+                current,
+            })
+        }),
+    )
+}
+
+struct LockedApp {
+    data_dir: String,
+    recorded: String,
+    current:  String,
+}
+
+impl eframe::App for LockedApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let short = |s: &str| -> String {
+            if s.chars().count() > 16 {
+                let v: Vec<char> = s.chars().collect();
+                format!("{}…{}", v[..8].iter().collect::<String>(), v[v.len()-4..].iter().collect::<String>())
+            } else {
+                s.to_string()
+            }
+        };
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(28.0);
+                ui.label(
+                    egui::RichText::new("\u{F0026}")
+                        .size(46.0)
+                        .color(egui::Color32::from_rgb(220, 150, 60)),
+                );
+                ui.add_space(6.0);
+                ui.heading("Доступ заблокирован");
+            });
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new(
+                    "Извините, этот аккаунт принадлежит другому устройству и не может быть \
+                     перенесён. Похоже, файлы аккаунта скопированы с другого компьютера.")
+                    .size(15.0),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                "Удалите чужие файлы аккаунта из папки ниже и перезапустите программу — \
+                 будет создан новый аккаунт. Либо запустите программу на исходном устройстве.",
+            );
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Папка аккаунта:").strong());
+                ui.label(egui::RichText::new(&self.data_dir).monospace());
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "привязка: {}   |   это устройство: {}",
+                    short(&self.recorded), short(&self.current)))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space(18.0);
+            ui.vertical_centered(|ui| {
+                if ui.add_sized([140.0, 32.0], egui::Button::new("Выход")).clicked() {
+                    std::process::exit(0);
+                }
+            });
+        });
+    }
 }

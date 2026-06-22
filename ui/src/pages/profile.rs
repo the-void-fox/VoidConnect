@@ -18,6 +18,9 @@ pub struct ProfilePage {
     pub base_port:       u16,
     /// Запущены ли мы в публичном (bootstrap) режиме.
     pub bootstrap:       bool,
+    /// Доступны ли наши порты извне (по обратной пробе bootstrap-узла).
+    /// `None` — ещё не проверяли (нет bootstrap-узлов / нет ответа).
+    pub port_reachable:  Option<bool>,
     /// Аватар (PNG 64×64 в base64), если задан.
     pub avatar_png:      Option<String>,
     connect_input:       String,
@@ -48,6 +51,7 @@ impl Default for ProfilePage {
             my_ip:           "?".to_string(),
             base_port:       7700,
             bootstrap:         false,
+            port_reachable:    None,
             avatar_png:        None,
             my_node_id:        None,
             connect_input:     String::new(),
@@ -88,7 +92,46 @@ impl ProfilePage {
                     .strong()
                     .color(egui::Color32::from_rgb(150, 130, 230)),
             );
-            ui.add_space(12.0);
+            ui.add_space(6.0);
+        }
+
+        // ── Доступность портов извне (по обратной пробе bootstrap-узла) ─────────
+        match self.port_reachable {
+            Some(true) => {
+                ui.label(
+                    egui::RichText::new("󰦝  Порты доступны извне — вы принимаете прямые подключения")
+                        .color(egui::Color32::from_rgb(80, 190, 100)),
+                );
+                ui.add_space(12.0);
+            }
+            Some(false) => {
+                ui.label(
+                    egui::RichText::new("󰀦  Порты НЕдоступны извне")
+                        .strong()
+                        .color(egui::Color32::from_rgb(220, 150, 60)),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Входящие соединения блокируются (провайдер/файрвол/NAT). \
+                         Вы не сможете напрямую раздавать файлы и принимать подключения; \
+                         личные сообщения пойдут через relay. Откройте порты на роутере/файрволе \
+                         (см. подсказку ниже) или используйте узел в публичном режиме.")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                if self.bootstrap {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "\u{F0026} Режим Bootstrap-узла не будет работать, пока порты закрыты: \
+                             другие узлы не смогут к вам подключиться.")
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 120, 60)),
+                    );
+                }
+                ui.add_space(12.0);
+            }
+            None => {}
         }
 
         // ── Аватар + основная инфо ──────────────────────────────────────────

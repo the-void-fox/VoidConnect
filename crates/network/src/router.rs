@@ -1,13 +1,11 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use void_core::identity::NodeId;
 use void_core::message::NetworkMessage;
-use void_core::peer::PeerInfo;
 use void_discovery::PeerList;
 
 use crate::connection::{ConnectionEvent, ConnectionManager};

@@ -182,14 +182,10 @@ pub struct BackendHandle {
     pub local_mode:    bool,
     /// X25519 keypair для E2E шифрования (разделяется с GUI для само-шифрования)
     pub my_enc_kp:     Arc<EncryptionKeypair>,
-    /// X25519 публичный ключ (hex) — для включения в профиль
-    pub my_enc_pub_hex: String,
     /// Входящие расшифрованные личные сообщения (опрашивается GUI каждый кадр)
     pub dm_inbox:      Arc<Mutex<VecDeque<IncomingDm>>>,
     /// Канал GUI → backend: отправить DM пиру
     pub dm_sender:     tokio::sync::mpsc::UnboundedSender<DmSendCmd>,
-    /// DM-порт нашего узла = base_port + 3
-    pub dm_port:       u16,
     /// История общего чата, загруженная из БД при старте.
     /// `None` пока бэкенд не загрузил; GUI забирает её один раз (`take`).
     pub chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>,
@@ -215,6 +211,9 @@ pub struct BackendHandle {
     pub site_http_port: u16,
     /// Снимок известных имён внутреннего DNS (.void).
     pub dns_names: Arc<Mutex<Vec<DnsInfo>>>,
+    /// Доступны ли наши порты извне (по обратной пробе bootstrap-узла).
+    /// `Unknown`, пока нет bootstrap-узлов или первый обмен не завершён.
+    pub reachability: Arc<Mutex<void_discovery::bootstrap::Reachability>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -236,6 +235,8 @@ pub fn start_backend(
     let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
     let storage_files: Arc<Mutex<Vec<StorageFileInfo>>>         = Arc::new(Mutex::new(Vec::new()));
     let peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>       = Arc::new(Mutex::new(HashMap::new()));
+    let reachability: Arc<Mutex<void_discovery::bootstrap::Reachability>> =
+        Arc::new(Mutex::new(void_discovery::bootstrap::Reachability::Unknown));
 
     let (chat_tx,    chat_rx)    = tokio::sync::mpsc::unbounded_channel::<String>();
     let (connect_tx, connect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -271,7 +272,6 @@ pub fn start_backend(
 
     let my_id_full  = my_id.as_str().to_string();
     let my_id_short = format!("{}...{}", &my_id_full[..8], &my_id_full[my_id_full.len()-4..]);
-    let my_enc_pub_hex = hex::encode(enc_kp.public_bytes());
 
     let inbox_bg    = Arc::clone(&chat_inbox);
     let peers_bg    = Arc::clone(&peers);
@@ -284,6 +284,7 @@ pub fn start_backend(
     let reputation_bg = Arc::clone(&peer_reputation);
     let sites_bg      = Arc::clone(&sites);
     let dns_bg        = Arc::clone(&dns_names);
+    let reach_bg      = Arc::clone(&reachability);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -299,7 +300,7 @@ pub fn start_backend(
                 publish_rx, download_rx, storage_bg,
                 reputation_bg, report_rx,
                 publish_site_rx, sites_bg, site_http_port,
-                dns_bg,
+                dns_bg, reach_bg,
             ).await;
         });
     });
@@ -319,10 +320,8 @@ pub fn start_backend(
         base_port,
         local_mode,
         my_enc_kp:     enc_kp,
-        my_enc_pub_hex,
         dm_inbox,
         dm_sender: dm_tx,
-        dm_port,
         chat_history,
         publish_tx,
         download_tx,
@@ -335,6 +334,7 @@ pub fn start_backend(
         sites,
         site_http_port,
         dns_names,
+        reachability,
     }
 }
 
@@ -369,6 +369,7 @@ async fn backend_main(
     sites_out: Arc<Mutex<Vec<SiteInfo>>>,
     site_http_port: u16,
     dns_out: Arc<Mutex<Vec<DnsInfo>>>,
+    reachability_out: Arc<Mutex<void_discovery::bootstrap::Reachability>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -461,6 +462,7 @@ async fn backend_main(
         tracing::info!("Bootstrap-адреса: {:?}", service_addrs);
         void_discovery::bootstrap::start_bootstrap_client(
             my_peer.clone(), peer_list.clone(), service_addrs,
+            Arc::clone(&reachability_out),
         );
     }
     // Relay-адреса тех же bootstrap-узлов (host:base+6). Через них идёт fallback
@@ -477,6 +479,13 @@ async fn backend_main(
         let me = my_peer.clone();
         let pl = peer_list.clone();
         tokio::spawn(async move {
+            // 0. Relay-сервер не зависит от внешнего адреса — поднимаем сразу,
+            //    не дожидаясь UPnP/STUN (иначе он стартует с задержкой в десятки
+            //    секунд, пока идут таймауты поиска UPnP-шлюза).
+            let rport = base_port + void_discovery::relay::RELAY_PORT_OFFSET;
+            if let Err(e) = void_discovery::relay::start_relay_server(rport).await {
+                tracing::error!("Relay server failed on {}: {}", rport, e);
+            }
             // 1. UPnP: открываем TCP-порты на роутере (base/+2/+3/+4/+5/+6) + внешний IP.
             let ports = [base_port, base_port + 2, base_port + 3, base_port + 4, base_port + 5, base_port + 6];
             let upnp_ip = void_discovery::nat::map_ports(me.ip, &ports, "Void Connect").await;
@@ -508,11 +517,6 @@ async fn backend_main(
                 advertised, pl, bport,
             ).await {
                 tracing::error!("Bootstrap server failed on {}: {}", bport, e);
-            }
-            // 5. Relay-сервер: ретранслируем DM между узлами за symmetric NAT.
-            let rport = base_port + void_discovery::relay::RELAY_PORT_OFFSET;
-            if let Err(e) = void_discovery::relay::start_relay_server(rport).await {
-                tracing::error!("Relay server failed on {}: {}", rport, e);
             }
         });
     }

@@ -21,7 +21,6 @@ pub struct ChatPage {
     was_at_bottom:    bool,
     send_tx:  Option<tokio::sync::mpsc::UnboundedSender<String>>,
     my_name:  String,
-    my_id:    String,
     /// Свой аватар (base64-PNG) — для строк собственных сообщений.
     pub my_avatar: Option<String>,
     peers:    Vec<PeerInfo>,
@@ -39,7 +38,6 @@ impl ChatPage {
     pub fn new(
         send_tx: tokio::sync::mpsc::UnboundedSender<String>,
         my_name: String,
-        my_id:   String,
     ) -> Self {
         Self {
             messages:         Vec::new(),
@@ -48,7 +46,6 @@ impl ChatPage {
             was_at_bottom:    true,
             send_tx:          Some(send_tx),
             my_name,
-            my_id,
             my_avatar:        None,
             peers:            Vec::new(),
             profiles:         HashMap::new(),
@@ -81,7 +78,6 @@ impl Default for ChatPage {
             was_at_bottom:    true,
             send_tx:          None,
             my_name:          "Вы".into(),
-            my_id:            String::new(),
             my_avatar:        None,
             peers:            Vec::new(),
             profiles:         HashMap::new(),

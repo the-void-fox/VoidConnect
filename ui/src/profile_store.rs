@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use void_core::identity::NodeId;
 
 /// Переопределение корневой папки данных (identity, профиль, БД, DM-история).
 /// Если не задано — используется `~/.config/void-connect`.
@@ -79,10 +78,6 @@ pub fn save_profile(p: &SavedProfile) -> std::io::Result<()> {
     let data = serde_json::to_string_pretty(p)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     std::fs::write(path, data)
-}
-
-pub fn node_id_from_saved(p: &SavedProfile) -> NodeId {
-    NodeId(p.node_id.clone())
 }
 
 #[cfg(test)]

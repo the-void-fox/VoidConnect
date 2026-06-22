@@ -22,7 +22,7 @@
 /// - Оба файла на другом железе → ID совпадёт (это намеренно —
 ///   пользователь сам решает мигрировать аккаунт)
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs;
 
 use hmac::{Hmac, Mac};
