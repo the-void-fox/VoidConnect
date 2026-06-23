@@ -93,7 +93,7 @@ impl Graph {
 impl Graph {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.heading("  Граф сети");
+        ui.heading("\u{F1049} Граф сети");
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);

@@ -1,5 +1,4 @@
 target
-Obsidian
 dist
 
 # Локальная dev-БД для генерации sqlx offline-кэша (.sqlx коммитим, БД — нет)

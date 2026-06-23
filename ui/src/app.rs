@@ -26,12 +26,12 @@ pub enum Page {
 impl Page {
     fn icon(&self) -> &'static str {
         match self {
-            Page::Chat    => " 󰭹",
-            Page::Private => " 󰌾",
-            Page::Storage => " ",
-            Page::Sites   => " ",
-            Page::Profile => " ",
-            Page::Graph   => " ",
+            Page::Chat    => " \u{F0B79}", // nf-md-message
+            Page::Private => " \u{F033E}", // nf-md-lock
+            Page::Storage => " \u{F02CA}", // nf-md-harddisk
+            Page::Sites   => " \u{F059F}", // nf-md-web
+            Page::Profile => " \u{F0009}", // nf-md-account_circle
+            Page::Graph   => " \u{F1049}", // nf-md-graph
         }
     }
 
@@ -59,6 +59,16 @@ pub struct VoidApp {
     peer_count:       usize,
     /// Подгружена ли уже история общего чата из БД (делается один раз).
     history_loaded:   bool,
+    // ── Окна меню (настройки / о программе / документация) ────────────────
+    show_settings:    bool,
+    show_about:       bool,
+    show_docs:        bool,
+    /// Редактируемая копия настроек; применяется после перезапуска.
+    settings:         crate::settings_store::Settings,
+    /// Буфер ввода bootstrap-узлов (по одному адресу на строку).
+    settings_bootstrap_input: String,
+    /// Показать отметку «сохранено» после записи настроек.
+    settings_saved:   bool,
 }
 
 impl VoidApp {
@@ -118,6 +128,9 @@ impl VoidApp {
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
 
+        let settings = crate::settings_store::load();
+        let settings_bootstrap_input = settings.bootstrap_nodes.join("\n");
+
         Self {
             current_page: Page::Chat,
             chat,
@@ -129,6 +142,12 @@ impl VoidApp {
             backend,
             peer_count: 0,
             history_loaded: false,
+            show_settings: false,
+            show_about: false,
+            show_docs: false,
+            settings,
+            settings_bootstrap_input,
+            settings_saved: false,
         }
     }
 }
@@ -186,6 +205,8 @@ impl eframe::App for VoidApp {
                 }
             }
         });
+
+        self.show_dialogs(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -383,29 +404,29 @@ impl VoidApp {
         ui.menu_button("󰋙", |ui| {
             ui.set_min_width(220.0);
 
-            if ui.button("  Настройки").clicked() { ui.close_menu(); }
+            if ui.button(" \u{F0493} Настройки").clicked() {
+                self.show_settings = true;
+                self.settings_saved = false;
+                ui.close_menu();
+            }
             ui.separator();
             ui.label("Навигация:");
-            for (label, page) in [
-                (" 󰭹 Общий чат",         Page::Chat),
-                (" 󰌾 Личные сообщения",   Page::Private),
-                ("  Хранилище",          Page::Storage),
-                ("  Сайты",             Page::Sites),
-                ("  Граф сети",         Page::Graph),
-                ("  Профиль",           Page::Profile),
+            for page in [
+                Page::Chat, Page::Private, Page::Storage,
+                Page::Sites, Page::Graph, Page::Profile,
             ] {
-                if ui.button(label).clicked() {
+                if ui.button(format!("{} {}", page.icon(), page.label())).clicked() {
                     self.current_page = page;
                     ui.close_menu();
                 }
             }
             ui.separator();
-            if ui.button(" 󰿅 Выход").clicked() { std::process::exit(0); }
+            if ui.button(" \u{F0343} Выход").clicked() { std::process::exit(0); }
         });
 
         ui.menu_button("Справка", |ui| {
-            if ui.button("  О программе").clicked()  { ui.close_menu(); }
-            if ui.button("  Документация").clicked() { ui.close_menu(); }
+            if ui.button(" \u{F02FC} О программе").clicked()  { self.show_about = true; ui.close_menu(); }
+            if ui.button(" \u{F0BC8} Документация").clicked() { self.show_docs = true;  ui.close_menu(); }
         });
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -413,5 +434,208 @@ impl VoidApp {
             ui.label(egui::RichText::new("● Online").color(online_color));
             ui.add_space(8.0);
         });
+    }
+
+    // ── Окна из меню ──────────────────────────────────────────────────────────
+
+    fn show_dialogs(&mut self, ctx: &egui::Context) {
+        self.show_settings_window(ctx);
+        self.show_about_window(ctx);
+        self.show_docs_window(ctx);
+    }
+
+    /// Окно настроек: публичный режим, bootstrap-узлы, базовый порт.
+    /// Значения сохраняются в settings.json и применяются при следующем запуске.
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("\u{F0493}  Настройки")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Глобальная сеть").strong().size(15.0));
+                ui.add_space(8.0);
+
+                ui.checkbox(
+                    &mut self.settings.public_mode,
+                    "Публичный режим — стать точкой входа в сеть",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Поднимает bootstrap- и relay-сервер, пробрасывает порты через UPnP и \
+                         помогает другим узлам войти в сеть. Нужен «белый» IP или проброшенный порт.")
+                        .small().color(ui.visuals().weak_text_color()),
+                );
+
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Bootstrap-узлы для подключения к глобальной сети").strong());
+                ui.label(
+                    egui::RichText::new("По одному адресу host:порт на строку.")
+                        .small().color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.settings_bootstrap_input)
+                        .desired_rows(3)
+                        .hint_text("203.0.113.5:7700")
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Базовый порт:").strong());
+                    ui.add(egui::DragValue::new(&mut self.settings.base_port).clamp_range(1024..=65500));
+                    ui.label(
+                        egui::RichText::new("(чат +2, ЛС +3, сайты +4, bootstrap +5, relay +6)")
+                            .small().color(ui.visuals().weak_text_color()),
+                    );
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("\u{F0193}  Сохранить").clicked() {
+                        self.settings.bootstrap_nodes = self.settings_bootstrap_input
+                            .lines()
+                            .flat_map(|l| l.split(','))
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        self.settings_saved = crate::settings_store::save(&self.settings).is_ok();
+                    }
+                    if self.settings_saved {
+                        ui.label(
+                            egui::RichText::new("\u{F012C}  сохранено")
+                                .color(egui::Color32::from_rgb(80, 200, 80)),
+                        );
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "\u{F0709}  Изменения вступят в силу после перезапуска программы.")
+                        .small().color(egui::Color32::from_rgb(220, 180, 60)),
+                );
+                let live = if self.backend.bootstrap {
+                    "Сейчас активен: публичный режим"
+                } else {
+                    "Сейчас активен: обычный режим"
+                };
+                ui.label(egui::RichText::new(live).small().color(ui.visuals().weak_text_color()));
+            });
+        self.show_settings = open;
+    }
+
+    fn show_about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        egui::Window::new("\u{F02FC}  О программе")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("Void Connect");
+                    ui.label(
+                        egui::RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).weak(),
+                    );
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(
+                    "Децентрализованная P2P-сеть — мини-интернет внутри локальной сети. \
+                     Общий и личный чат, обмен файлами, хостинг сайтов и внутренний DNS \
+                     (.void) — без центрального сервера.",
+                );
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Технологии:").strong());
+                    ui.label("Rust · Tokio · egui · ChaCha20/X25519 · SQLite");
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("\u{F02D1}").color(egui::Color32::from_rgb(220, 90, 90)),
+                    );
+                    ui.label(
+                        egui::RichText::new("Сделано с любовью к децентрализации.")
+                            .small().color(ui.visuals().weak_text_color()),
+                    );
+                });
+            });
+        self.show_about = open;
+    }
+
+    fn show_docs_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_docs;
+        egui::Window::new("\u{F0BC8}  Документация — быстрый старт")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(470.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
+                    ui.add_space(4.0);
+
+                    ui.label(egui::RichText::new("В одной локальной сети").strong().size(14.0));
+                    ui.label(
+                        "Запустите программу на каждом ПК — узлы найдут друг друга сами \
+                         (mDNS + broadcast). Соседи появятся на странице «Граф сети».",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        egui::RichText::new("Своя сеть через интернет (Hamachi / Radmin VPN)")
+                            .strong().size(14.0),
+                    );
+                    ui.label(
+                        "1. Установите Hamachi или Radmin VPN на всех ПК.\n\
+                         2. Один создаёт сеть, остальные присоединяются по имени и паролю.\n\
+                         3. Запустите Void Connect обычно (без --local).\n\
+                         4. Если узлы не нашлись — подключитесь вручную к VPN-адресу друга \
+                            (25.x.x.x или 26.x.x.x) на странице «Профиль».",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new("Глобальная сеть").strong().size(14.0));
+                    ui.label(
+                        "Меню → Настройки: укажите bootstrap-узлы, чтобы подключиться к сети \
+                         через интернет, либо включите «Публичный режим», чтобы самому стать \
+                         точкой входа.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new("Если соединение не идёт — порты").strong().size(14.0));
+                    ui.label(
+                        egui::RichText::new(
+                            "TCP 7700 (файлы), 7702 (чат), 7703 (ЛС), 7704 (сайты)\n\
+                             UDP 7701 (обнаружение)\n\
+                             публичный узел дополнительно: TCP 7705, 7706")
+                            .monospace().small(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Подробные инструкции по файрволу — на странице «Профиль».")
+                            .small().color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Полная документация — в файле README.md и папке Obsidian/.")
+                            .small().color(ui.visuals().weak_text_color()),
+                    );
+                });
+            });
+        self.show_docs = open;
     }
 }

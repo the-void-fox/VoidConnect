@@ -210,7 +210,7 @@ impl StoragePage {
 
         // === Заголовок ===
         ui.add_space(8.0);
-        ui.heading("Хранилище");
+        ui.heading("\u{F02CA} Хранилище");
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);

@@ -76,7 +76,7 @@ impl SitesPage {
         self.sync();
 
         ui.add_space(8.0);
-        ui.heading("Сайты");
+        ui.heading("\u{F059F} Сайты");
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);

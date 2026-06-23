@@ -81,7 +81,7 @@ impl ProfilePage {
         self.maybe_send_profile();
 
         ui.add_space(8.0);
-        ui.heading("  Профиль");
+        ui.heading("\u{F0009} Профиль");
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(16.0);

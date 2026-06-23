@@ -5,6 +5,7 @@ mod device_lock;
 mod pages;
 mod profile_store;
 mod private_store;
+mod settings_store;
 mod widgets;
 
 use eframe::egui;
@@ -28,11 +29,12 @@ fn main() -> eframe::Result<()> {
 
     // --public: запуск в bootstrap-режиме (точка входа в сеть). Включает
     // bootstrap-сервер (peer-exchange) + попытку UPnP-проброса портов + бейдж.
-    let public_mode = args.iter().any(|a| a == "--public");
+    // Может быть включён и из настроек (settings.json) — см. ниже.
+    let cli_public = args.iter().any(|a| a == "--public");
 
     // --bootstrap=host:port,host:port — адреса bootstrap-узлов (base_port).
     // При старте к ним подключаемся для первого знакомства с сетью (cross-LAN).
-    let bootstrap_addrs: Vec<String> = args.iter()
+    let cli_bootstrap_addrs: Vec<String> = args.iter()
         .find_map(|a| a.strip_prefix("--bootstrap="))
         .map(|s| {
             s.split(',')
@@ -53,6 +55,18 @@ fn main() -> eframe::Result<()> {
         profile_store::set_data_dir(dir);
     }
 
+    // Сохранённые настройки (settings.json в папке данных). Их можно менять из
+    // интерфейса (меню → Настройки), чтобы не запускать программу с аргументами.
+    // CLI имеет приоритет: --public форсит публичный режим, --bootstrap=
+    // перекрывает список узлов, второй позиционный аргумент — базовый порт.
+    let settings = settings_store::load();
+    let public_mode = cli_public || settings.public_mode;
+    let bootstrap_addrs: Vec<String> = if cli_bootstrap_addrs.is_empty() {
+        settings.bootstrap_nodes.clone()
+    } else {
+        cli_bootstrap_addrs
+    };
+
     // Positional args (skip flags)
     let positional: Vec<&str> = args.iter().skip(1)
         .filter(|a| !a.starts_with('-'))
@@ -61,7 +75,7 @@ fn main() -> eframe::Result<()> {
 
     let base_port = positional.get(1)
         .and_then(|p| p.parse().ok())
-        .unwrap_or(7700u16);
+        .unwrap_or(settings.base_port);
 
     // Load (or create) persistent identity + profile from disk
     let mut saved = profile_store::load_or_create();
