@@ -5048,16 +5048,9 @@ dependencies = [
 name = "void-network"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "futures",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "void-core",
- "void-discovery",
 ]
 
 [[package]]

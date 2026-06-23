@@ -5,24 +5,9 @@ edition = "2024"
 
 [dependencies]
 void-core = { path = "../core" }
-void-discovery = { path = "../discovery" }
 
-# Async runtime
+# Async runtime (используется только RateLimiter: tokio::sync::Mutex)
 tokio = { workspace = true }
-
-# WebSocket
-tokio-tungstenite = { workspace = true }
-futures = { workspace = true }
-
-# Сериализация
-serde = { workspace = true }
-serde_json = { workspace = true }
-
-# Время
-chrono = { workspace = true }
-
-# Ошибки
-thiserror = { workspace = true }
 
 # Логирование
 tracing = { workspace = true }

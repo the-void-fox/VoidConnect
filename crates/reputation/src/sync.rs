@@ -7,17 +7,14 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use void_core::identity::NodeId;
-use void_core::message::NetworkMessage;
 use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_db::{peers as db_peers, DbPool};
-use void_network::router::{MessageKind, Router, RouterEvent};
 
 use crate::error::ReputationError;
-use crate::events::{EventProcessor, ReputationEvent};
 use crate::score::ScoreManager;
 
 // ─── Константы ───────────────────────────────────────────────────────────────
@@ -73,11 +70,10 @@ impl ReputationVote {
 
 // ─── SyncManager ──────────────────────────────────────────────────────────────
 
-/// Управляет синхронизацией репутации через Router.
+/// Управляет синхронизацией репутации между узлами (gossip через relay чата).
 pub struct SyncManager {
     pool: DbPool,
     score_manager: ScoreManager,
-    event_processor: EventProcessor,
     my_keypair: Arc<SigningKeypair>,
     my_id: NodeId,
 }
@@ -86,69 +82,15 @@ impl SyncManager {
     pub fn new(
         pool: DbPool,
         score_manager: ScoreManager,
-        event_processor: EventProcessor,
         my_keypair: Arc<SigningKeypair>,
         my_id: NodeId,
     ) -> Self {
         Self {
             pool,
             score_manager,
-            event_processor,
             my_keypair,
             my_id,
         }
-    }
-
-    // ─── Запуск фонового цикла ────────────────────────────────────────────────
-
-    /// Подписывается на Router и обрабатывает события репутации.
-    ///
-    /// Слушает:
-    /// - `MessageKind::Reputation` — входящие sync-пакеты
-    /// - `MessageKind::All` с фильтром — Connect/Disconnect для аптайма
-    pub async fn start(self: Arc<Self>, router: Arc<Router>) {
-        // Подписка на сообщения репутации
-        let mut rep_rx = router.subscribe(MessageKind::Reputation, 256).await;
-
-        // Подписка на Discovery (чтобы реагировать на Connect/Disconnect через Router events)
-        let mut discovery_rx = router.subscribe(MessageKind::Discovery, 256).await;
-
-        let manager = self.clone();
-        let router_for_rep = router.clone();
-
-        // Задача: обработка Reputation сообщений
-        tokio::spawn(async move {
-            while let Some(event) = rep_rx.recv().await {
-                if let Err(e) = manager.handle_reputation_message(event).await {
-                    warn!("Reputation sync error: {}", e);
-                }
-            }
-        });
-
-        // Задача: реагирование на подключение новых пиров (отправляем им наши данные)
-        let manager2 = self.clone();
-        tokio::spawn(async move {
-            while let Some(event) = discovery_rx.recv().await {
-                // Announce — значит новый пир подключился, отправляем ему наш sync-пакет
-                if let NetworkMessage::Announce { peer } = &event.message {
-                    let peer_id = peer.id.clone();
-                    debug!("New peer {}, sending reputation sync", peer_id);
-
-                    // Событие подключения → аптайм
-                    manager2
-                        .event_processor
-                        .process(ReputationEvent::PeerConnected {
-                            peer_id: peer_id.clone(),
-                        })
-                        .await;
-
-                    // Отправляем наш sync-пакет
-                    if let Ok(msg) = manager2.build_sync_message().await {
-                        let _ = router_for_rep.send_to(&peer_id, msg).await;
-                    }
-                }
-            }
-        });
     }
 
     // ─── Построение sync-пакета ───────────────────────────────────────────────
@@ -205,85 +147,6 @@ impl SyncManager {
             from, vote_weight, sync.entries.len()
         );
         self.apply_sync(sync, vote_weight, from).await
-    }
-
-    /// Строит подписанный NetworkMessage::ReputationSync (Router-путь).
-    async fn build_sync_message(&self) -> Result<NetworkMessage, ReputationError> {
-        let signed = self.build_signed_sync().await?;
-        Ok(NetworkMessage::ReputationSync {
-            from: self.my_id.clone(),
-            signed_payload: signed.payload,
-            signature: signed.signature,
-            signer: signed.signer,
-        })
-    }
-
-    // ─── Приём sync-пакета ────────────────────────────────────────────────────
-
-    async fn handle_reputation_message(
-        &self,
-        event: RouterEvent,
-    ) -> Result<(), ReputationError> {
-        match event.message {
-            NetworkMessage::ReputationSync {
-                from,
-                signed_payload,
-                signature,
-                signer,
-            } => {
-                // Проверяем что signer совпадает с from
-                if signer != from.as_str() {
-                    warn!("ReputationSync: signer mismatch from {}", from);
-                    return Err(ReputationError::SignerMismatch);
-                }
-
-                // Верифицируем подпись
-                let signed = SignedMessage {
-                    payload: signed_payload,
-                    signature,
-                    signer: signer.clone(),
-                };
-                signed.verify().map_err(ReputationError::from)?;
-
-                // Десериализуем payload
-                let sync: SyncPayload = serde_json::from_slice(&signed.payload)
-                    .map_err(|e| ReputationError::Deserialize(e.to_string()))?;
-
-                // Узнаём вес голоса отправителя
-                let sender_score = self.score_manager.score(&from).await;
-                let vote_weight = (sender_score / 100.0).clamp(MIN_VOTE_WEIGHT, 1.0);
-
-                debug!(
-                    "Applying reputation sync from {} (weight={:.2}, entries={})",
-                    from,
-                    vote_weight,
-                    sync.entries.len()
-                );
-
-                self.apply_sync(sync, vote_weight, &from).await?;
-                Ok(())
-            }
-
-            NetworkMessage::ReputationReport {
-                target,
-                signed_payload,
-                signature,
-                signer,
-            } => {
-                // Пересобираем SignedMessage для передачи в ReportManager
-                let signed = SignedMessage {
-                    payload: signed_payload,
-                    signature,
-                    signer,
-                };
-                // ReportManager подключается отдельно — здесь только логируем
-                info!("Reputation report received targeting {}", target);
-                let _ = (signed, target); // обрабатывается через ReportManager
-                Ok(())
-            }
-
-            _ => Ok(()),
-        }
     }
 
     // ─── Применение входящих данных ───────────────────────────────────────────
@@ -350,9 +213,7 @@ mod tests {
     use void_db::open;
     use void_crypto::keys::SigningKeypair;
 
-    use crate::events::EventProcessor;
     use crate::score::ScoreManager;
-    use void_network::rate_limit::RateLimiter;
 
     fn keypair(seed: u8) -> (Arc<SigningKeypair>, NodeId) {
         let kp = Arc::new(SigningKeypair::from_seed(&[seed; 32]).unwrap());
@@ -365,8 +226,7 @@ mod tests {
         let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
         let (kp, id) = keypair(seed);
         let score = ScoreManager::new(pool.clone());
-        let events = EventProcessor::new(score.clone(), Arc::new(RateLimiter::new()));
-        let sync = Arc::new(SyncManager::new(pool, score.clone(), events, kp, id.clone()));
+        let sync = Arc::new(SyncManager::new(pool, score.clone(), kp, id.clone()));
         (dir, score, sync, id)
     }
 

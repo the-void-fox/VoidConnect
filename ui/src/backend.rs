@@ -504,7 +504,7 @@ async fn backend_main(
         let score = ScoreManager::new(pool.clone());
         let events = EventProcessor::new(score.clone(), Arc::new(rate_limiter.clone()));
         let sync = Arc::new(SyncManager::new(
-            pool.clone(), score.clone(), events.clone(),
+            pool.clone(), score.clone(),
             sign_kp.clone(), my_peer.id.clone(),
         ));
         let reports = ReportManager::new(pool, score.clone());
