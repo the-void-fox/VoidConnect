@@ -72,18 +72,26 @@ impl DnsRegistry {
         Ok(Some(record))
     }
 
-    /// Резолвит `имя` или `имя.void` в запись.
+    /// Резолвит `имя` или `имя.void` в запись. Удалённые (надгробия) не
+    /// резолвятся — имя зарезервировано за владельцем, но не указывает на сервис.
     pub async fn resolve(&self, name: &str) -> Option<DnsRecord> {
         let key = name.trim().trim_end_matches(".void");
-        self.names.read().await.get(key).map(|e| e.record.clone())
+        self.names.read().await.get(key)
+            .map(|e| e.record.clone())
+            .filter(|r| !r.deleted)
     }
 
-    /// Все известные записи.
+    /// Все известные записи, кроме надгробий (для отображения списка имён).
     pub async fn list(&self) -> Vec<DnsRecord> {
-        self.names.read().await.values().map(|e| e.record.clone()).collect()
+        self.names.read().await.values()
+            .map(|e| e.record.clone())
+            .filter(|r| !r.deleted)
+            .collect()
     }
 
     /// Подписанные записи, принадлежащие `owner` — для перерассылки новым пирам.
+    /// Включает надгробия: их тоже распространяем, чтобы офлайн-узлы узнали об
+    /// удалении имени.
     pub async fn mine(&self, owner: &NodeId) -> Vec<SignedMessage> {
         self.names
             .read()
@@ -108,6 +116,10 @@ mod tests {
     }
 
     fn signed_record(kp: &SigningKeypair, owner: NodeId, name: &str, created_at: i64) -> SignedMessage {
+        signed_record_del(kp, owner, name, created_at, false)
+    }
+
+    fn signed_record_del(kp: &SigningKeypair, owner: NodeId, name: &str, created_at: i64, deleted: bool) -> SignedMessage {
         let rec = DnsRecord {
             name: name.into(),
             kind: DnsKind::Site,
@@ -115,6 +127,7 @@ mod tests {
             ip: None,
             port: Some(8080),
             created_at,
+            deleted,
         };
         SignedMessage::sign(rec.to_bytes(), kp).unwrap()
     }
@@ -166,6 +179,34 @@ mod tests {
         let rejected = reg.apply_signed(&signed_record(&kp2, id2, "blog", 200)).await.unwrap();
         assert!(rejected.is_none());
         assert_eq!(reg.resolve("blog").await.unwrap().node_id, id1);
+    }
+
+    #[tokio::test]
+    async fn revocation_hides_name_but_keeps_reservation() {
+        let (kp, id) = keypair(1);
+        let reg = DnsRegistry::new();
+
+        // Владелец заявляет имя, затем отзывает (надгробие с тем же created_at).
+        reg.apply_signed(&signed_record(&kp, id.clone(), "blog", 100)).await.unwrap();
+        assert!(reg.resolve("blog").await.is_some());
+
+        let tomb = signed_record_del(&kp, id.clone(), "blog", 100, true);
+        assert!(reg.apply_signed(&tomb).await.unwrap().is_some(), "надгробие принято (другой контент)");
+
+        // Имя больше не резолвится и пропало из списка…
+        assert!(reg.resolve("blog").await.is_none());
+        assert!(reg.list().await.is_empty());
+        // …но надгробие распространяется дальше (mine его отдаёт).
+        assert_eq!(reg.mine(&id).await.len(), 1);
+
+        // Чужой не может занять зарезервированное имя более поздней заявкой.
+        let (kp2, id2) = keypair(2);
+        assert!(reg.apply_signed(&signed_record(&kp2, id2, "blog", 200)).await.unwrap().is_none());
+        assert!(reg.resolve("blog").await.is_none());
+
+        // Владелец может переопубликовать (un-delete) тем же именем.
+        reg.apply_signed(&signed_record(&kp, id.clone(), "blog", 300)).await.unwrap();
+        assert_eq!(reg.resolve("blog").await.unwrap().node_id, id);
     }
 
     #[tokio::test]

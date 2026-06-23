@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use void_core::identity::NodeId;
 use void_core::manifest::FileManifest;
 use void_core::peer::{PeerInfo, PeerProfile};
-use void_core::site::SiteManifest;
+use void_core::site::{SiteManifest, SiteRevocation};
 use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
@@ -53,6 +53,9 @@ pub enum ChatPacket {
     FileAnnounce(FileManifest),
     /// Объявление о публикации сайта — рассылается всем (как FileAnnounce).
     SiteAnnounce(SiteManifest),
+    /// Подписанное надгробие сайта: владелец удалил сайт (payload = SiteRevocation,
+    /// signer = owner). Получатели стирают сайт и подавляют его воскрешение.
+    SiteRevoke { signed: SignedMessage },
     /// Подписанный снимок репутации от узла `from` (gossip по сети).
     ReputationSync { from: NodeId, signed: SignedMessage },
     /// Подписанная жалоба на узел (reporter = signed.signer).
@@ -161,6 +164,11 @@ struct PublicChatInner {
     sites:       Mutex<HashMap<String, SiteManifest>>,
     /// Уведомление backend о новых/обновлённых манифестах сайтов
     site_tx:     broadcast::Sender<SiteManifest>,
+    /// Надгробия удалённых сайтов (имя → (надгробие, подписанный оригинал)).
+    /// Подавляют воскрешение устаревших анонсов и распространяются новым пирам.
+    site_tombstones: Mutex<HashMap<String, (SiteRevocation, SignedMessage)>>,
+    /// Уведомление backend об удалении сайта (он стирает кэш-файлы/реестр)
+    site_revoke_tx:  broadcast::Sender<SiteRevocation>,
     /// Входящие пакеты репутации (sync/жалобы) → backend
     rep_tx:      broadcast::Sender<RepGossip>,
     /// Входящие подписанные DNS-записи → backend (он проверяет/применяет)
@@ -186,6 +194,7 @@ impl PublicChat {
         let (incoming_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (site_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
+        let (site_revoke_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (vote_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
@@ -206,6 +215,8 @@ impl PublicChat {
                 manifest_tx,
                 sites:       Mutex::new(HashMap::new()),
                 site_tx,
+                site_tombstones: Mutex::new(HashMap::new()),
+                site_revoke_tx,
                 rep_tx,
                 dns_tx,
                 vote_tx,
@@ -346,6 +357,17 @@ impl PublicChat {
     /// Возвращает `Some`, если это новый сайт или более свежая версия того же
     /// владельца (по `created_at`), иначе `None` (дедуп / отказ в перехвате).
     async fn merge_site(&self, incoming: SiteManifest) -> Option<SiteManifest> {
+        // Надгробие подавляет воскрешение: устаревший анонс того же владельца
+        // (created_at <= revoked_at) отбрасываем. Более новая публикация того же
+        // владельца проходит (re-publish после удаления).
+        {
+            let tombs = self.inner.site_tombstones.lock().await;
+            if let Some((rev, _)) = tombs.get(&incoming.name) {
+                if rev.owner == incoming.owner && incoming.created_at <= rev.revoked_at {
+                    return None;
+                }
+            }
+        }
         let mut map = self.inner.sites.lock().await;
         match map.get(&incoming.name) {
             // Тот же контент — дедуп (гасит петли форвардинга).
@@ -394,6 +416,76 @@ impl PublicChat {
         let clients = self.inner.clients.lock().await;
         for tx in clients.values() {
             let _ = tx.try_send(ChatPacket::SiteAnnounce(merged.clone()));
+        }
+    }
+
+    // ─── Удаление сайта (надгробия) ───────────────────────────────────────────
+
+    /// Подписка backend на надгробия удалённых сайтов (стереть кэш-файлы/реестр).
+    pub fn subscribe_site_revokes(&self) -> broadcast::Receiver<SiteRevocation> {
+        self.inner.site_revoke_tx.subscribe()
+    }
+
+    /// Объявляет удаление НАШЕГО сайта: записывает надгробие локально (чтобы
+    /// устаревшие анонсы не воскрешали сайт) и рассылает его сети.
+    pub async fn announce_site_revoke(&self, signed: SignedMessage) {
+        let Ok(rev) = serde_json::from_slice::<SiteRevocation>(&signed.payload) else {
+            warn!("announce_site_revoke: некорректный payload надгробия");
+            return;
+        };
+        self.apply_revoke_local(rev, signed.clone()).await;
+        let pkt = ChatPacket::SiteRevoke { signed };
+        {
+            let clients = self.inner.clients.lock().await;
+            for tx in clients.values() {
+                let _ = tx.try_send(pkt.clone());
+            }
+        }
+        let outbox = self.inner.outbox_tx.lock().await;
+        if let Some(tx) = outbox.as_ref() {
+            let _ = tx.try_send(pkt);
+        }
+    }
+
+    /// Применяет надгробие локально: запоминает его (latest-wins по revoked_at) и
+    /// убирает сайт из реестра рассылки. Не трогает файлы/backend — это делает
+    /// `handle_site_revoke` (для входящих) или backend (для своих).
+    async fn apply_revoke_local(&self, rev: SiteRevocation, signed: SignedMessage) {
+        {
+            let mut tombs = self.inner.site_tombstones.lock().await;
+            match tombs.get(&rev.name) {
+                Some((existing, _)) if existing.revoked_at >= rev.revoked_at => {}
+                _ => { tombs.insert(rev.name.clone(), (rev.clone(), signed)); }
+            }
+        }
+        // Убираем сайт из карты рассылки, только если владелец совпадает.
+        let mut sites = self.inner.sites.lock().await;
+        if sites.get(&rev.name).map(|m| m.owner == rev.owner).unwrap_or(false) {
+            sites.remove(&rev.name);
+        }
+    }
+
+    /// Обрабатывает входящее надгробие: проверяет подпись (`signer == owner`),
+    /// применяет локально, уведомляет backend и — если мы релей — форвардит
+    /// остальным клиентам (кроме отправителя).
+    async fn handle_site_revoke(&self, signed: SignedMessage) {
+        let Ok(rev) = serde_json::from_slice::<SiteRevocation>(&signed.payload) else {
+            warn!("SiteRevoke: некорректный payload надгробия");
+            return;
+        };
+        if signed.verify().is_err() || signed.signer != rev.owner.as_str() {
+            warn!("SiteRevoke '{}': подпись неверна или signer ≠ владелец", rev.name);
+            return;
+        }
+        self.apply_revoke_local(rev.clone(), signed.clone()).await;
+        let _ = self.inner.site_revoke_tx.send(rev.clone());
+
+        let excl = signed.signer.clone();
+        let clients = self.inner.clients.lock().await;
+        for (id, tx) in clients.iter() {
+            if id.as_str() != excl {
+                let _ = tx.try_send(ChatPacket::SiteRevoke { signed: signed.clone() });
+            }
         }
     }
 
@@ -671,6 +763,15 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
         }
     }
 
+    // Шаг 3.7: шлём надгробия удалённых сайтов — чтобы клиент, у которого сайт
+    // ещё «жив», узнал об удалении и не воскрешал его анонсом.
+    {
+        let tombs = chat.inner.site_tombstones.lock().await;
+        for (_, signed) in tombs.values() {
+            let _ = send_packet(&mut stream, &ChatPacket::SiteRevoke { signed: signed.clone() }).await;
+        }
+    }
+
     // Шаг 4: регистрируем клиента
     let (fwd_tx, mut fwd_rx) = mpsc::channel::<ChatPacket>(64);
     chat.inner.clients.lock().await.insert(node_id.clone(), fwd_tx.clone());
@@ -714,6 +815,10 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
                 ChatPacket::SiteAnnounce(manifest) => {
                     debug!("SiteAnnounce from client {}: {}", nid, manifest.name);
                     chat_r.handle_site_announce(manifest).await;
+                }
+                ChatPacket::SiteRevoke { signed } => {
+                    debug!("SiteRevoke from client {}", nid);
+                    chat_r.handle_site_revoke(signed).await;
                 }
                 ChatPacket::ReputationSync { from, signed } => {
                     chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
@@ -1078,6 +1183,14 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
         }
     }
 
+    // …и надгробия удалённых сайтов (релей подхватит удаление, если пропустил)
+    {
+        let tombs = chat.inner.site_tombstones.lock().await;
+        for (_, signed) in tombs.values() {
+            send_packet_wr(&mut wr, &ChatPacket::SiteRevoke { signed: signed.clone() }).await?;
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel::<ChatPacket>(64);
 
     // Таск записи (наши пакеты → ретранслятор)
@@ -1113,6 +1226,10 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
                 Ok(ChatPacket::SiteAnnounce(manifest)) => {
                     debug!("SiteAnnounce from relay: {}", manifest.name);
                     chat_r.handle_site_announce(manifest).await;
+                }
+                Ok(ChatPacket::SiteRevoke { signed }) => {
+                    debug!("SiteRevoke from relay");
+                    chat_r.handle_site_revoke(signed).await;
                 }
                 Ok(ChatPacket::ReputationSync { from, signed }) => {
                     chat_r.handle_reputation(RepGossip::Sync { from, signed }).await;
@@ -1172,6 +1289,8 @@ impl ChatHandle {
     pub async fn announce_site(&self, manifest: SiteManifest) { self.chat.announce_site(manifest).await }
     pub fn subscribe_sites(&self) -> broadcast::Receiver<SiteManifest> { self.chat.subscribe_sites() }
     pub async fn get_sites(&self) -> Vec<SiteManifest> { self.chat.get_sites().await }
+    pub async fn announce_site_revoke(&self, signed: SignedMessage) { self.chat.announce_site_revoke(signed).await }
+    pub fn subscribe_site_revokes(&self) -> broadcast::Receiver<SiteRevocation> { self.chat.subscribe_site_revokes() }
     pub fn subscribe_reputation(&self) -> broadcast::Receiver<RepGossip> { self.chat.subscribe_reputation() }
     pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
         self.chat.broadcast_reputation_sync(from, signed).await
@@ -1586,6 +1705,7 @@ mod tests {
             ip: Some("10.0.0.1".into()),
             port: Some(a_port.wrapping_sub(2)),
             created_at: 1,
+            deleted: false,
         };
         let signed = SignedMessage::sign(record.to_bytes(), &a_kp).unwrap();
 
@@ -1736,5 +1856,83 @@ mod tests {
         for _ in 0..100 {
             assert!(chat2.allow_packet(&node_id(1)).await, "без лимитера всё проходит");
         }
+    }
+
+    /// Надгробие удалённого сайта, объявленное Alice, доходит до Bob как
+    /// `SiteRevocation` с проверяемой подписью (signer == владелец).
+    #[tokio::test]
+    async fn site_revoke_propagates_to_peer() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id.clone(), a_port);
+        let b_peer = test_peer("bob", b_id.clone(), b_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone(), None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
+
+        let mut bob_revokes = bob.subscribe_site_revokes();
+
+        let rev = SiteRevocation { name: "blog".into(), owner: a_id.clone(), revoked_at: 1700 };
+        let signed = SignedMessage::sign(rev.to_bytes(), &a_kp).unwrap();
+
+        let mut delivered = false;
+        for _ in 0..40 {
+            alice.announce_site_revoke(signed.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { break; }
+                match timeout(remaining, bob_revokes.recv()).await {
+                    Ok(Ok(r)) if r.name == "blog" => {
+                        assert_eq!(r.owner, a_id);
+                        assert_eq!(r.revoked_at, 1700);
+                        delivered = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    _ => break,
+                }
+            }
+            if delivered { break; }
+        }
+        assert!(delivered, "Bob не получил надгробие сайта от Alice");
+    }
+
+    /// Надгробие подавляет воскрешение: устаревший анонс того же владельца
+    /// (`created_at <= revoked_at`) отбрасывается `merge_site`, а более новая
+    /// публикация (re-publish) проходит.
+    #[tokio::test]
+    async fn tombstone_suppresses_site_resurrection() {
+        use void_core::site::SiteManifest;
+        let (kp, id) = keypair(7);
+        let chat = PublicChat::new(test_peer("o", id.clone(), 1), PeerList::new(), 1, kp.clone(), None);
+
+        let mk = |sid: &str, created_at: i64| SiteManifest {
+            site_id: sid.into(), name: "blog".into(), owner: id.clone(),
+            entries: vec![], created_at,
+        };
+
+        // Сайт сперва известен.
+        assert!(chat.merge_site(mk("s1", 100)).await.is_some());
+
+        // Надгробие в момент 150.
+        let rev = SiteRevocation { name: "blog".into(), owner: id.clone(), revoked_at: 150 };
+        let signed = SignedMessage::sign(rev.to_bytes(), &kp).unwrap();
+        chat.apply_revoke_local(rev, signed).await;
+
+        // Устаревшие анонсы (created_at <= revoked_at) подавлены.
+        assert!(chat.merge_site(mk("s1", 100)).await.is_none(), "старый анонс не воскрешает сайт");
+        assert!(chat.merge_site(mk("s2", 150)).await.is_none(), "created_at == revoked_at тоже подавлен");
+
+        // Переопубликация позже надгробия проходит.
+        assert!(chat.merge_site(mk("s3", 200)).await.is_some(), "новая публикация владельца проходит");
     }
 }

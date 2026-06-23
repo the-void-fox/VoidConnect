@@ -18,6 +18,7 @@ use void_storage::{ChunkEvent, ChunkStore, StorageManager};
 use void_reputation::{
     EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager, SyncManager,
 };
+use void_core::site::SiteRevocation;
 use void_web::{publish_site, DnsRegistry, SiteRegistry};
 
 /// Запись о файле в хранилище — снимок для GUI.
@@ -93,6 +94,7 @@ impl DnsService {
             ip,
             port,
             created_at: chrono::Utc::now().timestamp(),
+            deleted: false,
         };
         let signed = match SignedMessage::sign(record.to_bytes(), &self.keypair) {
             Ok(s) => s,
@@ -118,6 +120,31 @@ impl DnsService {
             }
             Ok(None) => {}
             Err(e)   => tracing::debug!("DNS: запись отклонена: {}", e),
+        }
+    }
+
+    /// Отзывает наше DNS-имя (надгробие): помечает запись удалённой, сохраняя
+    /// `created_at` (имя остаётся зарезервированным за нами по «первый по
+    /// времени»), применяет локально и рассылает сети. Имя перестаёт резолвиться
+    /// и исчезает из списков, но переопубликовать его можем только мы.
+    async fn revoke(&self, name: &str) {
+        let key = name.trim_end_matches(".void");
+        // Берём текущую запись (она ещё не удалена → resolve её вернёт).
+        let Some(mut rec) = self.registry.resolve(key).await else { return };
+        if rec.node_id != self.my_id { return; } // отзываем только своё
+        rec.deleted = true;
+        let signed = match SignedMessage::sign(rec.to_bytes(), &self.keypair) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("DNS: не удалось подписать надгробие '{}': {}", key, e); return; }
+        };
+        match self.registry.apply_signed(&signed).await {
+            Ok(Some(_)) => {
+                tracing::info!("DNS-имя '{}.void' отозвано (надгробие)", key);
+                self.chat.announce_dns(signed).await;
+                self.refresh().await;
+            }
+            Ok(None) => {}
+            Err(e)   => tracing::warn!("DNS: надгробие '{}' отклонено: {}", key, e),
         }
     }
 
@@ -153,6 +180,8 @@ pub enum MirrorCmd {
     Mirror(String),
     /// Перестать кэшировать сайт: убрать из набора и стереть его файлы.
     Unmirror(String),
+    /// Удалить НАШ сайт: разослать надгробие, стереть файлы, отозвать домен.
+    Delete(String),
 }
 
 /// Команда GUI → backend для управления скачиванием файла.
@@ -685,10 +714,11 @@ async fn backend_main(
         });
     }
 
-    // Ключ подписи нужен и DNS (заявка имён), и голосованиям — клонируем до
-    // передачи в чат.
+    // Ключ подписи нужен и DNS (заявка имён), и голосованиям, и удалению сайтов
+    // (подпись надгробия) — клонируем до передачи в чат.
     let dns_kp = sign_kp.clone();
     let vote_kp = sign_kp.clone();
+    let site_kp = sign_kp.clone();
     let chat = match start_public_chat(
         my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp,
         Some(rate_limiter.clone()),
@@ -1172,7 +1202,7 @@ async fn backend_main(
                     start_site_tasks(
                         manager.clone(), my_peer.id.clone(), site_http_port,
                         chat.clone(), Arc::clone(&sites_peers), dns.clone(),
-                        publish_site_rx, sites_out, mirror_rx,
+                        site_kp, publish_site_rx, sites_out, mirror_rx,
                     );
                     start_storage_tasks(
                         manager, pool, chat.clone(), peer_list.clone(),
@@ -1200,6 +1230,7 @@ async fn backend_main(
 /// файлов чужих сайтов по запросу), публикацию каталогов как сайтов с рассылкой
 /// по сети и обнаружение чужих сайтов через relay чата. Реестр in-memory.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn start_site_tasks(
     manager:    StorageManager,
     my_id:      NodeId,
@@ -1207,6 +1238,7 @@ fn start_site_tasks(
     chat:       ChatHandle,
     peers:      Arc<Mutex<Vec<PeerInfo>>>,
     dns:        DnsService,
+    keypair:    Arc<SigningKeypair>,
     mut publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
     mut mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
@@ -1225,6 +1257,8 @@ fn start_site_tasks(
     let mirror_out   = Arc::clone(&sites_out);
     let mirror_key   = my_key.clone();
     let mirror_set   = Arc::clone(&mirrored);
+    let mirror_dns   = dns.clone();   // для отзыва домена при удалении сайта
+    let mirror_kp    = keypair;       // для подписи надгробия (больше нигде не нужен)
 
     // HTTP-сервер сайтов (peers — источник для докачки файлов сетевых сайтов).
     let srv_reg = registry.clone();
@@ -1253,6 +1287,42 @@ fn start_site_tasks(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
                     tracing::warn!("Site stream lagged by {}", k);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Реакция на удаление сайтов другими узлами: надгробие владельца → стираем
+    // кэш-копию файлов, убираем из реестра и из набора зеркал. (Свои удаления
+    // мы выполняем напрямую в задаче ниже и собственный broadcast не получаем.)
+    let rev_reg    = registry.clone();
+    let rev_mgr    = manager.clone();
+    let rev_out    = Arc::clone(&sites_out);
+    let rev_mirror = Arc::clone(&mirrored);
+    let rev_key    = my_key.clone();
+    let mut revoke_rx = chat.subscribe_site_revokes();
+    tokio::spawn(async move {
+        loop {
+            match revoke_rx.recv().await {
+                Ok(rev) => {
+                    if let Some(manifest) = rev_reg.get(&rev.name).await {
+                        if manifest.owner == rev.owner {
+                            for entry in &manifest.entries {
+                                let _ = rev_mgr.delete_file(&entry.file_id).await;
+                            }
+                            rev_reg.remove(&rev.name).await;
+                            tracing::info!("Сайт '{}' удалён владельцем — стёрта кэш-копия", rev.name);
+                        }
+                    }
+                    {
+                        let mut set = rev_mirror.lock().unwrap();
+                        if set.remove(&rev.name) { save_mirrored_sites(&set); }
+                    }
+                    refresh_sites(&rev_reg, &rev_key, http_port, &rev_mirror, &rev_out).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
+                    tracing::warn!("Site-revoke stream lagged by {}", k);
                 }
                 Err(_) => break,
             }
@@ -1322,6 +1392,40 @@ fn start_site_tasks(
                                 }
                             }
                             tracing::info!("Сайт '{}' убран из кэша", name);
+                        }
+                        MirrorCmd::Delete(name) => {
+                            // Удаляем ТОЛЬКО свой сайт (UI предлагает кнопку лишь владельцу).
+                            match mirror_reg.get(&name).await {
+                                Some(manifest) if manifest.owner.as_str() == mirror_key.as_str() => {
+                                    // 1. Подписываем и рассылаем надгробие (ставит и локальный
+                                    //    tombstone в чате — старые анонсы не воскресят сайт).
+                                    let rev = SiteRevocation {
+                                        name: name.clone(),
+                                        owner: manifest.owner.clone(),
+                                        revoked_at: chrono::Utc::now().timestamp(),
+                                    };
+                                    match SignedMessage::sign(rev.to_bytes(), &mirror_kp) {
+                                        Ok(signed) => mirror_chat.announce_site_revoke(signed).await,
+                                        Err(e) => tracing::warn!("Подпись надгробия '{}' не удалась: {}", name, e),
+                                    }
+                                    // 2. Убираем из локального реестра рассылки.
+                                    mirror_reg.remove(&name).await;
+                                    // 3. Стираем файлы сайта из хранилища.
+                                    for entry in &manifest.entries {
+                                        let _ = mirror_mgr.delete_file(&entry.file_id).await;
+                                    }
+                                    // 4. На всякий случай убираем из набора зеркал.
+                                    {
+                                        let mut set = mirror_set.lock().unwrap();
+                                        if set.remove(&name) { save_mirrored_sites(&set); }
+                                    }
+                                    // 5. Отзываем DNS-домен (.void).
+                                    mirror_dns.revoke(&name).await;
+                                    tracing::info!("Сайт '{}' удалён: домен отозван, файлы стёрты", name);
+                                }
+                                Some(_) => tracing::warn!("Отказано в удалении '{}': сайт не наш", name),
+                                None     => tracing::warn!("Удаление '{}': сайт не найден", name),
+                            }
                         }
                     }
                     refresh_sites(&mirror_reg, &mirror_key, http_port, &mirror_set, &mirror_out).await;

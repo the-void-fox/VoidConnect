@@ -38,6 +38,11 @@ pub struct DnsRecord {
     pub port: Option<u16>,
     /// Unix-таймстемп регистрации — для разрешения конфликтов имён.
     pub created_at: i64,
+    /// Надгробие: владелец отозвал имя (удалил сайт). Запись держит имя за собой
+    /// (антисквоттинг по `created_at`), но не резолвится и скрыта из списков.
+    /// `#[serde(default)]` — совместимость со старыми записями без поля.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl DnsRecord {
@@ -105,6 +110,7 @@ mod tests {
             ip: Some("192.168.0.5".into()),
             port: Some(7700),
             created_at,
+            deleted: false,
         }
     }
 

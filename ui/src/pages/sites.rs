@@ -23,6 +23,8 @@ pub struct SitesPage {
     publish_name:  String,
     snapshot:      Vec<SiteInfo>,
     dns_snapshot:  Vec<DnsInfo>,
+    /// Имя сайта, ожидающего подтверждения удаления (модальное окно).
+    confirm_delete: Option<String>,
 }
 
 impl Default for SitesPage {
@@ -38,6 +40,7 @@ impl Default for SitesPage {
             publish_name:   String::new(),
             snapshot:       Vec::new(),
             dns_snapshot:   Vec::new(),
+            confirm_delete: None,
         }
     }
 }
@@ -144,6 +147,7 @@ impl SitesPage {
         let search = self.search.to_lowercase();
         let mut open_url: Option<String> = None;
         let mut mirror_action: Option<MirrorCmd> = None;
+        let mut request_delete: Option<String> = None;
 
         ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             if self.snapshot.is_empty() {
@@ -191,6 +195,21 @@ impl SitesPage {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(Button::new("󰖟  Открыть")).clicked() {
                                 open_url = Some(site.url.clone());
+                            }
+                            // Удаление — только для своего сайта (отзыв домена + стирание файлов).
+                            if site.is_mine
+                                && ui
+                                    .add(Button::new(
+                                        RichText::new("\u{F05E8}  Удалить")
+                                            .color(egui::Color32::from_rgb(220, 80, 60)),
+                                    ))
+                                    .on_hover_text(
+                                        "Удалить сайт: освободить домен .void и стереть файлы. \
+                                         Зеркала тоже удалят копию. Действие необратимо.",
+                                    )
+                                    .clicked()
+                            {
+                                request_delete = Some(site.name.clone());
                             }
                             // Кэширование (зеркалирование) — только для чужих сайтов;
                             // свои мы и так раздаём.
@@ -275,6 +294,57 @@ impl SitesPage {
         if let Some(cmd) = mirror_action {
             if let Some(tx) = &self.mirror_tx {
                 let _ = tx.send(cmd);
+            }
+        }
+        if let Some(name) = request_delete {
+            self.confirm_delete = Some(name);
+        }
+
+        // ── Подтверждение удаления своего сайта ─────────────────────────────
+        if let Some(name) = self.confirm_delete.clone() {
+            let mut do_delete = false;
+            let mut close = false;
+            egui::Window::new("Удалить сайт?")
+                .id(egui::Id::new("confirm_delete_site"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new(format!("«{name}.void»")).strong().size(15.0));
+                    ui.add_space(6.0);
+                    ui.label("Домен .void будет освобождён, а файлы сайта — стёрты.");
+                    ui.label(
+                        RichText::new(
+                            "Узлы, закэшировавшие сайт (зеркала), тоже удалят копию. \
+                             Действие необратимо.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(Button::new(
+                                RichText::new("\u{F0A7A}  Удалить")
+                                    .color(egui::Color32::from_rgb(230, 90, 70)),
+                            ))
+                            .clicked()
+                        {
+                            do_delete = true;
+                        }
+                        if ui.button("Отмена").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if do_delete {
+                if let Some(tx) = &self.mirror_tx {
+                    let _ = tx.send(MirrorCmd::Delete(name));
+                }
+                close = true;
+            }
+            if close {
+                self.confirm_delete = None;
             }
         }
     }

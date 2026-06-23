@@ -35,6 +35,31 @@ pub struct SiteManifest {
     pub created_at: i64,
 }
 
+/// Подписанное «надгробие» сайта: владелец отзывает публикацию.
+///
+/// Рассылается по сети как [`SiteManifest`] (через relay чата), но подписывается
+/// ключом владельца (`signer == owner`). Получив надгробие, узлы удаляют сайт из
+/// реестра, стирают кэшированные файлы и больше не принимают анонсы того же
+/// сайта с `created_at <= revoked_at` (подавление «воскрешения»). Имя остаётся
+/// зарезервированным за владельцем (DNS-запись помечается удалённой, но держит
+/// имя по принципу «первый зарегистрировал»).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteRevocation {
+    /// Имя сайта без зоны (`blog`).
+    pub name: String,
+    /// Владелец — должен совпадать с подписантом (`signer`).
+    pub owner: NodeId,
+    /// Момент удаления (unix). Подавляет анонсы с `created_at <= revoked_at`.
+    pub revoked_at: i64,
+}
+
+impl SiteRevocation {
+    /// Канонические байты для подписи/проверки (детерминированный JSON).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("SiteRevocation serialization failed")
+    }
+}
+
 impl SiteManifest {
     /// Полное DNS-имя сайта в зоне `.void`.
     pub fn dns_name(&self) -> String {
@@ -91,5 +116,16 @@ mod tests {
         let m = manifest();
         let back: SiteManifest = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn revocation_roundtrip() {
+        let rev = SiteRevocation {
+            name: "blog".into(),
+            owner: NodeId::from_public_key_bytes(&[3u8; 32]),
+            revoked_at: 1700,
+        };
+        let back: SiteRevocation = serde_json::from_slice(&rev.to_bytes()).unwrap();
+        assert_eq!(back, rev);
     }
 }
