@@ -319,6 +319,37 @@ pub async fn add_report(
     Ok(id)
 }
 
+/// Одна жалоба на узел (для отображения списка в UI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportRow {
+    pub reporter_key: String,
+    pub reason: String,
+    /// Время получения жалобы этим узлом (ISO-8601).
+    pub created_at: String,
+}
+
+/// Все жалобы на узел, новые сверху. Рантайм-запрос (без `query!`-макроса,
+/// чтобы не перегенерировать `.sqlx`-кэш). Показывает лишь жалобы, дошедшие до
+/// ЭТОГО узла по gossip.
+pub async fn list_reports(pool: &DbPool, target_key: &str) -> Result<Vec<ReportRow>> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT reporter_key, reason, created_at
+         FROM reputation_reports WHERE target_key = ? ORDER BY created_at DESC",
+    )
+    .bind(target_key)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ReportRow {
+            reporter_key: r.get::<String, _>("reporter_key"),
+            reason: r.get::<String, _>("reason"),
+            created_at: r.get::<String, _>("created_at"),
+        })
+        .collect())
+}
+
 /// Считает количество уникальных жалоб на узел.
 pub async fn count_reports(pool: &DbPool, target_key: &str) -> Result<i64> {
     let row = sqlx::query!(

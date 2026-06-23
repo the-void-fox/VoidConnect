@@ -1,5 +1,6 @@
 use eframe::egui;
 use void_core::peer::{PeerInfo, PeerProfile};
+use void_db::peers::ReportRow;
 use void_reputation::ReportReason;
 
 /// Действие, выбранное пользователем в попапе профиля узла.
@@ -28,6 +29,8 @@ pub fn show_peer_profile(
     peer:       Option<&PeerInfo>,
     profile:    Option<&PeerProfile>,
     reputation: Option<f64>,
+    reports:    &[ReportRow],
+    banned:     bool,
 ) -> PeerPopupAction {
     let name        = profile.map(|p| p.name.as_str())
         .or_else(|| peer.map(|p| p.name.as_str()))
@@ -70,6 +73,14 @@ pub fn show_peer_profile(
                         .small()
                         .strong()
                         .color(egui::Color32::from_rgb(150, 130, 230)),
+                );
+            }
+            if banned {
+                ui.label(
+                    egui::RichText::new("󰂭  Забанен голосованием")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(220, 80, 60)),
                 );
             }
         });
@@ -134,6 +145,41 @@ pub fn show_peer_profile(
         ui.add_space(2.0);
         ui.label(description);
     }
+
+    // Жалобы на узел (дошедшие до нас по gossip). Сворачиваемый список.
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    let reports_header = if reports.is_empty() {
+        "󰀦  Жалобы: нет".to_string()
+    } else {
+        format!("󰀦  Жалобы: {}", reports.len())
+    };
+    egui::CollapsingHeader::new(reports_header)
+        .enabled(!reports.is_empty())
+        .id_source("peer_reports")
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Показаны только жалобы, дошедшие до вашего узла.")
+                    .small()
+                    .italics()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space(2.0);
+            for r in reports {
+                let reason = match r.reason.as_str() {
+                    "spam" => "спам",
+                    "malicious_content" => "вредоносный контент",
+                    "bad_chunks" => "битые файлы",
+                    other => other,
+                };
+                let who = &r.reporter_key[..8.min(r.reporter_key.len())];
+                let when = r.created_at.get(..10).unwrap_or(&r.created_at);
+                ui.label(
+                    egui::RichText::new(format!("• {} — {} ({}…)", when, reason, who)).small(),
+                );
+            }
+        });
 
     // Кнопка "Начать беседу"
     ui.add_space(10.0);

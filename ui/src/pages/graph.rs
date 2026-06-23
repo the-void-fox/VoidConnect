@@ -19,6 +19,10 @@ pub struct Graph {
     pub pending_dm: Option<NodeId>,
     /// Снимок репутации узлов из backend (NodeId → score).
     pub reputation: Option<Arc<Mutex<HashMap<NodeId, f64>>>>,
+    /// Снимок жалоб на узлы из backend.
+    pub reports: Option<Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>>,
+    /// Снимок блок-листа (забаненные голосованием).
+    pub blocklist: Option<Arc<Mutex<HashMap<NodeId, i64>>>>,
     /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
     pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
 }
@@ -28,7 +32,8 @@ impl Graph {
         Self {
             my_name, my_id, my_avatar: None,
             peers: Vec::new(), profiles: HashMap::new(), avatar_tex: HashMap::new(),
-            selected: None, pending_dm: None, reputation: None, pending_report: None,
+            selected: None, pending_dm: None, reputation: None,
+            reports: None, blocklist: None, pending_report: None,
         }
     }
 
@@ -36,6 +41,21 @@ impl Graph {
     fn peer_score(&self, id: &NodeId) -> Option<f64> {
         self.reputation.as_ref()
             .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
+    }
+
+    /// Жалобы на узел из снимка backend.
+    fn peer_reports(&self, id: &NodeId) -> Vec<void_db::peers::ReportRow> {
+        self.reports.as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.get(id).cloned()))
+            .unwrap_or_default()
+    }
+
+    /// Забанен ли узел голосованием (бан не истёк).
+    fn is_banned(&self, id: &NodeId) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        self.blocklist.as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
+            .is_some_and(|until| until > now)
     }
 
     pub fn update_peers(&mut self, peers: Vec<PeerInfo>, profiles: HashMap<NodeId, PeerProfile>) {
@@ -113,7 +133,11 @@ impl Graph {
                     .default_width(320.0)
                     .show(ui.ctx(), |ui| {
                         let rep = self.peer_score(&sel_id);
-                        let action = show_peer_profile(ui, Some(&peer), profile.as_ref(), rep);
+                        let reports = self.peer_reports(&sel_id);
+                        let banned = self.is_banned(&sel_id);
+                        let action = show_peer_profile(
+                            ui, Some(&peer), profile.as_ref(), rep, &reports, banned,
+                        );
                         ui.add_space(6.0);
                         if action.start_dm {
                             start_dm_id = Some(sel_id.clone());

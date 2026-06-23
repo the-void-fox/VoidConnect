@@ -59,6 +59,13 @@ pub enum ChatPacket {
     ReputationReport { signed: SignedMessage },
     /// Подписанная DNS-запись зоны `.void` (owner = signed.signer).
     DnsAnnounce { signed: SignedMessage },
+    /// Подписанное предложение голосования (proposer = signed.signer).
+    ProposalAnnounce { signed: SignedMessage },
+    /// Подписанный голос (voter = signed.signer).
+    VoteAnnounce { signed: SignedMessage },
+    /// Дайджест для anti-entropy: `(proposal_id, votes_hash)` по открытым
+    /// предложениям. Получатель до-рассылает то, чего у отправителя нет.
+    VoteDigest { items: Vec<(String, String)> },
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -104,6 +111,19 @@ pub enum RepGossip {
     Report { signed: SignedMessage },
 }
 
+/// Входящее событие голосований, переданное backend'у (он проверяет подпись и
+/// трактует payload — чат лишь переносит подписанные пакеты, не зная их смысла).
+#[derive(Debug, Clone)]
+pub enum VoteGossip {
+    /// Предложение (proposer = signed.signer).
+    Proposal(SignedMessage),
+    /// Голос (voter = signed.signer).
+    Vote(SignedMessage),
+    /// Дайджест соседа `(proposal_id, votes_hash)` — backend сравнит со своим
+    /// и до-рассылает недостающее (anti-entropy union).
+    Digest(Vec<(String, String)>),
+}
+
 // ─── Состояние ───────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -145,6 +165,8 @@ struct PublicChatInner {
     rep_tx:      broadcast::Sender<RepGossip>,
     /// Входящие подписанные DNS-записи → backend (он проверяет/применяет)
     dns_tx:      broadcast::Sender<SignedMessage>,
+    /// Входящие предложения/голоса → backend (он проверяет подпись и считает)
+    vote_tx:     broadcast::Sender<VoteGossip>,
     /// Ограничитель частоты пакетов (флуд-защита на релее). None = выключен.
     rate_limiter: Option<RateLimiter>,
     /// Сигнал backend'у: узел превысил лимит (→ спам-страйк репутации).
@@ -166,6 +188,7 @@ impl PublicChat {
         let (site_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
+        let (vote_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (spam_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         PublicChat {
             inner: Arc::new(PublicChatInner {
@@ -185,6 +208,7 @@ impl PublicChat {
                 site_tx,
                 rep_tx,
                 dns_tx,
+                vote_tx,
                 rate_limiter,
                 spam_tx,
                 conn_gen:    AtomicU64::new(0),
@@ -382,15 +406,17 @@ impl PublicChat {
 
     /// Рассылает наш снимок репутации сети.
     pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
-        self.broadcast_rep_packet(ChatPacket::ReputationSync { from, signed }).await;
+        self.broadcast_gossip_packet(ChatPacket::ReputationSync { from, signed }).await;
     }
 
     /// Рассылает нашу жалобу на узел.
     pub async fn broadcast_report(&self, signed: SignedMessage) {
-        self.broadcast_rep_packet(ChatPacket::ReputationReport { signed }).await;
+        self.broadcast_gossip_packet(ChatPacket::ReputationReport { signed }).await;
     }
 
-    async fn broadcast_rep_packet(&self, pkt: ChatPacket) {
+    /// Рассылает пакет клиентам (если мы релей) и релею (если мы клиент).
+    /// Релей форвардит его остальным. Общий для репутации/голосований.
+    async fn broadcast_gossip_packet(&self, pkt: ChatPacket) {
         {
             let clients = self.inner.clients.lock().await;
             for tx in clients.values() {
@@ -418,6 +444,55 @@ impl PublicChat {
                 let excl = signed.signer.clone();
                 (excl, ChatPacket::ReputationReport { signed })
             }
+        };
+        let clients = self.inner.clients.lock().await;
+        for (id, tx) in clients.iter() {
+            if id.as_str() != excl {
+                let _ = tx.try_send(pkt.clone());
+            }
+        }
+    }
+
+    // ─── Голосования (void-vote) ──────────────────────────────────────────────
+
+    /// Подписка backend на входящие предложения/голоса.
+    pub fn subscribe_votes(&self) -> broadcast::Receiver<VoteGossip> {
+        self.inner.vote_tx.subscribe()
+    }
+
+    /// Рассылает наше предложение голосования.
+    pub async fn announce_proposal(&self, signed: SignedMessage) {
+        self.broadcast_gossip_packet(ChatPacket::ProposalAnnounce { signed }).await;
+    }
+
+    /// Рассылает наш голос.
+    pub async fn announce_vote(&self, signed: SignedMessage) {
+        self.broadcast_gossip_packet(ChatPacket::VoteAnnounce { signed }).await;
+    }
+
+    /// Рассылает наш дайджест открытых предложений (anti-entropy). Клиент шлёт
+    /// его релею, релей — всем клиентам; получатель до-рассылает недостающее.
+    pub async fn announce_vote_digest(&self, items: Vec<(String, String)>) {
+        self.broadcast_gossip_packet(ChatPacket::VoteDigest { items }).await;
+    }
+
+    /// Обрабатывает входящее событие голосований. Предложение/голос отдаёт
+    /// backend'у и — если мы релей — форвардит остальным клиентам, кроме автора.
+    /// Дайджест только отдаём backend'у (он реагирует re-announce'ом): форвардить
+    /// его не нужно — это сверка с прямым соседом. Подпись/подсчёт — в backend.
+    async fn handle_vote_gossip(&self, gossip: VoteGossip) {
+        let _ = self.inner.vote_tx.send(gossip.clone());
+
+        let (excl, pkt) = match gossip {
+            VoteGossip::Proposal(signed) => {
+                let excl = signed.signer.clone();
+                (excl, ChatPacket::ProposalAnnounce { signed })
+            }
+            VoteGossip::Vote(signed) => {
+                let excl = signed.signer.clone();
+                (excl, ChatPacket::VoteAnnounce { signed })
+            }
+            VoteGossip::Digest(_) => return, // дайджест не форвардим
         };
         let clients = self.inner.clients.lock().await;
         for (id, tx) in clients.iter() {
@@ -648,6 +723,15 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
                 }
                 ChatPacket::DnsAnnounce { signed } => {
                     chat_r.handle_dns(signed).await;
+                }
+                ChatPacket::ProposalAnnounce { signed } => {
+                    chat_r.handle_vote_gossip(VoteGossip::Proposal(signed)).await;
+                }
+                ChatPacket::VoteAnnounce { signed } => {
+                    chat_r.handle_vote_gossip(VoteGossip::Vote(signed)).await;
+                }
+                ChatPacket::VoteDigest { items } => {
+                    chat_r.handle_vote_gossip(VoteGossip::Digest(items)).await;
                 }
                 ChatPacket::Ping => {
                     debug!("Ping from client {}", nid);
@@ -1039,6 +1123,15 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
                 Ok(ChatPacket::DnsAnnounce { signed }) => {
                     chat_r.handle_dns(signed).await;
                 }
+                Ok(ChatPacket::ProposalAnnounce { signed }) => {
+                    chat_r.handle_vote_gossip(VoteGossip::Proposal(signed)).await;
+                }
+                Ok(ChatPacket::VoteAnnounce { signed }) => {
+                    chat_r.handle_vote_gossip(VoteGossip::Vote(signed)).await;
+                }
+                Ok(ChatPacket::VoteDigest { items }) => {
+                    chat_r.handle_vote_gossip(VoteGossip::Digest(items)).await;
+                }
                 Ok(ChatPacket::Ping) => {
                     // Ретранслятор пингует нас — отвечаем Pong через outbox
                     let outbox = chat_r.inner.outbox_tx.lock().await;
@@ -1087,6 +1180,10 @@ impl ChatHandle {
     pub async fn announce_dns(&self, signed: SignedMessage) { self.chat.announce_dns(signed).await }
     pub fn subscribe_dns(&self) -> broadcast::Receiver<SignedMessage> { self.chat.subscribe_dns() }
     pub fn subscribe_spam(&self) -> broadcast::Receiver<NodeId> { self.chat.subscribe_spam() }
+    pub fn subscribe_votes(&self) -> broadcast::Receiver<VoteGossip> { self.chat.subscribe_votes() }
+    pub async fn announce_proposal(&self, signed: SignedMessage) { self.chat.announce_proposal(signed).await }
+    pub async fn announce_vote(&self, signed: SignedMessage) { self.chat.announce_vote(signed).await }
+    pub async fn announce_vote_digest(&self, items: Vec<(String, String)>) { self.chat.announce_vote_digest(items).await }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -1515,6 +1612,99 @@ mod tests {
             if delivered { break; }
         }
         assert!(delivered, "Bob не получил DNS-запись от Alice");
+    }
+
+    /// Предложение голосования, объявленное Alice, доходит до Bob как
+    /// `VoteGossip::Proposal` с проверяемой подписью (чат переносит его опаквно).
+    #[tokio::test]
+    async fn proposal_announce_propagates_to_peer() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id.clone(), a_port);
+        let b_peer = test_peer("bob", b_id.clone(), b_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone(), None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
+
+        let mut bob_votes = bob.subscribe_votes();
+
+        // Содержимое для чата непрозрачно — подписываем произвольные байты.
+        let signed = SignedMessage::sign(b"proposal-payload".to_vec(), &a_kp).unwrap();
+
+        let mut delivered = false;
+        for _ in 0..40 {
+            alice.announce_proposal(signed.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { break; }
+                match timeout(remaining, bob_votes.recv()).await {
+                    Ok(Ok(VoteGossip::Proposal(s))) if s.signer == a_id.as_str() => {
+                        assert!(s.verify().is_ok(), "подпись предложения должна проверяться");
+                        assert_eq!(s.payload, b"proposal-payload");
+                        delivered = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    _ => break,
+                }
+            }
+            if delivered { break; }
+        }
+        assert!(delivered, "Bob не получил предложение от Alice");
+    }
+
+    /// Дайджест anti-entropy, объявленный Alice, доходит до Bob как
+    /// `VoteGossip::Digest` (для последующего re-announce недостающего).
+    #[tokio::test]
+    async fn vote_digest_propagates_to_peer() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id.clone(), a_port);
+        let b_peer = test_peer("bob", b_id.clone(), b_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone(), None).await.unwrap();
+        let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
+
+        let mut bob_votes = bob.subscribe_votes();
+        let digest = vec![("prop1".to_string(), "hashA".to_string())];
+
+        let mut delivered = false;
+        for _ in 0..40 {
+            alice.announce_vote_digest(digest.clone()).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { break; }
+                match timeout(remaining, bob_votes.recv()).await {
+                    Ok(Ok(VoteGossip::Digest(items))) => {
+                        assert_eq!(items, digest);
+                        delivered = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    _ => break,
+                }
+            }
+            if delivered { break; }
+        }
+        assert!(delivered, "Bob не получил дайджест от Alice");
     }
 
     /// Флуд-защита: при исчерпании лимита пакеты дропаются и backend получает

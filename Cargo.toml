@@ -9,6 +9,7 @@ members = [
     "crates/storage",
     "crates/web",
     "crates/reputation",
+    "crates/vote",
     "app",
     "ui"
 ]

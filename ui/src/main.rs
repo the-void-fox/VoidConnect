@@ -6,6 +6,7 @@ mod pages;
 mod profile_store;
 mod private_store;
 mod settings_store;
+mod vote_service;
 mod widgets;
 
 use eframe::egui;

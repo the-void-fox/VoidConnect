@@ -4,3 +4,4 @@ pub mod storage;
 pub mod sites;
 pub mod profile;
 pub mod graph;
+pub mod votes;

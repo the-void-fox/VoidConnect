@@ -5116,7 +5116,27 @@ dependencies = [
  "void-discovery",
  "void-reputation",
  "void-storage",
+ "void-vote",
  "void-web",
+]
+
+[[package]]
+name = "void-vote"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "void-core",
+ "void-crypto",
+ "void-db",
 ]
 
 [[package]]

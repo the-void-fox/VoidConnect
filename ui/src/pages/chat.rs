@@ -58,6 +58,12 @@ pub struct ChatPage {
     pub pending_dm: Option<NodeId>,
     /// Снимок репутации узлов из backend (NodeId → score).
     pub reputation: Option<Arc<Mutex<HashMap<NodeId, f64>>>>,
+    /// Снимок жалоб на узлы из backend (для показа в профиле).
+    pub reports: Option<Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>>,
+    /// Снимок блок-листа (забаненные голосованием): NodeId → ts истечения.
+    pub blocklist: Option<Arc<Mutex<HashMap<NodeId, i64>>>>,
+    /// Каналы, добавленные голосованием (мерджатся со встроенными `CHANNELS`).
+    pub voted_channels: Option<Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>>,
     /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
     pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
 }
@@ -81,6 +87,9 @@ impl ChatPage {
             selected:         None,
             pending_dm:       None,
             reputation:       None,
+            reports:          None,
+            blocklist:        None,
+            voted_channels:   None,
             pending_report:   None,
         }
     }
@@ -95,6 +104,39 @@ impl ChatPage {
     fn peer_score(&self, id: &NodeId) -> Option<f64> {
         self.reputation.as_ref()
             .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
+    }
+
+    /// Жалобы на узел из снимка backend.
+    fn peer_reports(&self, id: &NodeId) -> Vec<void_db::peers::ReportRow> {
+        self.reports.as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.get(id).cloned()))
+            .unwrap_or_default()
+    }
+
+    /// Забанен ли узел голосованием (бан не истёк).
+    fn is_banned(&self, id: &NodeId) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        self.blocklist.as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
+            .is_some_and(|until| until > now)
+    }
+
+    /// Полный список каналов: встроенные + добавленные голосованием (дедуп по id).
+    fn all_channels(&self) -> Vec<(String, String, String)> {
+        let mut out: Vec<(String, String, String)> = CHANNELS
+            .iter()
+            .map(|(id, icon, name)| (id.to_string(), icon.to_string(), name.to_string()))
+            .collect();
+        if let Some(shared) = &self.voted_channels {
+            if let Ok(list) = shared.lock() {
+                for c in list.iter() {
+                    if !out.iter().any(|(id, _, _)| *id == c.id) {
+                        out.push((c.id.clone(), c.icon.clone(), c.name.clone()));
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -114,6 +156,9 @@ impl Default for ChatPage {
             selected:         None,
             pending_dm:       None,
             reputation:       None,
+            reports:          None,
+            blocklist:        None,
+            voted_channels:   None,
             pending_report:   None,
         }
     }
@@ -137,7 +182,11 @@ impl ChatPage {
                     .default_width(320.0)
                     .show(ui.ctx(), |ui| {
                         let rep = self.peer_score(&sel_id);
-                        let action = show_peer_profile(ui, peer.as_ref(), profile.as_ref(), rep);
+                        let reports = self.peer_reports(&sel_id);
+                        let banned = self.is_banned(&sel_id);
+                        let action = show_peer_profile(
+                            ui, peer.as_ref(), profile.as_ref(), rep, &reports, banned,
+                        );
                         ui.add_space(6.0);
                         if action.start_dm {
                             start_dm_id = Some(sel_id.clone());
@@ -168,8 +217,16 @@ impl ChatPage {
         let input_scroll_h     = line_height * max_input_lines as f32 + 12.0;
         let input_area_total_h = input_scroll_h + 32.0;
         ui.add_space(8.0);
-        // Заголовок = текущий канал («доска»).
-        let (ch_icon, ch_name) = channel_meta(&self.current_channel);
+        // Заголовок = текущий канал («доска»). Имя ищем и среди проголосованных.
+        let (ch_icon, ch_name) = self
+            .all_channels()
+            .into_iter()
+            .find(|(id, _, _)| *id == self.current_channel)
+            .map(|(_, icon, name)| (icon, name))
+            .unwrap_or_else(|| {
+                let (i, n) = channel_meta(&self.current_channel);
+                (i.to_string(), n)
+            });
         ui.horizontal(|ui| {
             ui.heading(format!("{}  {}", ch_icon, ch_name));
             ui.label(
@@ -178,15 +235,17 @@ impl ChatPage {
         });
         ui.add_space(6.0);
 
-        // Панель каналов («доски» в духе форчана): глобальный + тематические.
+        // Панель каналов («доски» в духе форчана): встроенные + добавленные
+        // голосованием.
+        let channels = self.all_channels();
         ui.horizontal_wrapped(|ui| {
-            for (id, icon, name) in CHANNELS {
+            for (id, icon, name) in &channels {
                 let selected = self.current_channel == *id;
                 if ui
                     .selectable_label(selected, format!("{} {}", icon, name))
                     .clicked()
                 {
-                    self.current_channel = (*id).to_string();
+                    self.current_channel = id.clone();
                     self.scroll_to_bottom = true;
                 }
             }

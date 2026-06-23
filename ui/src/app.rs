@@ -11,6 +11,7 @@ use crate::pages::{
     sites::SitesPage,
     profile::ProfilePage,
     graph::Graph,
+    votes::VotesPage,
 };
 
 #[derive(PartialEq, Clone, Copy)]
@@ -19,6 +20,7 @@ pub enum Page {
     Private,
     Storage,
     Sites,
+    Votes,
     Profile,
     Graph,
 }
@@ -30,6 +32,7 @@ impl Page {
             Page::Private => " \u{F033E}", // nf-md-lock
             Page::Storage => " \u{F02CA}", // nf-md-harddisk
             Page::Sites   => " \u{F059F}", // nf-md-web
+            Page::Votes   => " \u{F0C30}", // nf-md-vote
             Page::Profile => " \u{F0009}", // nf-md-account_circle
             Page::Graph   => " \u{F1049}", // nf-md-graph
         }
@@ -41,6 +44,7 @@ impl Page {
             Page::Private => "Личные сообщения",
             Page::Storage => "Хранилище",
             Page::Sites   => "Сайты",
+            Page::Votes   => "Голосования",
             Page::Profile => "Профиль",
             Page::Graph   => "Граф сети",
         }
@@ -53,6 +57,7 @@ pub struct VoidApp {
     pub private:      PrivatePage,
     pub storage:      StoragePage,
     pub sites:        SitesPage,
+    pub votes:        VotesPage,
     pub profile:      ProfilePage,
     pub graph:        Graph,
     pub backend:      BackendHandle,
@@ -79,6 +84,9 @@ impl VoidApp {
         );
         chat.messages.clear();
         chat.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
+        chat.reports = Some(std::sync::Arc::clone(&backend.reports));
+        chat.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
+        chat.voted_channels = Some(std::sync::Arc::clone(&backend.voted_channels));
 
         // Load saved profile values (description, status) for the profile page
         let saved = crate::profile_store::load_or_create();
@@ -102,6 +110,8 @@ impl VoidApp {
 
         let mut graph = Graph::new(backend.my_name.clone(), backend.my_id_node.clone());
         graph.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
+        graph.reports = Some(std::sync::Arc::clone(&backend.reports));
+        graph.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
 
         // Инициализируем страницу личных сообщений
         let mut private = PrivatePage::default();
@@ -132,6 +142,16 @@ impl VoidApp {
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
 
+        // Страница голосований: снимок предложений + каналы создания/голоса.
+        let mut votes = VotesPage::default();
+        votes.proposals     = Some(std::sync::Arc::clone(&backend.proposals));
+        votes.propose_tx    = Some(backend.propose_tx.clone());
+        votes.vote_cast_tx  = Some(backend.vote_cast_tx.clone());
+        votes.my_score      = Some(std::sync::Arc::clone(&backend.my_score));
+        votes.peers         = Some(std::sync::Arc::clone(&backend.peers));
+        votes.profiles      = Some(std::sync::Arc::clone(&backend.peer_profiles));
+        votes.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
+
         let settings = crate::settings_store::load();
         let settings_bootstrap_input = settings.bootstrap_nodes.join("\n");
 
@@ -141,6 +161,7 @@ impl VoidApp {
             private,
             storage,
             sites,
+            votes,
             profile,
             graph,
             backend,
@@ -207,6 +228,7 @@ impl eframe::App for VoidApp {
                     }
                 }
                 Page::Sites   => self.sites.show(ui),
+                Page::Votes   => self.votes.show(ui),
                 Page::Profile => self.profile.show(ui),
                 Page::Graph   => {
                     self.graph.show(ui);
@@ -420,6 +442,8 @@ impl VoidApp {
                 ui.add_space(4.0);
                 self.nav_button(ui, Page::Sites,   btn_w);
                 ui.add_space(4.0);
+                self.nav_button(ui, Page::Votes,   btn_w);
+                ui.add_space(4.0);
                 self.nav_button(ui, Page::Graph,   btn_w);
 
                 ui.add_space(16.0);
@@ -455,7 +479,7 @@ impl VoidApp {
             ui.label("Навигация:");
             for page in [
                 Page::Chat, Page::Private, Page::Storage,
-                Page::Sites, Page::Graph, Page::Profile,
+                Page::Sites, Page::Votes, Page::Graph, Page::Profile,
             ] {
                 if ui.button(format!("{} {}", page.icon(), page.label())).clicked() {
                     self.current_page = page;

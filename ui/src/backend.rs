@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use void_core::dns::{DnsKind, DnsRecord};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
-use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip};
+use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip, VoteGossip};
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd, PrivateChatHandle};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_crypto::sign::SignedMessage;
@@ -282,6 +282,8 @@ pub struct BackendHandle {
     pub downloads_dir: PathBuf,
     /// Снимок репутации известных узлов: NodeId → score (обновляется ~2с).
     pub peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>,
+    /// Снимок жалоб на известные узлы: NodeId → список жалоб (дошедших до нас).
+    pub reports: Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>,
     /// Канал GUI → backend: пожаловаться на узел (target, причина).
     pub report_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, ReportReason)>,
     /// Запущены ли мы в публичном (bootstrap) режиме.
@@ -301,6 +303,20 @@ pub struct BackendHandle {
     /// Доступны ли наши порты извне (по обратной пробе bootstrap-узла).
     /// `Unknown`, пока нет bootstrap-узлов или первый обмен не завершён.
     pub reachability: Arc<Mutex<void_discovery::bootstrap::Reachability>>,
+
+    // ── Голосования (void-vote) ──────────────────────────────────────────────
+    /// Канал GUI → backend: создать предложение (gated: нужна High-репутация).
+    pub propose_tx: tokio::sync::mpsc::UnboundedSender<void_vote::ProposalKind>,
+    /// Канал GUI → backend: проголосовать `(proposal_id, choice)`.
+    pub vote_cast_tx: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    /// Снимок предложений + подсчёт для GUI (обновляется бэкендом).
+    pub proposals: Arc<Mutex<Vec<crate::vote_service::ProposalView>>>,
+    /// Локальный блок-лист по итогам BanUser: NodeId → unix-таймстемп истечения.
+    pub blocklist: Arc<Mutex<HashMap<NodeId, i64>>>,
+    /// Каналы чата, добавленные голосованием (мерджатся со встроенными).
+    pub voted_channels: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
+    /// Наша собственная репутация (для проверки права голоса/предложения в UI).
+    pub my_score: Arc<Mutex<f64>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -323,6 +339,7 @@ pub fn start_backend(
     let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
     let storage_files: Arc<Mutex<Vec<StorageFileInfo>>>         = Arc::new(Mutex::new(Vec::new()));
     let peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>       = Arc::new(Mutex::new(HashMap::new()));
+    let reports: Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>> = Arc::new(Mutex::new(HashMap::new()));
     let reachability: Arc<Mutex<void_discovery::bootstrap::Reachability>> =
         Arc::new(Mutex::new(void_discovery::bootstrap::Reachability::Unknown));
 
@@ -335,9 +352,23 @@ pub fn start_backend(
     let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, ReportReason)>();
     let (publish_site_tx, publish_site_rx) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, String)>();
     let (mirror_tx,  mirror_rx)  = tokio::sync::mpsc::unbounded_channel::<MirrorCmd>();
+    let (propose_tx, propose_rx) = tokio::sync::mpsc::unbounded_channel::<void_vote::ProposalKind>();
+    let (vote_cast_tx, vote_cast_rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
     let sites: Arc<Mutex<Vec<SiteInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let dns_names: Arc<Mutex<Vec<DnsInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let site_http_port = base_port + 4;
+
+    // Состояние голосований (восстанавливаем исполненные решения с диска).
+    let proposals: Arc<Mutex<Vec<crate::vote_service::ProposalView>>> = Arc::new(Mutex::new(Vec::new()));
+    let blocklist: Arc<Mutex<HashMap<NodeId, i64>>> = Arc::new(Mutex::new(
+        crate::vote_service::load_bans()
+            .into_iter()
+            .map(|(k, v)| (NodeId(k), v))
+            .collect(),
+    ));
+    let voted_channels: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>> =
+        Arc::new(Mutex::new(crate::vote_service::load_voted_channels()));
+    let my_score: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
     let my_ip = if local_mode {
         IpAddr::from([127, 0, 0, 1])
@@ -372,9 +403,14 @@ pub fn start_backend(
     let history_bg  = Arc::clone(&chat_history);
     let storage_bg  = Arc::clone(&storage_files);
     let reputation_bg = Arc::clone(&peer_reputation);
+    let reports_bg    = Arc::clone(&reports);
     let sites_bg      = Arc::clone(&sites);
     let dns_bg        = Arc::clone(&dns_names);
     let reach_bg      = Arc::clone(&reachability);
+    let proposals_bg  = Arc::clone(&proposals);
+    let blocklist_bg  = Arc::clone(&blocklist);
+    let voted_channels_bg = Arc::clone(&voted_channels);
+    let my_score_bg   = Arc::clone(&my_score);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -392,9 +428,11 @@ pub fn start_backend(
                 chat_rx, connect_rx, profile_rx, dm_rx,
                 data_dir, history_bg,
                 publish_rx, download_rx, storage_bg,
-                reputation_bg, report_rx,
+                reputation_bg, reports_bg, report_rx,
                 publish_site_rx, sites_bg, site_http_port,
                 dns_bg, reach_bg, mirror_rx,
+                propose_rx, vote_cast_rx, proposals_bg,
+                blocklist_bg, voted_channels_bg, my_score_bg,
             ).await;
         });
     });
@@ -423,6 +461,7 @@ pub fn start_backend(
         storage_files,
         downloads_dir,
         peer_reputation,
+        reports,
         report_tx,
         bootstrap: public_mode,
         has_bootstrap,
@@ -432,6 +471,12 @@ pub fn start_backend(
         site_http_port,
         dns_names,
         reachability,
+        propose_tx,
+        vote_cast_tx,
+        proposals,
+        blocklist,
+        voted_channels,
+        my_score,
     }
 }
 
@@ -462,6 +507,7 @@ async fn backend_main(
     download_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadCmd>,
     storage_files_out: Arc<Mutex<Vec<StorageFileInfo>>>,
     reputation_out: Arc<Mutex<HashMap<NodeId, f64>>>,
+    reports_out: Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>,
     mut report_rx: tokio::sync::mpsc::UnboundedReceiver<(NodeId, ReportReason)>,
     publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out: Arc<Mutex<Vec<SiteInfo>>>,
@@ -469,6 +515,12 @@ async fn backend_main(
     dns_out: Arc<Mutex<Vec<DnsInfo>>>,
     reachability_out: Arc<Mutex<void_discovery::bootstrap::Reachability>>,
     mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
+    propose_rx: tokio::sync::mpsc::UnboundedReceiver<void_vote::ProposalKind>,
+    vote_cast_rx: tokio::sync::mpsc::UnboundedReceiver<(String, bool)>,
+    proposals_out: Arc<Mutex<Vec<crate::vote_service::ProposalView>>>,
+    blocklist_out: Arc<Mutex<HashMap<NodeId, i64>>>,
+    voted_channels_out: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
+    my_score_out: Arc<Mutex<f64>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -633,8 +685,10 @@ async fn backend_main(
         });
     }
 
-    // Ключ подписи нужен и DNS (заявка имён) — клонируем до передачи в чат.
+    // Ключ подписи нужен и DNS (заявка имён), и голосованиям — клонируем до
+    // передачи в чат.
     let dns_kp = sign_kp.clone();
+    let vote_kp = sign_kp.clone();
     let chat = match start_public_chat(
         my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp,
         Some(rate_limiter.clone()),
@@ -725,10 +779,15 @@ async fn backend_main(
     let mut rx = chat.subscribe();
     let inbox_task = Arc::clone(&inbox);
     let pool_for_save = db_pool.clone();
+    let chat_blocklist = Arc::clone(&blocklist_out);
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(msg) => {
+                    // Узлы, забаненные голосованием, не показываем и не сохраняем.
+                    if is_banned(&chat_blocklist, &msg.from, chrono::Utc::now().timestamp()) {
+                        continue;
+                    }
                     // Сохраняем в БД (best-effort, дедуп по message_id внутри INSERT OR IGNORE)
                     if let Some(pool) = &pool_for_save {
                         if let Err(e) = persist_public_message(pool, &msg).await {
@@ -750,10 +809,15 @@ async fn backend_main(
     // Задача: входящие DM → dm_inbox GUI
     let mut dm_rx_sub = dm_handle.subscribe();
     let dm_inbox_task = Arc::clone(&dm_inbox);
+    let dm_blocklist = Arc::clone(&blocklist_out);
     tokio::spawn(async move {
         loop {
             match dm_rx_sub.recv().await {
                 Ok(msg) => {
+                    // DM от забаненных голосованием узлов игнорируем.
+                    if is_banned(&dm_blocklist, &msg.from, chrono::Utc::now().timestamp()) {
+                        continue;
+                    }
                     let mut q = dm_inbox_task.lock().unwrap();
                     if q.len() > 1000 { q.pop_front(); }
                     q.push_back(msg);
@@ -884,6 +948,8 @@ async fn backend_main(
     let chat_p   = chat.clone();
     let rep_snap = reputation.clone();
     let rep_out  = Arc::clone(&reputation_out);
+    let reports_pool = db_pool.clone();
+    let reports_out_t = Arc::clone(&reports_out);
     let my_rep_id = my_peer.id.clone();
     let dns_snap = dns.clone();
     let rl_clean = rate_limiter.clone();
@@ -894,8 +960,10 @@ async fn backend_main(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         let mut prev_ids: HashSet<NodeId> = HashSet::new();
+        let mut tick: u64 = 0;
         loop {
             interval.tick().await;
+            tick = tick.wrapping_add(1);
             let peers = pl.all().await;
             *peers_out.lock().unwrap() = peers.clone();
             let profiles = chat_p.get_profiles().await;
@@ -967,6 +1035,22 @@ async fn backend_main(
                     snapshot.insert(id.clone(), rep.score.score(id).await);
                 }
                 *rep_out.lock().unwrap() = snapshot;
+            }
+
+            // Снимок жалоб на текущие узлы (для просмотра в профиле). Реже —
+            // раз в ~10с, т.к. жалобы меняются нечасто. Только дошедшие до нас.
+            if tick % 5 == 0 {
+                if let Some(pool) = &reports_pool {
+                    let mut map: HashMap<NodeId, Vec<void_db::peers::ReportRow>> = HashMap::new();
+                    for id in &cur_ids {
+                        if let Ok(rows) = void_db::peers::list_reports(pool, id.as_str()).await {
+                            if !rows.is_empty() {
+                                map.insert(id.clone(), rows);
+                            }
+                        }
+                    }
+                    *reports_out_t.lock().unwrap() = map;
+                }
             }
 
             // Новым пирам — наши DNS-записи (работает и без репутации).
@@ -1061,6 +1145,10 @@ async fn backend_main(
         });
     }
 
+    // Файлы, удалённые голосованием (RemoveFile) — чтобы не докачивать обратно.
+    let removed_files: Arc<Mutex<HashSet<String>>> =
+        Arc::new(Mutex::new(crate::vote_service::load_removed_files()));
+
     // ── Подсистема хранилища (требует БД) ─────────────────────────────────────
     // chunk-сервер слушает base_port (он свободен: чат на +2, DM на +3),
     // download у пиров идёт именно на их base_port.
@@ -1072,6 +1160,14 @@ async fn backend_main(
                     if let Some(tx) = chunk_ev_tx.clone() {
                         manager.set_event_sink(tx);
                     }
+                    // Голосования (нужны БД + storage для RemoveFile).
+                    start_vote_tasks(
+                        manager.clone(), pool.clone(), chat.clone(), reputation.clone(),
+                        my_peer.id.clone(), vote_kp,
+                        propose_rx, vote_cast_rx,
+                        proposals_out, blocklist_out, voted_channels_out, my_score_out,
+                        Arc::clone(&removed_files),
+                    );
                     // Сайты: HTTP-сервер + публикация + обнаружение по сети.
                     start_site_tasks(
                         manager.clone(), my_peer.id.clone(), site_http_port,
@@ -1082,6 +1178,7 @@ async fn backend_main(
                         manager, pool, chat.clone(), peer_list.clone(),
                         my_peer.id.clone(), base_port, data_dir.clone(),
                         publish_rx, download_rx, storage_files_out,
+                        Arc::clone(&removed_files),
                     );
                     tracing::info!("Storage subsystem ready (chunk server on {}, sites on {})",
                         base_port, site_http_port);
@@ -1325,6 +1422,7 @@ fn start_storage_tasks(
     mut publish_rx:  tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
     mut download_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadCmd>,
     files_out:  Arc<Mutex<Vec<StorageFileInfo>>>,
+    removed_files: Arc<Mutex<HashSet<String>>>,
 ) {
     // chunk-сервер
     let srv = manager.clone();
@@ -1358,6 +1456,7 @@ fn start_storage_tasks(
 
     // приём манифестов файлов из сети → регистрация файла локально
     let ann_mgr = manager.clone();
+    let ann_removed = Arc::clone(&removed_files);
     let mut manifest_rx = chat.subscribe_manifests();
     tokio::spawn(async move {
         loop {
@@ -1365,6 +1464,11 @@ fn start_storage_tasks(
                 Ok(manifest) => {
                     let name = manifest.name.clone();
                     let n = manifest.chunks.len();
+                    // Файл, удалённый голосованием, не принимаем обратно.
+                    if ann_removed.lock().unwrap().contains(&manifest.file_id) {
+                        tracing::debug!("Манифест '{}' игнорирован: файл удалён голосованием", name);
+                        continue;
+                    }
                     if let Err(e) = ann_mgr.handle_manifest(&manifest).await {
                         tracing::warn!("Не удалось обработать манифест '{}': {}", name, e);
                     } else {
@@ -1530,6 +1634,306 @@ fn start_storage_tasks(
             *files_out.lock().unwrap() = out;
         }
     });
+}
+
+// ─── Голосования (void-vote) ─────────────────────────────────────────────────
+
+/// Период подсчёта/синхронизации голосований.
+const VOTE_TICK_SECS: u64 = 15;
+
+/// Запускает задачи подсистемы голосований: приём/хранение/anti-entropy
+/// предложений и голосов, создание/подачу из GUI, периодический подсчёт,
+/// финализацию закрытых голосований и исполнение принятых решений.
+#[allow(clippy::too_many_arguments)]
+fn start_vote_tasks(
+    manager: StorageManager,
+    pool: void_db::DbPool,
+    chat: ChatHandle,
+    reputation: Option<Reputation>,
+    my_id: NodeId,
+    sign_kp: Arc<SigningKeypair>,
+    mut propose_rx: tokio::sync::mpsc::UnboundedReceiver<void_vote::ProposalKind>,
+    mut vote_cast_rx: tokio::sync::mpsc::UnboundedReceiver<(String, bool)>,
+    proposals_out: Arc<Mutex<Vec<crate::vote_service::ProposalView>>>,
+    blocklist_out: Arc<Mutex<HashMap<NodeId, i64>>>,
+    voted_channels_out: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
+    my_score_out: Arc<Mutex<f64>>,
+    removed_files: Arc<Mutex<HashSet<String>>>,
+) {
+    let Some(rep) = reputation else {
+        tracing::warn!("Голосования отключены: репутация недоступна (нет БД)");
+        return;
+    };
+
+    // ── Приём из сети: предложения/голоса → БД; дайджест → re-announce. ──────
+    {
+        let recv_pool = pool.clone();
+        let recv_chat = chat.clone();
+        let mut votes_rx = chat.subscribe_votes();
+        tokio::spawn(async move {
+            loop {
+                match votes_rx.recv().await {
+                    Ok(VoteGossip::Proposal(signed)) => {
+                        match void_vote::Proposal::from_signed(signed) {
+                            Ok(p) => { let _ = void_vote::store::insert_proposal(&recv_pool, &p).await; }
+                            Err(e) => tracing::debug!("Отклонено предложение: {}", e),
+                        }
+                    }
+                    Ok(VoteGossip::Vote(signed)) => {
+                        match void_vote::Vote::from_signed(signed) {
+                            Ok(v) => { let _ = void_vote::store::upsert_vote(&recv_pool, &v).await; }
+                            Err(e) => tracing::debug!("Отклонён голос: {}", e),
+                        }
+                    }
+                    Ok(VoteGossip::Digest(remote)) => {
+                        // anti-entropy: до-рассылаем то, чего нет/расходится у соседа.
+                        let now = chrono::Utc::now().timestamp();
+                        let open = void_vote::store::list_open_proposals(&recv_pool, now).await
+                            .unwrap_or_default();
+                        let mut local = Vec::with_capacity(open.len());
+                        for sp in &open {
+                            let votes = void_vote::store::list_votes(&recv_pool, &sp.id).await
+                                .unwrap_or_default();
+                            local.push((sp.id.clone(), void_vote::votes_digest(&votes)));
+                        }
+                        for pid in void_vote::proposals_to_push(&local, &remote) {
+                            if let Ok(Some(sp)) = void_vote::store::get_proposal(&recv_pool, &pid).await {
+                                recv_chat.announce_proposal(sp.signed).await;
+                            }
+                            if let Ok(msgs) = void_vote::store::list_vote_messages(&recv_pool, &pid).await {
+                                for m in msgs { recv_chat.announce_vote(m).await; }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Vote gossip lagged by {}", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // ── GUI → создать предложение (только High-репутация). ──────────────────
+    {
+        let pool = pool.clone();
+        let chat = chat.clone();
+        let kp = sign_kp.clone();
+        let rep = rep.clone();
+        let me = my_id.clone();
+        tokio::spawn(async move {
+            while let Some(kind) = propose_rx.recv().await {
+                let score = rep.score.score(&me).await;
+                if !void_vote::can_propose(score) {
+                    tracing::warn!("Создание голосования отклонено: нужна High-репутация (сейчас {:.0})", score);
+                    continue;
+                }
+                let p = match void_vote::Proposal::create(kind, &kp) {
+                    Ok(p) => p,
+                    Err(e) => { tracing::warn!("Не удалось создать предложение: {}", e); continue; }
+                };
+                let _ = void_vote::store::insert_proposal(&pool, &p).await;
+                // Автор автоматически голосует «за».
+                if let Ok(v) = void_vote::Vote::create(p.id.clone(), true, &kp) {
+                    let _ = void_vote::store::upsert_vote(&pool, &v).await;
+                    chat.announce_vote(v.signed).await;
+                }
+                chat.announce_proposal(p.signed).await;
+                tracing::info!("Создано голосование: {}", crate::vote_service::kind_label(&p.payload.kind));
+            }
+        });
+    }
+
+    // ── GUI → проголосовать (нужна положительная репутация, окно открыто). ──
+    {
+        let pool = pool.clone();
+        let chat = chat.clone();
+        let kp = sign_kp.clone();
+        let rep = rep.clone();
+        let me = my_id.clone();
+        tokio::spawn(async move {
+            while let Some((proposal_id, choice)) = vote_cast_rx.recv().await {
+                let score = rep.score.score(&me).await;
+                if !void_vote::can_vote(score) {
+                    tracing::warn!("Голос отклонён: нет права голоса (репутация {:.0})", score);
+                    continue;
+                }
+                let now = chrono::Utc::now().timestamp();
+                match void_vote::store::get_proposal(&pool, &proposal_id).await {
+                    Ok(Some(sp)) if !void_vote::tally::is_closed(sp.created_at, now) => {
+                        if let Ok(v) = void_vote::Vote::create(proposal_id, choice, &kp) {
+                            let _ = void_vote::store::upsert_vote(&pool, &v).await;
+                            chat.announce_vote(v.signed).await;
+                        }
+                    }
+                    Ok(Some(_)) => tracing::warn!("Голос отклонён: окно голосования закрыто"),
+                    _ => tracing::warn!("Голос отклонён: предложение неизвестно"),
+                }
+            }
+        });
+    }
+
+    // ── Периодика: своя репутация, дайджест, финализация+исполнение, снимок. ─
+    {
+        let pool = pool.clone();
+        let chat = chat.clone();
+        let rep = rep.clone();
+        let me = my_id.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(VOTE_TICK_SECS));
+            loop {
+                interval.tick().await;
+                let now = chrono::Utc::now().timestamp();
+
+                // Своя репутация → UI (право голоса/предложения).
+                *my_score_out.lock().unwrap() = rep.score.score(&me).await;
+
+                // Истёкшие баны убираем (с сохранением на диск).
+                {
+                    let expired = {
+                        let mut bl = blocklist_out.lock().unwrap();
+                        let before = bl.len();
+                        bl.retain(|_, until| *until > now);
+                        bl.len() != before
+                    };
+                    if expired {
+                        save_blocklist(&blocklist_out);
+                    }
+                }
+
+                // Дайджест открытых предложений → рассылаем (anti-entropy).
+                let open = void_vote::store::list_open_proposals(&pool, now).await.unwrap_or_default();
+                let mut digest = Vec::with_capacity(open.len());
+                for sp in &open {
+                    let votes = void_vote::store::list_votes(&pool, &sp.id).await.unwrap_or_default();
+                    digest.push((sp.id.clone(), void_vote::votes_digest(&votes)));
+                }
+                if !digest.is_empty() {
+                    chat.announce_vote_digest(digest).await;
+                }
+
+                // Все предложения: финализация закрытых + снимок для UI.
+                let all = void_vote::store::list_proposals(&pool).await.unwrap_or_default();
+                let mut views = Vec::with_capacity(all.len());
+                for sp in &all {
+                    let votes = void_vote::store::list_votes(&pool, &sp.id).await.unwrap_or_default();
+                    let scores = gather_scores(&rep, &votes).await;
+                    let t = void_vote::tally(&sp.kind, sp.created_at, &votes, &scores, now);
+
+                    // Финализация: окно + grace прошли, ещё не исполнено.
+                    let finalize_at = sp.created_at
+                        + void_vote::VOTING_WINDOW_SECS + void_vote::VOTING_GRACE_SECS;
+                    if sp.closed_at.is_none() && now >= finalize_at {
+                        // Доп. защита: автор должен иметь право предлагать (High).
+                        let proposer_score =
+                            rep.score.score(&NodeId(sp.proposer_key.clone())).await;
+                        if t.outcome == void_vote::Outcome::Passed
+                            && void_vote::can_propose(proposer_score)
+                        {
+                            enforce_outcome(
+                                &sp.kind, &manager,
+                                &blocklist_out, &voted_channels_out, &removed_files, now,
+                            ).await;
+                            tracing::info!("Голосование принято и исполнено: {}",
+                                crate::vote_service::kind_label(&sp.kind));
+                        }
+                        let _ = void_vote::store::mark_closed(&pool, &sp.id, now).await;
+                    }
+
+                    let my_vote = votes.iter()
+                        .find(|v| v.voter_key == me.as_str())
+                        .map(|v| v.choice);
+                    views.push(crate::vote_service::ProposalView {
+                        id: sp.id.clone(),
+                        kind: sp.kind.clone(),
+                        label: crate::vote_service::kind_label(&sp.kind),
+                        proposer_short: format!("{}…", &sp.proposer_key[..8.min(sp.proposer_key.len())]),
+                        created_at: sp.created_at,
+                        closes_at: sp.created_at + void_vote::VOTING_WINDOW_SECS,
+                        open: t.open,
+                        yes: t.yes,
+                        no: t.no,
+                        eligible: t.eligible,
+                        high: t.high,
+                        outcome: t.outcome,
+                        my_vote,
+                        finalized: sp.closed_at.is_some(),
+                    });
+                }
+                views.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                *proposals_out.lock().unwrap() = views;
+            }
+        });
+    }
+}
+
+/// Собирает локальные репутации голосующих (для eligibility и кворума).
+async fn gather_scores(rep: &Reputation, votes: &[void_vote::VoteRecord]) -> HashMap<String, f64> {
+    let mut scores = HashMap::new();
+    for v in votes {
+        if !scores.contains_key(&v.voter_key) {
+            let s = rep.score.score(&NodeId(v.voter_key.clone())).await;
+            scores.insert(v.voter_key.clone(), s);
+        }
+    }
+    scores
+}
+
+/// Исполняет принятое решение локально и персистит результат.
+async fn enforce_outcome(
+    kind: &void_vote::ProposalKind,
+    manager: &StorageManager,
+    blocklist: &Arc<Mutex<HashMap<NodeId, i64>>>,
+    channels: &Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
+    removed: &Arc<Mutex<HashSet<String>>>,
+    now: i64,
+) {
+    use void_vote::ProposalKind as K;
+    match kind {
+        K::BanUser { target } => {
+            blocklist.lock().unwrap()
+                .insert(NodeId(target.clone()), now + void_vote::BAN_DURATION_SECS);
+            save_blocklist(blocklist);
+        }
+        K::UnbanUser { target } => {
+            blocklist.lock().unwrap().remove(&NodeId(target.clone()));
+            save_blocklist(blocklist);
+        }
+        K::AddChannel { id, name, icon } => {
+            let mut ch = channels.lock().unwrap();
+            if !ch.iter().any(|c| c.id == *id) {
+                ch.push(crate::vote_service::ChannelDef {
+                    id: id.clone(), name: name.clone(), icon: icon.clone(),
+                });
+                crate::vote_service::save_voted_channels(&ch);
+            }
+        }
+        K::RemoveFile { file_id } => {
+            {
+                let mut set = removed.lock().unwrap();
+                set.insert(file_id.clone());
+                crate::vote_service::save_removed_files(&set);
+            }
+            // Стираем локальную копию и перестаём сидировать.
+            let _ = manager.delete_file(file_id).await;
+        }
+    }
+}
+
+/// Забанен ли узел на момент `now` (бан не истёк).
+fn is_banned(blocklist: &Arc<Mutex<HashMap<NodeId, i64>>>, who: &NodeId, now: i64) -> bool {
+    blocklist.lock().unwrap().get(who).is_some_and(|until| *until > now)
+}
+
+/// Сохраняет блок-лист на диск (NodeId → ts истечения).
+fn save_blocklist(blocklist: &Arc<Mutex<HashMap<NodeId, i64>>>) {
+    let snap: HashMap<String, i64> = blocklist
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), *v))
+        .collect();
+    crate::vote_service::save_bans(&snap);
 }
 
 // ─── Определение реального LAN-IP ────────────────────────────────────────────

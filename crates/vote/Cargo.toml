@@ -1,0 +1,32 @@
+[package]
+name = "void-vote"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Внутренние крейты
+void-core   = { path = "../core" }
+void-crypto = { path = "../crypto" }
+void-db     = { path = "../db" }
+
+# БД (рантайм-запросы, без query!-макросов → не нужен .sqlx-кэш)
+sqlx = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Сериализация
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Хэш proposal_id
+sha2 = { workspace = true }
+hex  = { workspace = true }
+
+# Утилиты
+chrono    = { workspace = true }
+tracing   = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
