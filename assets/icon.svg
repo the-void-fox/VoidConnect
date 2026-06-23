@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="VoidConnect">
+  <title>VoidConnect</title>
+  <!-- Логотип VoidConnect — белый символ «шестиугольник-контур»
+       (Nerd Font md-hexagon-outline, U+F02D9), точный контур глифа из FiraCode.ttf. -->
+  <g transform="translate(37.845 28) scale(0.1502586 -0.1502586) translate(0 -1265.5185)">
+    <path fill="#FFFFFF" fill-rule="evenodd"
+      d="M1200 300Q1200 259 1165 240L638 -53Q622 -65 600.0 -65.5Q578 -66 562 -53L35 240Q1 259 0 300V900Q0 941 35 960L562 1253Q578 1265 600.0 1265.5Q622 1266 638 1253L1165 960Q1199 941 1200 900ZM600 1122 135 859V341L600 78L1065 341V859Z"/>
+  </g>
+</svg>
