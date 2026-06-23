@@ -6,12 +6,38 @@ use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
 use crate::widgets::peer_popup::{status_colors, show_peer_profile};
 
+/// Каналы («доски») общего чата: (id, иконка Nerd Font, название).
+/// `id` хранится в каждом сообщении и в БД; глобальный канал — "global".
+pub const CHANNELS: &[(&str, &str, &str)] = &[
+    ("global", "\u{F01E7}", "Глобальный"),
+    ("tech",   "\u{F061A}", "Технологии"),
+    ("dev",    "\u{F0174}", "Разработка"),
+    ("games",  "\u{F0EBF}", "Игры"),
+    ("music",  "\u{F0387}", "Музыка"),
+    ("movies", "\u{F0381}", "Кино"),
+    ("art",    "\u{F033A}", "Творчество"),
+    ("help",   "\u{F033B}", "Помощь"),
+    ("random", "\u{F0177}", "Random"),
+    ("trade",  "\u{F07D4}", "Барахолка"),
+];
+
+/// (иконка, название) канала по id; для неизвестного id — символ # и сам id.
+pub fn channel_meta(id: &str) -> (&'static str, String) {
+    CHANNELS
+        .iter()
+        .find(|(cid, _, _)| *cid == id)
+        .map(|(_, icon, name)| (*icon, name.to_string()))
+        .unwrap_or(("\u{F04C2}", id.to_string()))
+}
+
 pub struct ChatMessage {
     pub author:  String,
     pub text:    String,
     pub time:    String,
     pub is_me:   bool,
     pub from_id: Option<NodeId>,
+    /// Канал («доска»), к которому относится сообщение.
+    pub channel: String,
 }
 
 pub struct ChatPage {
@@ -19,7 +45,9 @@ pub struct ChatPage {
     pub input:        String,
     scroll_to_bottom: bool,
     was_at_bottom:    bool,
-    send_tx:  Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Текущий выбранный канал («доска»). По умолчанию "global".
+    current_channel:  String,
+    send_tx:  Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
     my_name:  String,
     /// Свой аватар (base64-PNG) — для строк собственных сообщений.
     pub my_avatar: Option<String>,
@@ -36,7 +64,7 @@ pub struct ChatPage {
 
 impl ChatPage {
     pub fn new(
-        send_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        send_tx: tokio::sync::mpsc::UnboundedSender<(String, String)>,
         my_name: String,
     ) -> Self {
         Self {
@@ -44,6 +72,7 @@ impl ChatPage {
             input:            String::new(),
             scroll_to_bottom: true,
             was_at_bottom:    true,
+            current_channel:  "global".into(),
             send_tx:          Some(send_tx),
             my_name,
             my_avatar:        None,
@@ -76,6 +105,7 @@ impl Default for ChatPage {
             input:            String::new(),
             scroll_to_bottom: true,
             was_at_bottom:    true,
+            current_channel:  "global".into(),
             send_tx:          None,
             my_name:          "Вы".into(),
             my_avatar:        None,
@@ -137,14 +167,40 @@ impl ChatPage {
         let max_input_lines    = 4;
         let input_scroll_h     = line_height * max_input_lines as f32 + 12.0;
         let input_area_total_h = input_scroll_h + 32.0;
-        let header_h           = 50.0;
-        let messages_h = (ui.available_height() - header_h - input_area_total_h).max(100.0);
+        ui.add_space(8.0);
+        // Заголовок = текущий канал («доска»).
+        let (ch_icon, ch_name) = channel_meta(&self.current_channel);
+        ui.horizontal(|ui| {
+            ui.heading(format!("{}  {}", ch_icon, ch_name));
+            ui.label(
+                egui::RichText::new("· общий чат").color(ui.visuals().weak_text_color()),
+            );
+        });
+        ui.add_space(6.0);
 
-        ui.add_space(8.0);
-        ui.heading("󰭹 Общий чат");
-        ui.add_space(8.0);
+        // Панель каналов («доски» в духе форчана): глобальный + тематические.
+        ui.horizontal_wrapped(|ui| {
+            for (id, icon, name) in CHANNELS {
+                let selected = self.current_channel == *id;
+                if ui
+                    .selectable_label(selected, format!("{} {}", icon, name))
+                    .clicked()
+                {
+                    self.current_channel = (*id).to_string();
+                    self.scroll_to_bottom = true;
+                }
+            }
+        });
+        ui.add_space(6.0);
         ui.separator();
         ui.add_space(4.0);
+
+        // Высоту области сообщений считаем здесь — после панели каналов, чтобы
+        // учесть её фактическую высоту (она может переноситься на пару строк).
+        let messages_h = (ui.available_height() - input_area_total_h).max(100.0);
+
+        // Есть ли сообщения в текущем канале (для заглушки пустого состояния).
+        let channel_has_msgs = self.messages.iter().any(|m| m.channel == self.current_channel);
 
         // Collect click result outside scroll closure to avoid borrow conflict
         let mut clicked_id: Option<NodeId> = None;
@@ -155,17 +211,18 @@ impl ChatPage {
             .auto_shrink([false; 2])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                if self.messages.is_empty() {
+                if !channel_has_msgs {
                     ui.add_space(messages_h / 2.0 - 20.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            egui::RichText::new("Сеть запущена. Нет сообщений.")
+                            egui::RichText::new(format!(
+                                "В канале «{}» пока нет сообщений.", ch_name))
                                 .color(ui.visuals().weak_text_color()),
                         );
                     });
                 }
 
-                for msg in &self.messages {
+                for msg in self.messages.iter().filter(|m| m.channel == self.current_channel) {
                     if let Some(id) = Self::render_message(ui, msg, &self.profiles, self.my_avatar.as_deref()) {
                         clicked_id = Some(id);
                     }
@@ -352,12 +409,13 @@ impl ChatPage {
             time:    chrono::Local::now().format("%H:%M").to_string(),
             is_me:   true,
             from_id: None,
+            channel: self.current_channel.clone(),
         });
         self.input.clear();
         if self.was_at_bottom { self.scroll_to_bottom = true; }
 
         if let Some(tx) = &self.send_tx {
-            let _ = tx.send(text);
+            let _ = tx.send((self.current_channel.clone(), text));
         }
     }
 

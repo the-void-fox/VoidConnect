@@ -168,7 +168,8 @@ struct Reputation {
 
 pub struct BackendHandle {
     pub chat_inbox:    Arc<Mutex<VecDeque<ChatMessage>>>,
-    pub chat_sender:   tokio::sync::mpsc::UnboundedSender<String>,
+    /// Канал GUI → backend: отправить сообщение общего чата как `(канал, текст)`.
+    pub chat_sender:   tokio::sync::mpsc::UnboundedSender<(String, String)>,
     /// Вручную добавить пир: отправить "ip:base_port"
     pub connect_tx:    tokio::sync::mpsc::UnboundedSender<String>,
     /// Отправить обновление своего профиля
@@ -242,7 +243,7 @@ pub fn start_backend(
     let reachability: Arc<Mutex<void_discovery::bootstrap::Reachability>> =
         Arc::new(Mutex::new(void_discovery::bootstrap::Reachability::Unknown));
 
-    let (chat_tx,    chat_rx)    = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (chat_tx,    chat_rx)    = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
     let (connect_tx, connect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (profile_tx, profile_rx) = tokio::sync::mpsc::unbounded_channel::<PeerProfile>();
     let (dm_tx,      dm_rx)      = tokio::sync::mpsc::unbounded_channel::<DmSendCmd>();
@@ -358,7 +359,7 @@ async fn backend_main(
     enc_kp:      Arc<EncryptionKeypair>,
     sign_kp:     Arc<SigningKeypair>,
     dm_port:     u16,
-    mut chat_rx:    tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut chat_rx:    tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
     mut connect_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     mut profile_rx: tokio::sync::mpsc::UnboundedReceiver<PeerProfile>,
     mut dm_rx:      tokio::sync::mpsc::UnboundedReceiver<DmSendCmd>,
@@ -654,8 +655,8 @@ async fn backend_main(
     // Задача: исходящий текст GUI → chat.send()
     let chat_send = chat.clone();
     tokio::spawn(async move {
-        while let Some(text) = chat_rx.recv().await {
-            if let Err(e) = chat_send.send(text).await {
+        while let Some((channel, text)) = chat_rx.recv().await {
+            if let Err(e) = chat_send.send(channel, text).await {
                 tracing::warn!("Chat send error: {}", e);
             }
         }
@@ -1254,6 +1255,7 @@ async fn persist_public_message(pool: &void_db::DbPool, msg: &ChatMessage) -> vo
         &msg.from_name,
         &msg.text,
         msg.signature.as_deref().unwrap_or(""),
+        &msg.channel,
         sent_at,
     )
     .await
@@ -1269,5 +1271,6 @@ fn db_msg_to_chat(m: void_db::messages::PublicMessage) -> ChatMessage {
         timestamp: m.sent_at.timestamp(),
         seq:       0,
         signature: if m.signature.is_empty() { None } else { Some(m.signature) },
+        channel:   m.channel,
     }
 }

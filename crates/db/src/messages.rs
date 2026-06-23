@@ -1,6 +1,7 @@
 use crate::{DbPool, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 // ─── Модели ───────────────────────────────────────────────────────────────────
 
@@ -12,6 +13,8 @@ pub struct PublicMessage {
     pub sender_name: String,
     pub content: String,
     pub signature: String,
+    /// Канал («доска»), к которому относится сообщение.
+    pub channel: String,
     pub sent_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
 }
@@ -58,22 +61,26 @@ pub async fn save_public_message(
     sender_name: &str,
     content: &str,
     signature: &str,
+    channel: &str,
     sent_at: DateTime<Utc>,
 ) -> Result<()> {
     let sent = sent_at.to_rfc3339();
-    sqlx::query!(
+    // Непроверяемый запрос (sqlx::query): колонка channel добавлена миграцией
+    // 0002 и отсутствует в offline-кэше .sqlx — поэтому не используем query!.
+    sqlx::query(
         r#"
         INSERT OR IGNORE INTO public_messages
-            (message_id, sender_key, sender_name, content, signature, sent_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (message_id, sender_key, sender_name, content, signature, channel, sent_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         "#,
-        message_id,
-        sender_key,
-        sender_name,
-        content,
-        signature,
-        sent,
     )
+    .bind(message_id)
+    .bind(sender_key)
+    .bind(sender_name)
+    .bind(content)
+    .bind(signature)
+    .bind(channel)
+    .bind(sent)
     .execute(pool)
     .await?;
 
@@ -82,29 +89,31 @@ pub async fn save_public_message(
 
 /// Возвращает последние `limit` сообщений общего чата (от новых к старым).
 pub async fn get_public_history(pool: &DbPool, limit: i64) -> Result<Vec<PublicMessage>> {
-    let rows = sqlx::query!(
+    // Непроверяемый запрос (см. примечание в save_public_message про channel).
+    let rows = sqlx::query(
         r#"
-        SELECT id as "id!", message_id, sender_key, sender_name, content, signature, sent_at, received_at
+        SELECT id, message_id, sender_key, sender_name, content, signature, channel, sent_at, received_at
         FROM public_messages
         ORDER BY sent_at DESC
         LIMIT ?
         "#,
-        limit,
     )
+    .bind(limit)
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .into_iter()
         .map(|r| PublicMessage {
-            id: r.id,
-            message_id: r.message_id,
-            sender_key: r.sender_key,
-            sender_name: r.sender_name,
-            content: r.content,
-            signature: r.signature,
-            sent_at: r.sent_at.parse().unwrap_or_else(|_| Utc::now()),
-            received_at: r.received_at.parse().unwrap_or_else(|_| Utc::now()),
+            id: r.get::<i64, _>("id"),
+            message_id: r.get("message_id"),
+            sender_key: r.get("sender_key"),
+            sender_name: r.get("sender_name"),
+            content: r.get("content"),
+            signature: r.get("signature"),
+            channel: r.get("channel"),
+            sent_at: r.get::<String, _>("sent_at").parse().unwrap_or_else(|_| Utc::now()),
+            received_at: r.get::<String, _>("received_at").parse().unwrap_or_else(|_| Utc::now()),
         })
         .collect())
 }
@@ -242,10 +251,10 @@ mod tests {
         let (_dir, pool) = temp_db().await;
         let t = Utc::now();
 
-        save_public_message(&pool, "k:1", "k", "Алиса", "привет", "sig", t).await.unwrap();
+        save_public_message(&pool, "k:1", "k", "Алиса", "привет", "sig", "global", t).await.unwrap();
         // Тот же message_id — должен быть проигнорирован.
-        save_public_message(&pool, "k:1", "k", "Алиса", "дубль", "sig", t).await.unwrap();
-        save_public_message(&pool, "k:2", "k", "Алиса", "второе", "sig",
+        save_public_message(&pool, "k:1", "k", "Алиса", "дубль", "sig", "global", t).await.unwrap();
+        save_public_message(&pool, "k:2", "k", "Алиса", "второе", "sig", "tech",
             t + chrono::Duration::seconds(1)).await.unwrap();
 
         let hist = get_public_history(&pool, 10).await.unwrap();
@@ -253,6 +262,8 @@ mod tests {
         // get_public_history возвращает новые первыми (ORDER BY sent_at DESC)
         assert_eq!(hist[0].content, "второе");
         assert_eq!(hist[1].content, "привет");
+        assert_eq!(hist[0].channel, "tech", "канал должен сохраняться");
+        assert_eq!(hist[1].channel, "global");
         assert_eq!(hist[0].sender_name, "Алиса", "имя отправителя должно сохраняться");
         assert!(hist.iter().all(|m| m.sender_key == "k"));
     }
@@ -266,7 +277,7 @@ mod tests {
 
         {
             let pool = open(&path).await.unwrap();
-            save_public_message(&pool, "k:1", "k", "n", "до перезапуска", "s", Utc::now())
+            save_public_message(&pool, "k:1", "k", "n", "до перезапуска", "s", "global", Utc::now())
                 .await.unwrap();
         }
         // Новое подключение к тому же файлу — данные на месте.
@@ -280,7 +291,7 @@ mod tests {
     async fn public_history_respects_limit() {
         let (_dir, pool) = temp_db().await;
         for i in 0..5 {
-            save_public_message(&pool, &format!("k:{i}"), "k", "n", &format!("m{i}"), "s",
+            save_public_message(&pool, &format!("k:{i}"), "k", "n", &format!("m{i}"), "s", "global",
                 Utc::now() + chrono::Duration::seconds(i)).await.unwrap();
         }
         assert_eq!(get_public_history(&pool, 3).await.unwrap().len(), 3);
@@ -291,7 +302,7 @@ mod tests {
     async fn public_message_exists_works() {
         let (_dir, pool) = temp_db().await;
         assert!(!public_message_exists(&pool, "k:1").await.unwrap());
-        save_public_message(&pool, "k:1", "k", "n", "x", "s", Utc::now()).await.unwrap();
+        save_public_message(&pool, "k:1", "k", "n", "x", "s", "global", Utc::now()).await.unwrap();
         assert!(public_message_exists(&pool, "k:1").await.unwrap());
     }
 

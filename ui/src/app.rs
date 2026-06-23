@@ -260,6 +260,7 @@ impl VoidApp {
                     time,
                     is_me,
                     from_id: Some(msg.from.clone()),
+                    channel: msg.channel.clone(),
                 });
             }
             self.history_loaded = true;
@@ -287,6 +288,7 @@ impl VoidApp {
                 time,
                 is_me:   false,
                 from_id: Some(msg.from.clone()),
+                channel: msg.channel.clone(),
             });
         }
     }

@@ -74,11 +74,23 @@ pub struct ChatMessage {
     pub timestamp: i64,
     pub seq: u64,
     pub signature: Option<String>,
+    /// Канал («доска») сообщения. Сообщения рассылаются всем, но UI фильтрует
+    /// их по каналу. По умолчанию — глобальный канал ("global").
+    #[serde(default = "default_channel")]
+    pub channel: String,
+}
+
+/// Канал по умолчанию для пакетов без поля `channel` (совместимость версий).
+pub fn default_channel() -> String {
+    "global".to_string()
 }
 
 impl ChatMessage {
-    pub fn new(from: NodeId, from_name: String, text: String, seq: u64) -> Self {
-        ChatMessage { from, from_name, text, timestamp: Utc::now().timestamp(), seq, signature: None }
+    pub fn new(from: NodeId, from_name: String, text: String, channel: String, seq: u64) -> Self {
+        ChatMessage {
+            from, from_name, text, channel,
+            timestamp: Utc::now().timestamp(), seq, signature: None,
+        }
     }
 }
 
@@ -652,14 +664,14 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
 
 /// Канонические байты сообщения для подписи/проверки.
 /// Привязывает отправителя, порядковый номер, время и текст.
-fn message_signing_bytes(from: &NodeId, seq: u64, timestamp: i64, text: &str) -> Vec<u8> {
-    format!("{}\n{}\n{}\n{}", from.as_str(), seq, timestamp, text).into_bytes()
+fn message_signing_bytes(from: &NodeId, seq: u64, timestamp: i64, channel: &str, text: &str) -> Vec<u8> {
+    format!("{}\n{}\n{}\n{}\n{}", from.as_str(), seq, timestamp, channel, text).into_bytes()
 }
 
 impl PublicChat {
     /// Подписывает исходящее сообщение нашим Ed25519-ключом.
     fn sign_message(&self, msg: &mut ChatMessage) {
-        let bytes = message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.text);
+        let bytes = message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.channel, &msg.text);
         match SignedMessage::sign(bytes, &self.inner.signing_kp) {
             Ok(signed) => msg.signature = Some(signed.signature),
             Err(e) => warn!("Failed to sign chat message: {:?}", e),
@@ -674,7 +686,7 @@ impl PublicChat {
             return false;
         };
         let signed = SignedMessage {
-            payload:   message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.text),
+            payload:   message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.channel, &msg.text),
             signature,
             signer:    msg.from.as_str().to_string(),
         };
@@ -757,7 +769,7 @@ impl PublicChat {
         }
     }
 
-    pub async fn send(&self, text: String) -> anyhow::Result<()> {
+    pub async fn send(&self, channel: String, text: String) -> anyhow::Result<()> {
         let seq = { let mut c = self.inner.seq_counter.lock().await; *c += 1; *c };
 
         // Используем имя из профиля если оно установлено
@@ -769,7 +781,7 @@ impl PublicChat {
                 .unwrap_or_else(|| self.inner.my_peer.name.clone())
         };
 
-        let mut msg = ChatMessage::new(self.inner.my_peer.id.clone(), my_name, text, seq);
+        let mut msg = ChatMessage::new(self.inner.my_peer.id.clone(), my_name, text, channel, seq);
         self.sign_message(&mut msg);
 
         let is_relay = self.inner.relay.read().await.is_none();
@@ -1040,7 +1052,7 @@ pub struct ChatHandle {
 }
 
 impl ChatHandle {
-    pub async fn send(&self, text: String) -> anyhow::Result<()> { self.chat.send(text).await }
+    pub async fn send(&self, channel: String, text: String) -> anyhow::Result<()> { self.chat.send(channel, text).await }
     pub fn subscribe(&self) -> broadcast::Receiver<ChatMessage> { self.chat.subscribe() }
     pub async fn recent(&self, n: usize) -> Vec<ChatMessage> { self.chat.recent(n).await }
     pub async fn set_profile(&self, profile: PeerProfile) { self.chat.set_profile(profile).await }
@@ -1160,7 +1172,7 @@ mod tests {
     /// Сериализация ChatPacket: roundtrip Message + неизвестный тип → Unknown.
     #[test]
     fn chat_packet_serde_roundtrip() {
-        let msg = ChatMessage::new(node_id(1), "alice".into(), "привет".into(), 42);
+        let msg = ChatMessage::new(node_id(1), "alice".into(), "привет".into(), "global".into(), 42);
         let json = serde_json::to_string(&ChatPacket::Message(msg)).unwrap();
         let back: ChatPacket = serde_json::from_str(&json).unwrap();
         match back {
@@ -1184,7 +1196,7 @@ mod tests {
         let peer = test_peer("x", id.clone(), 1);
         let chat = PublicChat::new(peer, PeerList::new(), 1, kp, None);
 
-        let mut msg = ChatMessage::new(id.clone(), "x".into(), "secret".into(), 1);
+        let mut msg = ChatMessage::new(id.clone(), "x".into(), "secret".into(), "global".into(), 1);
         chat.sign_message(&mut msg);
         assert!(msg.signature.is_some(), "сообщение должно быть подписано");
         assert!(chat.verify_message(&msg), "валидная подпись должна проходить");
@@ -1235,7 +1247,7 @@ mod tests {
         // может прийтись на момент до биндинга сервера релея).
         let mut delivered = false;
         for _ in 0..30 {
-            bob.send("from_bob".into()).await.unwrap();
+            bob.send("global".into(), "from_bob".into()).await.unwrap();
             if wait_for_text(&mut alice_rx, "from_bob", 1).await {
                 delivered = true;
                 break;
@@ -1244,7 +1256,7 @@ mod tests {
         assert!(delivered, "релей (Alice) не получил сообщение клиента (Bob)");
 
         // Релей → клиент.
-        alice.send("from_alice".into()).await.unwrap();
+        alice.send("global".into(), "from_alice".into()).await.unwrap();
         assert!(
             wait_for_text(&mut bob_rx, "from_alice", 5).await,
             "клиент (Bob) не получил сообщение релея (Alice)"
@@ -1289,7 +1301,7 @@ mod tests {
         let mut got_b = false;
         let mut got_c = false;
         for _ in 0..40 {
-            a.send("from_a".into()).await.unwrap();
+            a.send("global".into(), "from_a".into()).await.unwrap();
             if !got_b { got_b = wait_for_text(&mut b_rx, "from_a", 1).await; }
             if !got_c { got_c = wait_for_text(&mut c_rx, "from_a", 1).await; }
             if got_b && got_c { break; }
