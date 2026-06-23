@@ -1,9 +1,14 @@
 {
   description = "VoidConnect — децентрализованный P2P-мессенджер для локальной сети (Rust + egui)";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Rust-тулчейн с произвольными таргетами (для кросс-сборки под Windows).
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
@@ -88,27 +93,36 @@
       });
 
       # ── Разработка: nix develop ─────────────────────────────────────────────
-      # Зеркало shell.nix: тулчейн Rust + системные библиотеки для egui/rfd.
+      # Зеркало shell.nix: тулчейн Rust (+ windows-gnu target) + библиотеки egui/rfd.
       devShells = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
           rlibs = runtimeLibs pkgs;
+          # Один тулчейн: host + std для Windows-кросса (make windows через zig).
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rust-analyzer" "rust-src" ];
+            targets = [ "x86_64-pc-windows-gnu" ];
+          };
         in
         {
           default = pkgs.mkShell {
-            buildInputs = with pkgs; [
-              # Rust
-              rustc
-              cargo
-              rustfmt
-              clippy
-              rust-analyzer
+            buildInputs = [ rustToolchain ] ++ (with pkgs; [
               # Нативные диалоги (rfd) + pkg-config
               gtk3
               glib
               pkg-config
               wayland-protocols
-            ] ++ rlibs;
+              # Упаковка через Makefile (linux/appimage)
+              patchelf
+              curl
+              appimage-run
+              # Кросс-сборка под Windows (make windows)
+              cargo-zigbuild
+              zig
+            ]) ++ rlibs;
 
             shellHook = ''
               export WINIT_UNIX_BACKEND=x11

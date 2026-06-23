@@ -25,7 +25,7 @@ ICON       := ui/src/assets/icon.png
 APPIMAGETOOL_URL := https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
 APPIMAGETOOL     := tools/appimagetool.AppImage
 
-.PHONY: all linux appimage windows clean sizes _appdir _bundle_libs _check_win_toolchain
+.PHONY: all linux appimage windows clean sizes _appdir _bundle_libs
 
 all: linux appimage windows
 
@@ -53,7 +53,13 @@ appimage: $(DIST)/$(APP_NAME)-$(APP_VER)-x86_64.AppImage
 $(APPIMAGETOOL):
 	@echo "→ Скачиваю appimagetool…"
 	@mkdir -p tools
-	wget -q --show-progress -O $(APPIMAGETOOL) $(APPIMAGETOOL_URL)
+	@if command -v curl >/dev/null 2>&1; then \
+	    curl -fL --progress-bar -o $(APPIMAGETOOL) $(APPIMAGETOOL_URL); \
+	elif command -v wget >/dev/null 2>&1; then \
+	    wget -q --show-progress -O $(APPIMAGETOOL) $(APPIMAGETOOL_URL); \
+	else \
+	    echo "❌  Нужен curl или wget (оба есть в shell.nix)"; exit 1; \
+	fi
 	chmod +x $(APPIMAGETOOL)
 
 $(DIST)/$(APP_NAME)-$(APP_VER)-x86_64.AppImage: $(BIN_LIN) $(APPIMAGETOOL)
@@ -105,21 +111,15 @@ _bundle_libs:
 # ── 3. Windows (.exe) ─────────────────────────────────────────────────────────
 # Требует cargo-zigbuild + zig ИЛИ mingw-w64.
 # Добавь в shell.nix: cargo-zigbuild zig  (или pkgsCross.mingwW64.stdenv.cc)
-windows: _check_win_toolchain $(DIST)/$(APP_NAME)-$(APP_VER)-windows-x86_64.exe
-
-_check_win_toolchain:
-	@if command -v cargo-zigbuild >/dev/null 2>&1; then \
-	    echo "→ Используем cargo-zigbuild"; \
-	elif command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
-	    echo "→ Используем mingw-w64"; \
+# Без тулчейна — мягко пропускаем (чтобы `make all` собрал linux+appimage).
+windows:
+	@if command -v cargo-zigbuild >/dev/null 2>&1 || command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+	    $(MAKE) $(DIST)/$(APP_NAME)-$(APP_VER)-windows-x86_64.exe; \
 	else \
-	    echo ""; \
-	    echo "❌  Нет инструментов для Windows-кросс-компиляции."; \
-	    echo "   Добавь в shell.nix одно из:"; \
+	    echo "⚠  Windows пропущен: нет cargo-zigbuild / mingw-w64."; \
+	    echo "   Чтобы собрать .exe, добавь в shell.nix одно из:"; \
 	    echo "     pkgs.cargo-zigbuild  pkgs.zig          (рекомендуется)"; \
 	    echo "     pkgs.pkgsCross.mingwW64.stdenv.cc      (альтернатива)"; \
-	    echo ""; \
-	    exit 1; \
 	fi
 
 $(DIST)/$(APP_NAME)-$(APP_VER)-windows-x86_64.exe: $(BIN_WIN)

@@ -1,13 +1,27 @@
-{ pkgs ? import <nixpkgs> {} }:
+# Rust-тулчейн берём из rust-overlay (oxalica), чтобы добавить таргет
+# x86_64-pc-windows-gnu: стоковый rustc из nixpkgs не содержит std для других
+# таргетов, а rustup здесь нет. cargo-zigbuild затем чинит линковку (zig as linker).
+{ pkgs ? import <nixpkgs> {
+    overlays = [
+      (import (builtins.fetchTarball {
+        url = "https://github.com/oxalica/rust-overlay/archive/master.tar.gz";
+      }))
+    ];
+  }
+}:
 
+let
+  # Один тулчейн = host (Linux) + std для Windows-кросса. Профиль default уже
+  # включает rustc/cargo/clippy/rustfmt; добавляем rust-analyzer/rust-src и таргет.
+  rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+    extensions = [ "rust-analyzer" "rust-src" ];
+    targets = [ "x86_64-pc-windows-gnu" ];
+  };
+in
 pkgs.mkShell {
   buildInputs = with pkgs; [
-    # Rust
-    rustc
-    cargo
-    rustfmt
-    clippy
-    rust-analyzer
+    # Rust (host + windows-gnu target, см. выше)
+    rustToolchain
 
     # Для egui/eframe с X11
     libX11
@@ -29,6 +43,16 @@ pkgs.mkShell {
     gtk3
     glib
     pkg-config
+
+    # Для упаковки (make linux/appimage): RPATH-патчинг, загрузка appimagetool,
+    # запуск appimagetool на NixOS без FUSE.
+    patchelf
+    curl
+    appimage-run
+
+    # Кросс-компиляция под Windows (make windows): zig как линкер для windows-gnu.
+    cargo-zigbuild
+    zig
   ];
 
   # Указываем X11 бэкенд явно
