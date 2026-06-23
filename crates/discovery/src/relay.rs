@@ -82,7 +82,10 @@ pub fn service_addr(base_addr: &str) -> io::Result<String> {
         .trim()
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "неверный порт"))?;
-    Ok(format!("{}:{}", host.trim(), base + RELAY_PORT_OFFSET))
+    let svc = base.checked_add(RELAY_PORT_OFFSET).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "базовый порт слишком велик (переполнение)")
+    })?;
+    Ok(format!("{}:{}", host.trim(), svc))
 }
 
 // ─── Сервер (роль публичного узла) ──────────────────────────────────────────────

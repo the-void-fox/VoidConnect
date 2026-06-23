@@ -5,11 +5,13 @@ use eframe::egui;
 use egui::{Button, Frame, RichText, ScrollArea, TextEdit};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::{DnsInfo, SiteInfo};
+use crate::backend::{DnsInfo, MirrorCmd, SiteInfo};
 
 pub struct SitesPage {
     /// Канал GUI → backend: опубликовать каталог как сайт (путь, имя).
     pub publish_tx:     Option<UnboundedSender<(PathBuf, String)>>,
+    /// Канал GUI → backend: зеркалировать / убрать из кэша сайт.
+    pub mirror_tx:      Option<UnboundedSender<MirrorCmd>>,
     /// Снимок списка сайтов из backend.
     pub sites:          Option<Arc<Mutex<Vec<SiteInfo>>>>,
     /// Снимок имён внутреннего DNS (.void) из backend.
@@ -27,6 +29,7 @@ impl Default for SitesPage {
     fn default() -> Self {
         Self {
             publish_tx:     None,
+            mirror_tx:      None,
             sites:          None,
             dns_names:      None,
             site_http_port: 0,
@@ -140,6 +143,7 @@ impl SitesPage {
         // ── Список сайтов ───────────────────────────────────────────────────
         let search = self.search.to_lowercase();
         let mut open_url: Option<String> = None;
+        let mut mirror_action: Option<MirrorCmd> = None;
 
         ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             if self.snapshot.is_empty() {
@@ -187,6 +191,31 @@ impl SitesPage {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(Button::new("󰖟  Открыть")).clicked() {
                                 open_url = Some(site.url.clone());
+                            }
+                            // Кэширование (зеркалирование) — только для чужих сайтов;
+                            // свои мы и так раздаём.
+                            if !site.is_mine {
+                                if site.is_mirrored {
+                                    if ui
+                                        .add(Button::new(
+                                            RichText::new("\u{F05E0}  В кэше")
+                                                .color(egui::Color32::from_rgb(80, 180, 100)),
+                                        ))
+                                        .on_hover_text("Перестать кэшировать (удалит локальную копию)")
+                                        .clicked()
+                                    {
+                                        mirror_action = Some(MirrorCmd::Unmirror(site.name.clone()));
+                                    }
+                                } else if ui
+                                    .add(Button::new("\u{F0867}  Кэшировать"))
+                                    .on_hover_text(
+                                        "Скачать копию сайта и помогать его раздавать — \
+                                         сайт останется доступен, даже когда владелец офлайн",
+                                    )
+                                    .clicked()
+                                {
+                                    mirror_action = Some(MirrorCmd::Mirror(site.name.clone()));
+                                }
                             }
                         });
                     });
@@ -242,6 +271,11 @@ impl SitesPage {
 
         if let Some(url) = open_url {
             Self::open(&url);
+        }
+        if let Some(cmd) = mirror_action {
+            if let Some(tx) = &self.mirror_tx {
+                let _ = tx.send(cmd);
+            }
         }
     }
 }

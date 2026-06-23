@@ -10,7 +10,11 @@ use tokio_tungstenite::{
 use crate::error::NetworkError;
 
 /// Тип транспорта — TCP или WebSocket.
-/// Оба поддерживаются одновременно: TCP для p2p в LAN, WS для bootstrap-узлов.
+///
+/// ПРИМЕЧАНИЕ: этот транспорт — часть незадействованного слоя (см. доки крейта
+/// в `lib.rs`). Работающий bootstrap использует НЕ его, а собственный
+/// length-prefixed JSON-протокол в `void-discovery`. WS здесь реализован, но
+/// нигде не подключён.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
     Tcp,

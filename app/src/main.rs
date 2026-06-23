@@ -92,10 +92,11 @@ async fn main() -> anyhow::Result<()> {
     let mut rx = chat.subscribe();
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
-            println!("\r[{}] <{}> {}",
+            println!("\r[{}] #{} <{}> {}",
                 chrono::DateTime::from_timestamp(msg.timestamp, 0)
                     .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%H:%M:%S").to_string())
                     .unwrap_or_default(),
+                msg.channel,
                 msg.from_name,
                 msg.text
             );
@@ -143,7 +144,8 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        if let Err(e) = chat.send(text).await {
+        // Канал по умолчанию — тот же, что использует GUI и default_channel().
+        if let Err(e) = chat.send("global".to_string(), text).await {
             warn!("Failed to send: {}", e);
         }
     }

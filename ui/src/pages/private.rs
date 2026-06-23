@@ -9,6 +9,7 @@ use void_core::peer::{PeerInfo, PeerProfile};
 use void_chat::private_chat::{DmSendCmd, IncomingDm};
 use void_crypto::keys::EncryptionKeypair;
 use crate::widgets::peer_popup::status_colors;
+use crate::backend::DeliveryState;
 
 // ── Модели ────────────────────────────────────────────────────────────────────
 
@@ -17,6 +18,8 @@ pub struct UiMessage {
     pub text:       String,
     pub time:       String,
     pub is_me:      bool,
+    /// Статус доставки исходящего сообщения. `None` — для входящих и истории.
+    pub delivery:   Option<DeliveryState>,
 }
 
 pub struct Conversation {
@@ -92,6 +95,7 @@ impl PrivatePage {
                     text,
                     time: fmt_ts(ts),
                     is_me,
+                    delivery: None, // история с диска — без живого статуса
                 })
                 .collect();
             ui_msgs.sort_by_key(|_| 0i64); // уже отсортированы по timestamp из decrypt_messages
@@ -160,6 +164,7 @@ impl PrivatePage {
                     text:       dm.plaintext,
                     time,
                     is_me:      false,
+                    delivery:   None,
                 });
             }
         } else {
@@ -178,9 +183,24 @@ impl PrivatePage {
                 text:       dm.plaintext,
                 time,
                 is_me:      false,
+                delivery:   None,
             });
             self.conversations.push(conv);
         }
+    }
+
+    /// Применяет статус доставки к своему сообщению по message_id.
+    /// Возвращает `true`, если сообщение найдено (статус можно считать применённым).
+    pub fn apply_delivery(&mut self, message_id: &str, state: DeliveryState) -> bool {
+        for conv in &mut self.conversations {
+            if let Some(m) = conv.messages.iter_mut()
+                .find(|m| m.is_me && m.message_id == message_id)
+            {
+                m.delivery = Some(state);
+                return true;
+            }
+        }
+        false
     }
 
     /// Обновляет имена пиров в беседах если они изменились.
@@ -388,9 +408,9 @@ impl PrivatePage {
                 .show(ui, |ui| {
                     let len = self.conversations[selected].messages.len();
                     for idx in 0..len {
-                        let (text, time, is_me) = {
+                        let (text, time, is_me, delivery) = {
                             let m = &self.conversations[selected].messages[idx];
-                            (m.text.clone(), m.time.clone(), m.is_me)
+                            (m.text.clone(), m.time.clone(), m.is_me, m.delivery)
                         };
                         let sender = if is_me { self.my_name.clone() } else { peer_name.clone() };
                         let (avatar, fill) = if is_me {
@@ -398,7 +418,7 @@ impl PrivatePage {
                         } else {
                             (peer_avatar.as_deref(), status_colors(peer_status.as_deref()).0)
                         };
-                        render_message(ui, &text, &time, is_me, &sender, avatar, fill);
+                        render_message(ui, &text, &time, is_me, &sender, avatar, fill, delivery);
                         ui.add_space(8.0);
                     }
 
@@ -534,6 +554,7 @@ impl PrivatePage {
             text:       text.clone(),
             time:       chrono::Local::now().format("%H:%M").to_string(),
             is_me:      true,
+            delivery:   Some(DeliveryState::Sending),
         });
         conv.last_message = text.chars().take(40).collect();
         if conv.was_at_bottom { conv.scroll_to_bottom = true; }
@@ -572,6 +593,7 @@ fn render_message(
     sender: &str,
     avatar: Option<&str>,
     avatar_fill: egui::Color32,
+    delivery: Option<DeliveryState>,
 ) {
     let bubble = Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8.0))
@@ -604,6 +626,20 @@ fn render_message(
                         egui::RichText::new(time).small()
                             .color(ui.visuals().weak_text_color()),
                     );
+                    // Индикатор доставки — только для своих сообщений.
+                    if let Some(state) = delivery {
+                        let (glyph, color, hint) = match state {
+                            DeliveryState::Sending =>
+                                ("󰔟", ui.visuals().weak_text_color(), "Отправляется…"),
+                            DeliveryState::Delivered =>
+                                ("󰄬", egui::Color32::from_rgb(80, 180, 80), "Доставлено"),
+                            DeliveryState::Failed =>
+                                ("󰀪", egui::Color32::from_rgb(210, 90, 70), "Не доставлено"),
+                        };
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(glyph).small().color(color))
+                            .on_hover_text(hint);
+                    }
                 });
                 ui.add_space(4.0);
                 ui.label(text);

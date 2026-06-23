@@ -5,25 +5,41 @@ pub fn show_status_bar(
     peer_count: usize,
     my_addr: &str,
     local_mode: bool,
+    public_mode: bool,
+    has_bootstrap: bool,
     reachable: Option<bool>,
 ) {
     ui.horizontal(|ui| {
         ui.add_space(8.0);
 
-        // Network mode badge
-        if local_mode {
-            ui.label(
-                egui::RichText::new("󰍹 Local")
-                    .small()
-                    .color(egui::Color32::from_rgb(220, 160, 40)),
-            );
+        // Индикатор режима сети — должен отражать реальный режим backend.
+        let (badge, badge_color, badge_hint): (&str, egui::Color32, &str) = if local_mode {
+            (
+                "󰍹 Local",
+                egui::Color32::from_rgb(220, 160, 40),
+                "Локальный режим (--local): только loopback, без выхода в сеть.",
+            )
+        } else if public_mode {
+            (
+                "󰒍 Public",
+                egui::Color32::from_rgb(80, 180, 80),
+                "Публичный режим: узел работает как bootstrap/relay для глобальной сети.",
+            )
+        } else if has_bootstrap {
+            (
+                "󰖟 Global",
+                egui::Color32::from_rgb(80, 180, 80),
+                "Подключены к глобальной сети через bootstrap-узлы.",
+            )
         } else {
-            ui.label(
-                egui::RichText::new("󰛳 LAN")
-                    .small()
-                    .color(egui::Color32::from_rgb(80, 180, 80)),
-            );
-        }
+            (
+                "󰛳 LAN",
+                egui::Color32::from_rgb(80, 180, 80),
+                "Только локальная сеть (LAN): bootstrap-узлы не заданы.",
+            )
+        };
+        ui.label(egui::RichText::new(badge).small().color(badge_color))
+            .on_hover_text(badge_hint);
         ui.separator();
 
         // Peer count
@@ -43,24 +59,33 @@ pub fn show_status_bar(
         // My address
         ui.label(egui::RichText::new(my_addr).small().weak());
 
-        // Предупреждение о заблокированных портах (входящие недоступны извне).
+        // Прямой доступ извне не подтверждён. Это не гарантия «портов закрыто»:
+        // обратная проба бьёт по базовому порту, а при symmetric NAT внешний
+        // порт может отличаться — возможны ложные срабатывания. Поэтому
+        // формулировка мягкая, а доставка всё равно идёт через relay.
         if reachable == Some(false) {
             ui.separator();
             ui.label(
-                egui::RichText::new("\u{F0026} порты закрыты")
+                egui::RichText::new("\u{F0026} прямой доступ не подтверждён")
                     .small()
                     .strong()
                     .color(egui::Color32::from_rgb(220, 150, 60)),
             )
             .on_hover_text(
-                "Bootstrap-узел не смог подключиться к вам: входящие соединения \
-                 блокируются (провайдер/файрвол/NAT). Подробнее — на странице «Профиль».",
+                "Bootstrap-узел не смог подключиться к вам напрямую (провайдер/файрвол/\
+                 symmetric NAT). Сообщения и файлы пойдут через relay. Проба проверяет \
+                 совпадение внешнего и внутреннего порта, поэтому возможны ложные \
+                 срабатывания. Подробнее — на странице «Профиль».",
             );
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("Void Connect v0.1.0").small().weak());
+            ui.label(
+                egui::RichText::new(concat!("Void Connect v", env!("CARGO_PKG_VERSION")))
+                    .small()
+                    .weak(),
+            );
         });
     });
 }

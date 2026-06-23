@@ -14,7 +14,7 @@ use tokio::net::{
     TcpListener, TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -77,8 +77,12 @@ pub struct DmSendCmd {
 
 // ── Внутреннее состояние ──────────────────────────────────────────────────────
 
+/// Пакет на отправку + одноразовый канал подтверждения фактической записи в
+/// сокет. `true` = записано, `false`/закрытие = соединение мертво (нужен fallback).
+type FwdItem = (DmPacket, oneshot::Sender<bool>);
+
 struct PeerConn {
-    fwd_tx: mpsc::Sender<DmPacket>,
+    fwd_tx: mpsc::Sender<FwdItem>,
 }
 
 struct Inner {
@@ -183,7 +187,7 @@ async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
     handle.inner.known_pubkeys.lock().await
         .insert(peer_id.clone(), (their_enc_pub, peer_name.clone()));
 
-    let (fwd_tx, fwd_rx) = mpsc::channel::<DmPacket>(64);
+    let (fwd_tx, fwd_rx) = mpsc::channel::<FwdItem>(64);
     handle.inner.connections.lock().await
         .insert(peer_id.clone(), PeerConn { fwd_tx });
 
@@ -236,14 +240,26 @@ impl PrivateChatHandle {
             timestamp:      chrono::Utc::now().timestamp(),
         };
 
-        // Пробуем существующее соединение (в т.ч. ранее поднятый relay-туннель)
-        {
+        // Пробуем существующее соединение (в т.ч. ранее поднятый relay-туннель).
+        // Берём отправитель под локом и СРАЗУ освобождаем лок: держать его на время
+        // await нельзя — cleanup соединения (`run_conn_tasks`) тоже берёт
+        // `connections.lock()`, иначе возможен дедлок.
+        let existing = {
             let conns = self.inner.connections.lock().await;
-            if let Some(conn) = conns.get(&cmd.to) {
-                if conn.fwd_tx.send(pkt.clone()).await.is_ok() {
+            conns.get(&cmd.to).map(|c| c.fwd_tx.clone())
+        };
+        if let Some(fwd_tx) = existing {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            // Ok из send() лишь подтверждает постановку в очередь; доставку
+            // подтверждает ack из write-задачи (фактическая запись в сокет).
+            if fwd_tx.send((pkt.clone(), ack_tx)).await.is_ok() {
+                if let Ok(true) = ack_rx.await {
                     return Ok(());
                 }
             }
+            // Соединение мертво (очередь закрыта или запись не удалась) — выбрасываем
+            // его из кэша и пробуем заново прямой дозвон, а выше по стеку — relay.
+            self.inner.connections.lock().await.remove(&cmd.to);
         }
 
         // Устанавливаем новое исходящее соединение (прямое)
@@ -313,7 +329,7 @@ impl PrivateChatHandle {
         // Отправляем первый пакет
         write_dm_pkt(&mut wr, &first_pkt).await?;
 
-        let (fwd_tx, fwd_rx) = mpsc::channel::<DmPacket>(64);
+        let (fwd_tx, fwd_rx) = mpsc::channel::<FwdItem>(64);
         self.inner.connections.lock().await
             .insert(to.clone(), PeerConn { fwd_tx });
 
@@ -351,7 +367,7 @@ async fn run_conn_tasks(
     their_enc_pub: [u8; 32],
     mut rd:        OwnedReadHalf,
     mut wr:        OwnedWriteHalf,
-    mut fwd_rx:    mpsc::Receiver<DmPacket>,
+    mut fwd_rx:    mpsc::Receiver<FwdItem>,
 ) {
     let inner_r = Arc::clone(&inner);
     let pid_r   = peer_id.clone();
@@ -376,8 +392,13 @@ async fn run_conn_tasks(
     let _their_enc_pub = their_enc_pub; // подавляем предупреждение
 
     let write_task = tokio::spawn(async move {
-        while let Some(pkt) = fwd_rx.recv().await {
-            if write_dm_pkt(&mut wr, &pkt).await.is_err() {
+        while let Some((pkt, ack)) = fwd_rx.recv().await {
+            // Подтверждаем отправителю РЕЗУЛЬТАТ фактической записи в сокет, а не
+            // только постановки в очередь — иначе разорванное соединение тихо
+            // съедало бы DM, не давая сработать fallback через relay.
+            let ok = write_dm_pkt(&mut wr, &pkt).await.is_ok();
+            let _ = ack.send(ok);
+            if !ok {
                 break;
             }
         }

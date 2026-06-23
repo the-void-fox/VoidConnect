@@ -1,5 +1,5 @@
-target
-dist
+target/
+dist/
 
 # Локальная dev-БД для генерации sqlx offline-кэша (.sqlx коммитим, БД — нет)
 crates/db/.dev.db

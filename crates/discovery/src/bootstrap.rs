@@ -92,7 +92,10 @@ pub fn service_addr(base_addr: &str) -> io::Result<String> {
         .trim()
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "неверный порт"))?;
-    Ok(format!("{}:{}", host.trim(), base + BOOTSTRAP_PORT_OFFSET))
+    let svc = base.checked_add(BOOTSTRAP_PORT_OFFSET).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "базовый порт слишком велик (переполнение)")
+    })?;
+    Ok(format!("{}:{}", host.trim(), svc))
 }
 
 // ─── Сервер (роль bootstrap-узла) ─────────────────────────────────────────────
@@ -135,9 +138,22 @@ async fn handle_bootstrap_client(
 
     // Шаг 1: читаем Hello и регистрируем новичка (только реальные узлы).
     let mut probe_port: Option<u16> = None;
-    if let BootstrapMsg::Hello { peer } = read_msg(&mut stream).await? {
+    if let BootstrapMsg::Hello { mut peer } = read_msg(&mut stream).await? {
         if peer.id.as_str().len() == REAL_ID_LEN {
-            debug!("Bootstrap: registered peer {} ({})", peer.name, peer.id);
+            // NAT-traversal: узел рекламирует свой LAN-адрес, но из другой сети он
+            // недостижим. Подменяем приватный/loopback ip на ВНЕШНИЙ (источник
+            // TCP-соединения, как его видит bootstrap), чтобы остальные пиры могли
+            // подключиться к узлу напрямую (если порт открыт/проброшен) и не гонять
+            // трафик через relay. Публичный (маршрутизируемый) адрес не трогаем.
+            if looks_private(peer.ip) {
+                if let Some(src) = src_ip {
+                    if peer.ip != src {
+                        debug!("Bootstrap: внешний адрес {} → {} для {}", peer.ip, src, peer.name);
+                    }
+                    peer.ip = src;
+                }
+            }
+            debug!("Bootstrap: registered peer {} ({}) at {}", peer.name, peer.id, peer.ip);
             probe_port = Some(peer.port);
             peer_list.upsert(peer).await;
         }
@@ -159,6 +175,17 @@ async fn handle_bootstrap_client(
         .collect();
     peers.push(my_peer);
     write_msg(&mut stream, &BootstrapMsg::Peers { peers, reachable }).await
+}
+
+/// «Похож на приватный/локальный» адрес — недостижим из другой сети, поэтому
+/// bootstrap заменяет его на внешний (источник TCP-соединения).
+fn looks_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
 }
 
 /// Пробует за короткий таймаут подключиться к `ip:port`. `true` — порт принимает
@@ -349,6 +376,27 @@ mod tests {
         assert_eq!(learned, 2, "C узнаёт A и B");
         assert!(pl_c.get(&a.id).await.is_some(), "C знает A");
         assert!(pl_c.get(&b.id).await.is_some(), "C знает B (через bootstrap)");
+    }
+
+    /// NAT-traversal: bootstrap подменяет приватный LAN-адрес клиента на его
+    /// внешний (источник соединения), чтобы другие узлы подключались напрямую.
+    #[tokio::test]
+    async fn exchange_stamps_external_ip() {
+        let a = peer(1, free_port());
+        let svc_port = free_port();
+        let pl_a = PeerList::new();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let svc = format!("127.0.0.1:{svc_port}");
+
+        // B рекламирует «LAN»-адрес 10.0.0.5, но подключается с 127.0.0.1.
+        let mut b = peer(2, free_port());
+        b.ip = "10.0.0.5".parse().unwrap();
+        bootstrap_exchange(&b, &PeerList::new(), &svc).await.unwrap();
+
+        let stored = pl_a.get(&b.id).await.expect("A зарегистрировал B");
+        assert_eq!(stored.ip.to_string(), "127.0.0.1",
+            "приватный адрес должен быть заменён на внешний (источник соединения)");
     }
 
     /// Повторный обмен не считает уже известных пиров новыми.

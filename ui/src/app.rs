@@ -127,6 +127,7 @@ impl VoidApp {
         // Страница сайтов: канал публикации + список сайтов + имена .void.
         let mut sites = SitesPage::default();
         sites.publish_tx     = Some(backend.publish_site_tx.clone());
+        sites.mirror_tx      = Some(backend.mirror_tx.clone());
         sites.sites          = Some(std::sync::Arc::clone(&backend.sites));
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
@@ -160,6 +161,7 @@ impl eframe::App for VoidApp {
         self.load_chat_history_once();
         self.poll_chat();
         self.poll_private_chat();
+        self.poll_dm_status();
         self.refresh_peers();
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -173,13 +175,17 @@ impl eframe::App for VoidApp {
 
         let peer_count = self.peer_count;
         let local_mode = self.backend.local_mode;
+        let public_mode = self.backend.bootstrap;
+        let has_bootstrap = self.backend.has_bootstrap;
         let reachable  = self.profile.port_reachable;
         let my_addr    = format!("{} ({}:{})",
             self.profile.name, self.backend.my_ip, self.backend.base_port);
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(26.0)
             .show(ctx, |ui| {
-                crate::widgets::status_bar::show_status_bar(ui, peer_count, &my_addr, local_mode, reachable);
+                crate::widgets::status_bar::show_status_bar(
+                    ui, peer_count, &my_addr, local_mode, public_mode, has_bootstrap, reachable,
+                );
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -302,6 +308,32 @@ impl VoidApp {
 
         for dm in messages {
             self.private.receive_dm(dm);
+        }
+    }
+
+    /// Применяем статусы доставки исходящих DM и убираем терминальные записи,
+    /// чтобы карта статусов не росла бесконечно.
+    fn poll_dm_status(&mut self) {
+        let updates: Vec<(String, crate::backend::DeliveryState)> = {
+            let map = self.backend.dm_status.lock().unwrap();
+            if map.is_empty() { return; }
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        let mut terminal: Vec<String> = Vec::new();
+        for (mid, state) in updates {
+            self.private.apply_delivery(&mid, state);
+            if matches!(
+                state,
+                crate::backend::DeliveryState::Delivered | crate::backend::DeliveryState::Failed
+            ) {
+                terminal.push(mid);
+            }
+        }
+        if !terminal.is_empty() {
+            let mut map = self.backend.dm_status.lock().unwrap();
+            for mid in terminal {
+                map.remove(&mid);
+            }
         }
     }
 
@@ -440,8 +472,24 @@ impl VoidApp {
         });
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let online_color = egui::Color32::from_rgb(80, 200, 80);
-            ui.label(egui::RichText::new("● Online").color(online_color));
+            // Индикатор должен отражать реальное наличие связи, а не быть зашитым.
+            let (dot, label, color, hint) = if self.peer_count > 0 {
+                (
+                    "●",
+                    "В сети",
+                    egui::Color32::from_rgb(80, 200, 80),
+                    format!("Известно узлов: {}", self.peer_count),
+                )
+            } else {
+                (
+                    "○",
+                    "Нет связи",
+                    egui::Color32::from_rgb(180, 130, 60),
+                    "Ни одного узла не обнаружено.".to_string(),
+                )
+            };
+            ui.label(egui::RichText::new(format!("{} {}", dot, label)).color(color))
+                .on_hover_text(hint);
             ui.add_space(8.0);
         });
     }

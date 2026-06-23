@@ -309,17 +309,33 @@ impl PublicChat {
     /// Объявляет наш сайт сети: запоминает его и рассылает всем (клиентам — если
     /// мы релей; релею — если мы клиент). Релей форвардит объявление остальным.
     pub async fn announce_site(&self, manifest: SiteManifest) {
-        let merged = self.merge_site(manifest.clone()).await.unwrap_or(manifest);
-        self.broadcast_site(merged).await;
+        // Это НАШ сайт — всегда регистрируем его локально (даже если имя занял
+        // кто-то ещё) и рассылаем. Перехват у нас не работает: чужие узлы
+        // применяют first-owner-wins в `merge_site` и наш манифест на чужое имя
+        // отклонят.
+        self.inner.sites.lock().await
+            .insert(manifest.name.clone(), manifest.clone());
+        self.broadcast_site(manifest).await;
     }
 
-    /// Объединяет входящий манифест сайта с известным по имени. Возвращает
-    /// `Some`, если это новый сайт или более свежая версия (по `created_at`),
-    /// иначе `None` (дедуп — гасит петли форвардинга).
+    /// Объединяет входящий (из сети) манифест сайта с известным по имени.
+    /// Возвращает `Some`, если это новый сайт или более свежая версия того же
+    /// владельца (по `created_at`), иначе `None` (дедуп / отказ в перехвате).
     async fn merge_site(&self, incoming: SiteManifest) -> Option<SiteManifest> {
         let mut map = self.inner.sites.lock().await;
         match map.get(&incoming.name) {
+            // Тот же контент — дедуп (гасит петли форвардинга).
             Some(existing) if existing.site_id == incoming.site_id => None,
+            // Имя уже принадлежит ДРУГОМУ владельцу — не даём перехватить его
+            // чужим манифестом (first-owner-wins, защита от подмены имени).
+            Some(existing) if existing.owner != incoming.owner => {
+                warn!(
+                    "Сайт '{}' уже принадлежит {} — игнорирую манифест от {}",
+                    incoming.name, existing.owner, incoming.owner
+                );
+                None
+            }
+            // Более старая версия того же владельца — игнорируем.
             Some(existing) if existing.created_at > incoming.created_at => None,
             _ => {
                 map.insert(incoming.name.clone(), incoming.clone());

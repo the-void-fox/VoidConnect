@@ -10,7 +10,7 @@ use void_core::dns::{DnsKind, DnsRecord};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
 use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip};
-use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd};
+use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd, PrivateChatHandle};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
@@ -48,6 +48,8 @@ pub struct SiteInfo {
     pub size_bytes: i64,
     /// Опубликован нами.
     pub is_mine:    bool,
+    /// Мы держим кэш-копию (зеркало) сайта и помогаем его раздавать.
+    pub is_mirrored: bool,
     /// Локальный URL для открытия в браузере.
     pub url:        String,
 }
@@ -144,6 +146,15 @@ impl DnsService {
     }
 }
 
+/// Команда GUI → backend для зеркалирования (кэширования) чужого сайта.
+#[derive(Clone, Debug)]
+pub enum MirrorCmd {
+    /// Закэшировать сайт целиком и стать его сидером (по имени сайта).
+    Mirror(String),
+    /// Перестать кэшировать сайт: убрать из набора и стереть его файлы.
+    Unmirror(String),
+}
+
 /// Команда GUI → backend для управления скачиванием файла.
 #[derive(Clone, Debug)]
 pub enum DownloadCmd {
@@ -164,6 +175,71 @@ struct Reputation {
     reports: ReportManager,
     /// Наш ключ подписи — для создания подписанных жалоб.
     keypair: Arc<SigningKeypair>,
+}
+
+/// Состояние доставки исходящего личного сообщения (для индикации в UI).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeliveryState {
+    /// Отправляется / стоит в очереди на повтор.
+    Sending,
+    /// Подтверждена запись получателю (прямо или через relay).
+    Delivered,
+    /// Не доставлено после всех попыток.
+    Failed,
+}
+
+/// Смещение порта DM-сервера относительно базового порта узла (base + 3).
+const DM_PORT_OFFSET: u16 = 3;
+/// Период повторной попытки доставки недоставленного DM.
+const DM_RETRY_SECS: u64 = 15;
+/// Максимум попыток доставки, после чего DM помечается как Failed.
+const DM_MAX_ATTEMPTS: u32 = 20;
+
+/// Недоставленное личное сообщение в очереди на повтор.
+struct PendingDm {
+    cmd:      DmSendCmd,
+    attempts: u32,
+    next_at:  std::time::Instant,
+}
+
+/// Записать статус доставки DM (для опроса из GUI).
+fn set_dm_status(
+    map: &Arc<Mutex<HashMap<String, DeliveryState>>>,
+    message_id: &str,
+    state: DeliveryState,
+) {
+    map.lock().unwrap().insert(message_id.to_string(), state);
+}
+
+/// Одна попытка доставки DM: сначала прямое соединение (`send_dm`), затем
+/// fallback через все известные relay. Возвращает `true`, если доставлено.
+async fn try_deliver_dm(
+    dm_h:      &PrivateChatHandle,
+    relay_set: &Arc<Mutex<HashSet<String>>>,
+    my_id:     &NodeId,
+    cmd:       &DmSendCmd,
+) -> bool {
+    // send_dm переиспользует уже поднятое соединение (в т.ч. relay-туннель),
+    // иначе пытается прямой дозвон.
+    if dm_h.send_dm(cmd.clone()).await.is_ok() {
+        return true;
+    }
+    // Снимок текущих relay-адресов (статические + узнанные по gossip).
+    let relay_addrs: Vec<String> = { relay_set.lock().unwrap().iter().cloned().collect() };
+    for raddr in &relay_addrs {
+        match void_discovery::relay::open_tunnel(raddr, my_id, &cmd.to).await {
+            Ok(stream) => {
+                if let Err(e) = dm_h.send_dm_over_stream(cmd.clone(), stream).await {
+                    tracing::debug!("DM через relay {} не прошёл: {}", raddr, e);
+                } else {
+                    tracing::info!("DM доставлено через relay {}", raddr);
+                    return true;
+                }
+            }
+            Err(e) => tracing::debug!("relay {} недоступен: {}", raddr, e),
+        }
+    }
+    false
 }
 
 pub struct BackendHandle {
@@ -191,6 +267,8 @@ pub struct BackendHandle {
     pub dm_inbox:      Arc<Mutex<VecDeque<IncomingDm>>>,
     /// Канал GUI → backend: отправить DM пиру
     pub dm_sender:     tokio::sync::mpsc::UnboundedSender<DmSendCmd>,
+    /// Статус доставки исходящих DM: message_id → состояние. Опрашивается GUI.
+    pub dm_status:     Arc<Mutex<HashMap<String, DeliveryState>>>,
     /// История общего чата, загруженная из БД при старте.
     /// `None` пока бэкенд не загрузил; GUI забирает её один раз (`take`).
     pub chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>,
@@ -208,8 +286,12 @@ pub struct BackendHandle {
     pub report_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, ReportReason)>,
     /// Запущены ли мы в публичном (bootstrap) режиме.
     pub bootstrap: bool,
+    /// Подключены ли мы к глобальной сети как клиент (заданы bootstrap-узлы).
+    pub has_bootstrap: bool,
     /// Канал GUI → backend: опубликовать сайт (каталог, имя).
     pub publish_site_tx: tokio::sync::mpsc::UnboundedSender<(PathBuf, String)>,
+    /// Канал GUI → backend: зеркалировать / убрать из кэша сайт (по имени).
+    pub mirror_tx: tokio::sync::mpsc::UnboundedSender<MirrorCmd>,
     /// Снимок списка сайтов (обновляется бэкендом).
     pub sites: Arc<Mutex<Vec<SiteInfo>>>,
     /// Порт локального HTTP-сервера сайтов (base_port + 4).
@@ -237,6 +319,7 @@ pub fn start_backend(
     let peers:         Arc<Mutex<Vec<PeerInfo>>>                  = Arc::new(Mutex::new(Vec::new()));
     let peer_profiles: Arc<Mutex<HashMap<NodeId, PeerProfile>>>  = Arc::new(Mutex::new(HashMap::new()));
     let dm_inbox:      Arc<Mutex<VecDeque<IncomingDm>>>          = Arc::new(Mutex::new(VecDeque::new()));
+    let dm_status:     Arc<Mutex<HashMap<String, DeliveryState>>> = Arc::new(Mutex::new(HashMap::new()));
     let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
     let storage_files: Arc<Mutex<Vec<StorageFileInfo>>>         = Arc::new(Mutex::new(Vec::new()));
     let peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>       = Arc::new(Mutex::new(HashMap::new()));
@@ -251,6 +334,7 @@ pub fn start_backend(
     let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel::<DownloadCmd>();
     let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(NodeId, ReportReason)>();
     let (publish_site_tx, publish_site_rx) = tokio::sync::mpsc::unbounded_channel::<(PathBuf, String)>();
+    let (mirror_tx,  mirror_rx)  = tokio::sync::mpsc::unbounded_channel::<MirrorCmd>();
     let sites: Arc<Mutex<Vec<SiteInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let dns_names: Arc<Mutex<Vec<DnsInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let site_http_port = base_port + 4;
@@ -282,6 +366,7 @@ pub fn start_backend(
     let peers_bg    = Arc::clone(&peers);
     let profiles_bg = Arc::clone(&peer_profiles);
     let dm_inbox_bg = Arc::clone(&dm_inbox);
+    let dm_status_bg = Arc::clone(&dm_status);
     let enc_kp_bg   = Arc::clone(&enc_kp);
     let sign_kp_bg  = Arc::clone(&sign_kp);
     let history_bg  = Arc::clone(&chat_history);
@@ -293,19 +378,23 @@ pub fn start_backend(
 
     let downloads_dir = data_dir.join("downloads");
 
+    // Подключены ли мы к глобальной сети как клиент (заданы bootstrap-узлы).
+    // Захватываем до move в фоновый поток.
+    let has_bootstrap = !bootstrap_addrs.is_empty();
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async move {
             backend_main(
                 my_peer, base_port, local_mode, public_mode, bootstrap_addrs,
-                inbox_bg, peers_bg, profiles_bg, dm_inbox_bg,
+                inbox_bg, peers_bg, profiles_bg, dm_inbox_bg, dm_status_bg,
                 enc_kp_bg, sign_kp_bg, dm_port,
                 chat_rx, connect_rx, profile_rx, dm_rx,
                 data_dir, history_bg,
                 publish_rx, download_rx, storage_bg,
                 reputation_bg, report_rx,
                 publish_site_rx, sites_bg, site_http_port,
-                dns_bg, reach_bg,
+                dns_bg, reach_bg, mirror_rx,
             ).await;
         });
     });
@@ -326,6 +415,7 @@ pub fn start_backend(
         local_mode,
         my_enc_kp:     enc_kp,
         dm_inbox,
+        dm_status,
         dm_sender: dm_tx,
         chat_history,
         publish_tx,
@@ -335,7 +425,9 @@ pub fn start_backend(
         peer_reputation,
         report_tx,
         bootstrap: public_mode,
+        has_bootstrap,
         publish_site_tx,
+        mirror_tx,
         sites,
         site_http_port,
         dns_names,
@@ -356,6 +448,7 @@ async fn backend_main(
     peers_out:   Arc<Mutex<Vec<PeerInfo>>>,
     profiles_out: Arc<Mutex<HashMap<NodeId, PeerProfile>>>,
     dm_inbox:    Arc<Mutex<VecDeque<IncomingDm>>>,
+    dm_status:   Arc<Mutex<HashMap<String, DeliveryState>>>,
     enc_kp:      Arc<EncryptionKeypair>,
     sign_kp:     Arc<SigningKeypair>,
     dm_port:     u16,
@@ -375,6 +468,7 @@ async fn backend_main(
     site_http_port: u16,
     dns_out: Arc<Mutex<Vec<DnsInfo>>>,
     reachability_out: Arc<Mutex<void_discovery::bootstrap::Reachability>>,
+    mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -524,6 +618,19 @@ async fn backend_main(
                 tracing::error!("Bootstrap server failed on {}: {}", bport, e);
             }
         });
+    } else if !local_mode {
+        // Не публичный режим, но в LAN/глобальной сети: best-effort пробуем
+        // UPnP-проброс наших рабочих портов (чанки/чат/DM/сайты). В паре со
+        // штамповкой внешнего адреса на bootstrap это даёт прямое подключение к
+        // нам из других сетей (если роутер поддерживает UPnP) — без relay.
+        // Неудача (нет UPnP-шлюза) игнорируется молча.
+        let ip = my_peer.ip;
+        tokio::spawn(async move {
+            let ports = [base_port, base_port + 2, base_port + 3, base_port + 4];
+            if void_discovery::nat::map_ports(ip, &ports, "Void Connect").await.is_some() {
+                tracing::info!("UPnP: рабочие порты проброшены на роутере");
+            }
+        });
     }
 
     // Ключ подписи нужен и DNS (заявка имён) — клонируем до передачи в чат.
@@ -586,6 +693,13 @@ async fn backend_main(
             loop { tokio::time::sleep(tokio::time::Duration::from_secs(60)).await; }
         }
     };
+
+    // Множество relay-адресов, на которых мы зарегистрированы. Сидируется
+    // статическими bootstrap-узлами и динамически пополняется адресами узлов,
+    // объявивших себя bootstrap'ами по gossip (см. периодическую задачу ниже).
+    // Читается fallback-доставкой DM.
+    let relay_set: Arc<Mutex<HashSet<String>>> =
+        Arc::new(Mutex::new(relay_addrs.iter().cloned().collect()));
 
     // Relay-клиент: регистрируемся на relay каждого известного bootstrap-узла и
     // принимаем входящие туннели — поток скармливаем DM-серверу как входящее
@@ -675,39 +789,60 @@ async fn backend_main(
     });
 
     // Задача: исходящие DM из GUI → DM handle. При неудаче прямого соединения
-    // (symmetric NAT) пробуем доставить через relay известных bootstrap-узлов.
+    // (symmetric NAT) пробуем relay известных bootstrap-узлов. Недоставленные
+    // ставим в очередь и периодически повторяем (пир мог быть офлайн), сообщая
+    // GUI статус доставки через `dm_status`.
     let dm_h = dm_handle.clone();
-    let dm_relay_addrs = relay_addrs.clone();
+    let dm_relay_set = Arc::clone(&relay_set);
     let dm_my_id = my_peer.id.clone();
+    let dm_status_loop = Arc::clone(&dm_status);
+    let dm_peer_list = peer_list.clone();
     tokio::spawn(async move {
-        while let Some(cmd) = dm_rx.recv().await {
-            let to = cmd.to.clone();
-            // send_dm переиспользует уже поднятое соединение (в т.ч. relay-туннель),
-            // иначе пытается прямой дозвон.
-            if dm_h.send_dm(cmd.clone()).await.is_ok() {
-                continue;
-            }
-            if dm_relay_addrs.is_empty() {
-                tracing::warn!("DM не доставлено: прямое соединение не удалось, relay не задан");
-                continue;
-            }
-            let mut sent = false;
-            for raddr in &dm_relay_addrs {
-                match void_discovery::relay::open_tunnel(raddr, &dm_my_id, &to).await {
-                    Ok(stream) => {
-                        if let Err(e) = dm_h.send_dm_over_stream(cmd.clone(), stream).await {
-                            tracing::debug!("DM через relay {} не прошёл: {}", raddr, e);
+        let mut retry_q: VecDeque<PendingDm> = VecDeque::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(DM_RETRY_SECS));
+        loop {
+            tokio::select! {
+                maybe_cmd = dm_rx.recv() => {
+                    let Some(cmd) = maybe_cmd else { break; }; // канал закрыт — выходим
+                    set_dm_status(&dm_status_loop, &cmd.message_id, DeliveryState::Sending);
+                    if try_deliver_dm(&dm_h, &dm_relay_set, &dm_my_id, &cmd).await {
+                        set_dm_status(&dm_status_loop, &cmd.message_id, DeliveryState::Delivered);
+                    } else {
+                        // Пир, возможно, офлайн — повторим позже.
+                        retry_q.push_back(PendingDm {
+                            cmd,
+                            attempts: 1,
+                            next_at: std::time::Instant::now()
+                                + std::time::Duration::from_secs(DM_RETRY_SECS),
+                        });
+                    }
+                }
+                _ = tick.tick() => {
+                    if retry_q.is_empty() { continue; }
+                    let now = std::time::Instant::now();
+                    let mut still: VecDeque<PendingDm> = VecDeque::new();
+                    while let Some(mut p) = retry_q.pop_front() {
+                        if p.next_at > now { still.push_back(p); continue; }
+                        // Переразрешаем адрес пира из peer_list — он мог смениться.
+                        if let Some(info) = dm_peer_list.get(&p.cmd.to).await {
+                            p.cmd.to_dm_addr =
+                                format!("{}:{}", info.ip, info.port.saturating_add(DM_PORT_OFFSET));
+                        }
+                        if try_deliver_dm(&dm_h, &dm_relay_set, &dm_my_id, &p.cmd).await {
+                            set_dm_status(&dm_status_loop, &p.cmd.message_id, DeliveryState::Delivered);
+                        } else if p.attempts >= DM_MAX_ATTEMPTS {
+                            tracing::warn!(
+                                "DM {} не доставлено после {} попыток",
+                                &p.cmd.message_id, p.attempts);
+                            set_dm_status(&dm_status_loop, &p.cmd.message_id, DeliveryState::Failed);
                         } else {
-                            tracing::info!("DM доставлено через relay {}", raddr);
-                            sent = true;
-                            break;
+                            p.attempts += 1;
+                            p.next_at = now + std::time::Duration::from_secs(DM_RETRY_SECS);
+                            still.push_back(p);
                         }
                     }
-                    Err(e) => tracing::debug!("relay {} недоступен: {}", raddr, e),
+                    retry_q = still;
                 }
-            }
-            if !sent {
-                tracing::warn!("DM не доставлено: ни прямое соединение, ни relay не сработали");
             }
         }
     });
@@ -752,6 +887,10 @@ async fn backend_main(
     let my_rep_id = my_peer.id.clone();
     let dns_snap = dns.clone();
     let rl_clean = rate_limiter.clone();
+    // Для динамической регистрации на relay узлов, узнанных по gossip.
+    let dm_for_relay = dm_handle.clone();
+    let relay_set_disc = Arc::clone(&relay_set);
+    let my_relay_id = my_peer.id.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         let mut prev_ids: HashSet<NodeId> = HashSet::new();
@@ -764,6 +903,41 @@ async fn backend_main(
                 let mut map = profiles_out.lock().unwrap();
                 for p in profiles {
                     map.insert(p.node_id.clone(), p);
+                }
+            }
+
+            // Динамическая регистрация на relay узлов, объявивших себя
+            // bootstrap'ами (узнаны по gossip профилей). Без этого fallback-DM
+            // покрывал лишь статически заданные bootstrap-адреса.
+            let bootstrap_ids: Vec<NodeId> = {
+                let map = profiles_out.lock().unwrap();
+                map.values()
+                    .filter(|p| p.is_bootstrap)
+                    .map(|p| p.node_id.clone())
+                    .collect()
+            };
+            for bid in bootstrap_ids {
+                if bid == my_relay_id { continue; } // не регистрируемся у самих себя
+                let Some(info) = pl.get(&bid).await else { continue; };
+                // только реальные узлы (64-hex), не stub-заглушки
+                if info.id.as_str().len() != 64 { continue; }
+                let Some(rport) = info.port.checked_add(void_discovery::relay::RELAY_PORT_OFFSET)
+                    else { continue; };
+                let raddr = format!("{}:{}", info.ip, rport);
+                let is_new = relay_set_disc.lock().unwrap().insert(raddr.clone());
+                if is_new {
+                    tracing::info!("Relay (gossip): регистрируюсь на {} ({})", raddr, info.name);
+                    let mut accepted = void_discovery::relay::start_relay_client(
+                        raddr.clone(), my_relay_id.clone(),
+                    );
+                    let dm_accept = dm_for_relay.clone();
+                    tokio::spawn(async move {
+                        while let Some((stream, from)) = accepted.recv().await {
+                            tracing::info!("Relay: входящий туннель от {}", from);
+                            let h = dm_accept.clone();
+                            tokio::spawn(async move { h.accept_stream(stream).await; });
+                        }
+                    });
                 }
             }
 
@@ -902,7 +1076,7 @@ async fn backend_main(
                     start_site_tasks(
                         manager.clone(), my_peer.id.clone(), site_http_port,
                         chat.clone(), Arc::clone(&sites_peers), dns.clone(),
-                        publish_site_rx, sites_out,
+                        publish_site_rx, sites_out, mirror_rx,
                     );
                     start_storage_tasks(
                         manager, pool, chat.clone(), peer_list.clone(),
@@ -938,9 +1112,22 @@ fn start_site_tasks(
     dns:        DnsService,
     mut publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
+    mut mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
 ) {
     let registry = SiteRegistry::new();
     let my_key = my_id.as_str().to_string();
+
+    // Набор зеркалируемых (кэшируемых нами) сайтов — переживает перезапуск.
+    let mirrored: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(load_mirrored_sites()));
+    // Клоны для задачи зеркалирования (создаём до того, как оригиналы уедут в
+    // другие задачи ниже).
+    let mirror_reg   = registry.clone();
+    let mirror_mgr   = manager.clone();
+    let mirror_chat  = chat.clone();
+    let mirror_peers = Arc::clone(&peers);
+    let mirror_out   = Arc::clone(&sites_out);
+    let mirror_key   = my_key.clone();
+    let mirror_set   = Arc::clone(&mirrored);
 
     // HTTP-сервер сайтов (peers — источник для докачки файлов сетевых сайтов).
     let srv_reg = registry.clone();
@@ -956,6 +1143,7 @@ fn start_site_tasks(
     let disc_reg  = registry.clone();
     let disc_out  = Arc::clone(&sites_out);
     let disc_key  = my_key.clone();
+    let disc_mirror = Arc::clone(&mirrored);
     let mut site_rx = chat.subscribe_sites();
     tokio::spawn(async move {
         loop {
@@ -964,7 +1152,7 @@ fn start_site_tasks(
                     tracing::info!("Обнаружен сайт в сети: '{}' ({} файлов)",
                         manifest.name, manifest.entries.len());
                     disc_reg.register(manifest).await;
-                    refresh_sites(&disc_reg, &disc_key, http_port, &disc_out).await;
+                    refresh_sites(&disc_reg, &disc_key, http_port, &disc_mirror, &disc_out).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
                     tracing::warn!("Site stream lagged by {}", k);
@@ -977,6 +1165,7 @@ fn start_site_tasks(
     // Публикация сайтов из GUI: публикуем файлы, объявляем их манифесты
     // (чтобы пиры могли докачать), затем объявляем сам сайт.
     let pub_chat = chat.clone();
+    let pub_mirror = Arc::clone(&mirrored);
     tokio::spawn(async move {
         while let Some((dir, name)) = publish_site_rx.recv().await {
             match publish_site(&manager, &dir, &name, my_id.clone()).await {
@@ -993,7 +1182,7 @@ fn start_site_tasks(
                     registry.register(manifest.clone()).await;
                     // Объявляем сайт сети.
                     pub_chat.announce_site(manifest).await;
-                    refresh_sites(&registry, &my_key, http_port, &sites_out).await;
+                    refresh_sites(&registry, &my_key, http_port, &pub_mirror, &sites_out).await;
                     // Заявляем DNS-имя сайта (.void) — владение + резолв.
                     dns.claim(DnsKind::Site, &site_name, None, Some(http_port)).await;
                 }
@@ -1001,6 +1190,103 @@ fn start_site_tasks(
             }
         }
     });
+
+    // Задача зеркалирования: команды GUI (кэшировать/убрать) + раз в 30с
+    // до-качивает все файлы зеркалируемых сайтов (восстановление после рестарта и
+    // подхват сайтов, обнаруженных позже) и объявляет нас их сидером.
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                cmd = mirror_rx.recv() => {
+                    let Some(cmd) = cmd else { break };
+                    match cmd {
+                        MirrorCmd::Mirror(name) => {
+                            {
+                                let mut set = mirror_set.lock().unwrap();
+                                set.insert(name.clone());
+                                save_mirrored_sites(&set);
+                            }
+                            tracing::info!("Зеркалирую сайт '{}'", name);
+                            ensure_site_mirrored(&mirror_mgr, &mirror_reg, &mirror_chat, &mirror_peers, &name).await;
+                        }
+                        MirrorCmd::Unmirror(name) => {
+                            {
+                                let mut set = mirror_set.lock().unwrap();
+                                set.remove(&name);
+                                save_mirrored_sites(&set);
+                            }
+                            // Стираем кэшированные файлы (только если сайт не наш).
+                            if let Some(manifest) = mirror_reg.get(&name).await {
+                                if mirror_key.as_str() != manifest.owner.as_str() {
+                                    for entry in &manifest.entries {
+                                        let _ = mirror_mgr.delete_file(&entry.file_id).await;
+                                    }
+                                }
+                            }
+                            tracing::info!("Сайт '{}' убран из кэша", name);
+                        }
+                    }
+                    refresh_sites(&mirror_reg, &mirror_key, http_port, &mirror_set, &mirror_out).await;
+                }
+                _ = ticker.tick() => {
+                    let names: Vec<String> = { mirror_set.lock().unwrap().iter().cloned().collect() };
+                    for name in &names {
+                        ensure_site_mirrored(&mirror_mgr, &mirror_reg, &mirror_chat, &mirror_peers, name).await;
+                    }
+                    if !names.is_empty() {
+                        refresh_sites(&mirror_reg, &mirror_key, http_port, &mirror_set, &mirror_out).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Скачивает все файлы сайта локально (делая нас сидером) и пере-анонсирует его —
+/// так зеркало остаётся доступным, даже когда владелец офлайн.
+async fn ensure_site_mirrored(
+    manager:  &StorageManager,
+    registry: &SiteRegistry,
+    chat:     &ChatHandle,
+    peers:    &Arc<Mutex<Vec<PeerInfo>>>,
+    name:     &str,
+) {
+    let Some(manifest) = registry.get(name).await else { return };
+    let peers_snap = { peers.lock().unwrap().clone() };
+    for entry in &manifest.entries {
+        // read_or_fetch_file докачивает недостающие чанки, сохраняет их локально и
+        // регистрирует нас владельцем (мульти-сидинг). Содержимое нам не нужно.
+        if let Err(e) = manager.read_or_fetch_file(&entry.file_id, &peers_snap).await {
+            tracing::debug!("Зеркало '{}': файл {} пока недоступен: {}",
+                name, &entry.file_id[..8.min(entry.file_id.len())], e);
+        }
+        if let Ok(Some(fm)) = manager.file_manifest(&entry.file_id).await {
+            chat.announce_file(fm).await;
+        }
+    }
+    // Объявляем, что мы тоже хостим этот сайт.
+    chat.announce_site(manifest).await;
+}
+
+/// Путь к файлу со списком зеркалируемых сайтов.
+fn mirrored_sites_path() -> PathBuf {
+    crate::profile_store::profile_dir().join("mirrored_sites.json")
+}
+
+/// Загружает набор зеркалируемых сайтов с диска (пустой при отсутствии/ошибке).
+fn load_mirrored_sites() -> HashSet<String> {
+    match std::fs::read_to_string(mirrored_sites_path()) {
+        Ok(s)  => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => HashSet::new(),
+    }
+}
+
+/// Сохраняет набор зеркалируемых сайтов на диск.
+fn save_mirrored_sites(set: &HashSet<String>) {
+    if let Ok(json) = serde_json::to_string_pretty(set) {
+        let _ = std::fs::write(mirrored_sites_path(), json);
+    }
 }
 
 /// Обновляет снимок списка сайтов для GUI из реестра.
@@ -1008,15 +1294,18 @@ async fn refresh_sites(
     registry: &SiteRegistry,
     my_key: &str,
     http_port: u16,
+    mirrored: &Arc<Mutex<HashSet<String>>>,
     out: &Arc<Mutex<Vec<SiteInfo>>>,
 ) {
+    let mset = { mirrored.lock().unwrap().clone() };
     let infos: Vec<SiteInfo> = registry.list().await.into_iter().map(|m| SiteInfo {
-        url:        format!("http://127.0.0.1:{}/{}", http_port, m.name),
-        dns_name:   m.dns_name(),
-        file_count: m.entries.len(),
-        size_bytes: m.total_size(),
-        is_mine:    m.owner.as_str() == my_key,
-        name:       m.name,
+        url:         format!("http://127.0.0.1:{}/{}", http_port, m.name),
+        dns_name:    m.dns_name(),
+        file_count:  m.entries.len(),
+        size_bytes:  m.total_size(),
+        is_mine:     m.owner.as_str() == my_key,
+        is_mirrored: mset.contains(&m.name),
+        name:        m.name,
     }).collect();
     *out.lock().unwrap() = infos;
 }
@@ -1101,6 +1390,9 @@ fn start_storage_tasks(
     // поэтому карта не растёт бесконечно.
     let cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(async move {
+        // JoinHandle'ы активных задач скачивания — чтобы при удалении файла
+        // дождаться фактического завершения задачи перед стиранием данных.
+        let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         while let Some(cmd) = download_rx.recv().await {
             match cmd {
                 DownloadCmd::Pause(file_id) => {
@@ -1111,9 +1403,25 @@ fn start_storage_tasks(
                     }
                 }
                 DownloadCmd::Remove(file_id) => {
-                    // Останавливаем активное скачивание (если идёт), затем стираем.
+                    // Останавливаем активное скачивание (если идёт)...
                     if let Some(flag) = cancels.lock().unwrap().get(&file_id).cloned() {
                         flag.store(true, Ordering::Relaxed);
+                    }
+                    // ...и ДОЖИДАЕМСЯ фактического завершения задачи, иначе она может
+                    // дописать чанк/владельца уже после delete_file — гонка, оставляющая
+                    // осиротевшие блобы и неконсистентное состояние.
+                    if let Some(mut handle) = tasks.remove(&file_id) {
+                        if tokio::time::timeout(std::time::Duration::from_secs(15), &mut handle)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "Задача скачивания {} не завершилась за 15с — прерываю",
+                                &file_id[..8.min(file_id.len())]
+                            );
+                            handle.abort();
+                            let _ = handle.await;
+                        }
                     }
                     match dl_mgr.delete_file(&file_id).await {
                         Ok(()) => tracing::info!("Файл {} удалён из раздачи", &file_id[..8.min(file_id.len())]),
@@ -1143,7 +1451,10 @@ fn start_storage_tasks(
                     let chat  = dl_chat.clone();
                     let cancels_task = Arc::clone(&cancels);
                     tracing::info!("Скачивание '{}' → {}", name, dest.display());
-                    tokio::spawn(async move {
+                    // Прибираем завершившиеся задачи, чтобы карта не росла.
+                    tasks.retain(|_, h| !h.is_finished());
+                    let task_key = file_id.clone();
+                    let handle = tokio::spawn(async move {
                         let dl_flag = Arc::clone(&flag);
                         match mgr.download_file_cancellable(&file_id, &dest, &peers, dl_flag).await {
                             Ok(()) => {
@@ -1164,6 +1475,7 @@ fn start_storage_tasks(
                             map.remove(&file_id);
                         }
                     });
+                    tasks.insert(task_key, handle);
                 }
             }
         }
