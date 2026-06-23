@@ -18,11 +18,11 @@
       runtimeLibs = pkgs: with pkgs; [
         libGL
         libGLU
-        xorg.libX11
-        xorg.libXcursor
-        xorg.libXrandr
-        xorg.libXi
-        xorg.libxcb
+        libX11
+        libXcursor
+        libXrandr
+        libXi
+        libxcb
         wayland
         libxkbcommon
       ];
