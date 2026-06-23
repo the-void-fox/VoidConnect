@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -6,16 +6,29 @@ use eframe::egui;
 use egui::{Align, Button, Frame, Label, ProgressBar, RichText, ScrollArea, TextEdit};
 use tokio::sync::mpsc::UnboundedSender;
 
+use void_core::identity::NodeId;
+use void_core::peer::PeerProfile;
+use void_reputation::ReportReason;
+
 use crate::backend::{DownloadCmd, StorageFileInfo};
 
 pub struct FileEntry {
     pub file_id: String,
     pub name: String,
     pub size: String,
+    pub size_bytes: i64,
     pub chunks: u32,
     pub chunks_total: u32,
     pub seeders: u32,
     pub status: FileStatus,
+    /// Исходный публикатор (его публичный ключ = ID).
+    pub owner_key: String,
+    /// Имя публикатора для отображения («Ваши файлы» / имя / короткий ID).
+    pub owner_name: String,
+    /// Файл опубликован нами (мы — исходный публикатор).
+    pub is_mine: bool,
+    /// Мы раздаём этот файл (опубликован нами либо полностью скачан).
+    pub seeding_by_me: bool,
 }
 
 #[derive(PartialEq, Clone)]
@@ -67,6 +80,14 @@ pub struct StoragePage {
     pub downloads_dir: Option<PathBuf>,
     /// Индекс файла, ожидающего подтверждения удаления (показывается диалог).
     pending_delete: Option<usize>,
+    /// Профили узлов — для перевода ключа публикатора в читаемое имя.
+    pub peer_profiles: Option<Arc<Mutex<HashMap<NodeId, PeerProfile>>>>,
+    /// Наш ID — чтобы пометить свою «папку».
+    pub my_id: Option<NodeId>,
+    /// Наше имя — для подписи своей «папки».
+    pub my_name: String,
+    /// Жалоба на публикатора, ожидающая отправки в backend (target, причина).
+    pub pending_report: Option<(NodeId, ReportReason)>,
 }
 
 impl Default for StoragePage {
@@ -82,8 +103,21 @@ impl Default for StoragePage {
             downloading: HashSet::new(),
             downloads_dir: None,
             pending_delete: None,
+            peer_profiles: None,
+            my_id: None,
+            my_name: String::new(),
+            pending_report: None,
         }
     }
+}
+
+/// Группа файлов одного публикатора — «папка» пользователя.
+struct OwnerGroup {
+    key: String,
+    name: String,
+    is_mine: bool,
+    total_size: i64,
+    indices: Vec<usize>,
 }
 
 // Ширины колонок — одинаковые для шапки и строк
@@ -132,17 +166,84 @@ impl StoragePage {
             } else {
                 FileStatus::NotStarted
             };
+            let owner_name = self.owner_display(&f.owner_key);
+            // Мы раздаём файл, если опубликовали его сами или полностью скачали.
+            let seeding_by_me = f.is_mine || f.progress >= 1.0;
             entries.push(FileEntry {
                 file_id:      f.file_id,
                 name:         f.name,
                 size:         human_size(f.size_bytes),
+                size_bytes:   f.size_bytes,
                 chunks:       done,
                 chunks_total: f.total_chunks.max(0) as u32,
                 seeders:      f.seeders.max(0) as u32,
                 status,
+                owner_key:    f.owner_key,
+                owner_name,
+                is_mine:      f.is_mine,
+                seeding_by_me,
             });
         }
         self.files = entries;
+    }
+
+    /// Переводит публичный ключ публикатора в читаемое имя: «Ваши файлы» для
+    /// своих, имя из профиля для известных узлов, иначе короткий ID.
+    fn owner_display(&self, owner_key: &str) -> String {
+        if let Some(my) = &self.my_id {
+            if my.as_str() == owner_key {
+                return if self.my_name.trim().is_empty() {
+                    "Ваши файлы".to_string()
+                } else {
+                    self.my_name.clone()
+                };
+            }
+        }
+        if let Some(profiles) = &self.peer_profiles {
+            if let Ok(map) = profiles.lock() {
+                if let Some(p) = map.get(&NodeId(owner_key.to_string())) {
+                    if !p.name.trim().is_empty() {
+                        return p.name.clone();
+                    }
+                }
+            }
+        }
+        if owner_key.is_empty() {
+            "неизвестный публикатор".to_string()
+        } else {
+            format!("{}…", &owner_key[..8.min(owner_key.len())])
+        }
+    }
+
+    /// Группирует файлы по публикатору в «папки», применяя поиск (по имени файла
+    /// и имени публикатора). Своя папка идёт первой, остальные — по имени.
+    fn build_groups(&self, search_lower: &str) -> Vec<OwnerGroup> {
+        let mut map: HashMap<String, OwnerGroup> = HashMap::new();
+        for (idx, f) in self.files.iter().enumerate() {
+            if !search_lower.is_empty()
+                && !f.name.to_lowercase().contains(search_lower)
+                && !f.owner_name.to_lowercase().contains(search_lower)
+            {
+                continue;
+            }
+            let g = map.entry(f.owner_key.clone()).or_insert_with(|| OwnerGroup {
+                key:        f.owner_key.clone(),
+                name:       f.owner_name.clone(),
+                is_mine:    f.is_mine,
+                total_size: 0,
+                indices:    Vec::new(),
+            });
+            g.total_size += f.size_bytes;
+            g.indices.push(idx);
+        }
+        let mut groups: Vec<OwnerGroup> = map.into_values().collect();
+        groups.sort_by(|a, b| {
+            b.is_mine
+                .cmp(&a.is_mine)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        groups
     }
 
     /// Отправляет путь из поля ввода в backend на публикацию.
@@ -218,7 +319,7 @@ impl StoragePage {
         // === Поиск ===
         ui.add(
             TextEdit::singleline(&mut self.search)
-                .hint_text("󰍉  Поиск файлов...")
+                .hint_text("󰍉  Поиск по файлам и пользователям…")
                 .desired_width(f32::INFINITY),
         );
 
@@ -265,50 +366,73 @@ impl StoragePage {
         let total_spacing = spacing_x * 7.0; // 7 промежутков между 8 колонками
         let fixed_width = COL_ICON + COL_SIZE + COL_CHUNKS + COL_SEEDS + COL_STATUS + COL_ACTION + COL_REPORT;
         
-        // Занимаем все оставшееся место, но задаем минимальную ширину (например, 150.0)
-        let col_name_w = (ui.available_width() - fixed_width - total_spacing - 15.0).max(150.0);
+        // === Группировка по публикаторам («папки» пользователей) ===
+        let search_lower = self.search.trim().to_lowercase();
+        let groups = self.build_groups(&search_lower);
 
-        Frame::none()
-            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
-            .fill(ui.visuals().widgets.noninteractive.bg_fill)
-            .show(ui, |ui| {
-                Self::table_header(ui, col_name_w); // Передаем ширину
-            });
-
-        ui.add_space(2.0);
-
-        // === Тело таблицы ===
         let avail_h = ui.available_height() - 40.0;
-        let search_lower = self.search.to_lowercase();
         let mut action: Option<(usize, RowAction)> = None;
 
-        ScrollArea::vertical()
-            .id_source("storage_scroll")
-            .max_height(avail_h)
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                for (i, file) in self.files.iter().enumerate() {
-                    if !search_lower.is_empty()
-                        && !file.name.to_lowercase().contains(&search_lower)
-                    {
-                        continue;
-                    }
-
-                    let frame_fill = if i % 2 == 0 {
-                        ui.visuals().extreme_bg_color
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-
-                    Frame::none()
-                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                        .fill(frame_fill)
-                        .show(ui, |ui| {
-                            ui.set_min_height(ROW_H);
-                            Self::table_row(ui, i, file, &mut action, col_name_w); // Передаем ширину
-                        });
-                }
+        if groups.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                let msg = if self.files.is_empty() {
+                    "Хранилище пусто. Опубликуйте файл или дождитесь появления файлов в сети."
+                } else {
+                    "Ничего не найдено по запросу."
+                };
+                ui.label(RichText::new(msg).color(ui.visuals().weak_text_color()));
             });
+        } else {
+            ScrollArea::vertical()
+                .id_source("storage_scroll")
+                .max_height(avail_h)
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    for g in &groups {
+                        // Заголовок «папки» = публикатор + число файлов + объём.
+                        let icon = if g.is_mine { "\u{F0004}" } else { "\u{F024B}" };
+                        let title = format!(
+                            "{}  {}   —   {} файл. · {}",
+                            icon, g.name, g.indices.len(), human_size(g.total_size),
+                        );
+                        let title_rt = if g.is_mine {
+                            RichText::new(title).strong().color(egui::Color32::from_rgb(110, 175, 235))
+                        } else {
+                            RichText::new(title).strong()
+                        };
+                        egui::CollapsingHeader::new(title_rt)
+                            .id_source(format!("owner_folder_{}", g.key))
+                            .default_open(g.is_mine || !search_lower.is_empty())
+                            .show(ui, |ui| {
+                                let inner_w = ui.available_width();
+                                let col_name_w =
+                                    (inner_w - fixed_width - total_spacing - 24.0).max(120.0);
+                                Frame::none()
+                                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                                    .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                                    .show(ui, |ui| { Self::table_header(ui, col_name_w); });
+                                ui.add_space(2.0);
+                                for (row_i, &idx) in g.indices.iter().enumerate() {
+                                    let file = &self.files[idx];
+                                    let frame_fill = if row_i % 2 == 0 {
+                                        ui.visuals().extreme_bg_color
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    Frame::none()
+                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .fill(frame_fill)
+                                        .show(ui, |ui| {
+                                            ui.set_min_height(ROW_H);
+                                            Self::table_row(ui, idx, file, &mut action, col_name_w);
+                                        });
+                                }
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+        }
 
         // === Обработка действий ===
         if let Some((idx, act)) = action {
@@ -328,7 +452,7 @@ impl StoragePage {
                 return;
             };
             let name = file.name.clone();
-            let is_mine = matches!(file.status, FileStatus::Seeding);
+            let is_mine = file.is_mine;
             let mut close = false;
             let mut confirm = false;
             egui::Window::new("󰩺  Удалить файл")
@@ -373,54 +497,77 @@ impl StoragePage {
             }
         }
 
-        // === Диалог репорта ===
+        // === Диалог жалобы на публикатора ===
         if let Some(idx) = self.report_target {
-            let file_name = self.files[idx].name.clone();
-            let mut submitted = false;
+            let (file_name, owner_name, owner_key, is_mine) = match self.files.get(idx) {
+                Some(f) => (f.name.clone(), f.owner_name.clone(), f.owner_key.clone(), f.is_mine),
+                None => { self.report_target = None; return; }
+            };
+            let mut chosen: Option<ReportReason> = None;
+            let mut close = false;
 
-            egui::Window::new(format!("  󰀦  Жалоба: {}", file_name))
+            egui::Window::new("󰀦  Жалоба на публикатора")
                 .collapsible(false)
                 .resizable(false)
-                .fixed_size([360.0, 240.0])
+                .fixed_size([390.0, 0.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Выберите причину жалобы:")
-                            .size(14.0)
-                            .strong(),
-                    );
-                    ui.add_space(12.0);
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Файл:").strong());
+                        ui.label(RichText::new(&file_name).monospace());
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Публикатор:").strong());
+                        ui.label(RichText::new(&owner_name).color(ui.visuals().hyperlink_color));
+                    });
+                    ui.add_space(10.0);
 
-                    let reasons = [
-                        (" 󱃈  Вредоносный контент", "Вирус, троян, майнер и т.д."),
-                        (" 󰶍  Мошенничество / обман", "Ложное описание файла"),
-                        (" 󰇮  Неверные метаданные", "Неправильный размер или формат"),
-                        (" 󰶐  Другое", "Иная причина"),
+                    if is_mine {
+                        ui.label(
+                            RichText::new("Это ваш файл — пожаловаться на себя нельзя.")
+                                .color(egui::Color32::from_rgb(220, 160, 60)),
+                        );
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        if ui.button("Закрыть").clicked() {
+                            close = true;
+                        }
+                        return;
+                    }
+
+                    ui.label(RichText::new("Выберите причину:").size(14.0).strong());
+                    ui.add_space(10.0);
+
+                    let reasons: [(&str, &str, ReportReason); 4] = [
+                        (" 󱃈  Вредоносный контент",   "Вирус, троян, майнер и т.д.",            ReportReason::MaliciousContent),
+                        (" 󰶍  Мошенничество / обман", "Ложное описание файла",                  ReportReason::MaliciousContent),
+                        (" 󰇮  Неверные / битые данные","Неверный размер, формат или битые чанки", ReportReason::BadChunks),
+                        (" 󰶐  Другое",                "Иная причина",                           ReportReason::MaliciousContent),
                     ];
-
-                    for (reason, tooltip) in reasons {
-                        let resp = ui.selectable_label(false, reason);
-                        resp.clone().on_hover_text(tooltip);
+                    for (label, tooltip, reason) in reasons {
+                        let resp = ui.selectable_label(false, label).on_hover_text(tooltip);
                         if resp.clicked() {
-                            submitted = true;
+                            chosen = Some(reason);
                         }
                     }
 
-                    ui.add_space(16.0);
+                    ui.add_space(14.0);
                     ui.separator();
                     ui.add_space(8.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Отмена").clicked() {
-                            self.report_target = None;
-                        }
-                        if ui.button("Отправить").clicked() {
-                            submitted = true;
-                        }
-                    });
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
                 });
 
-            if submitted {
+            if let Some(reason) = chosen {
+                if !owner_key.is_empty() {
+                    self.pending_report = Some((NodeId(owner_key), reason));
+                }
+                close = true;
+            }
+            if close {
                 self.report_target = None;
             }
         }
@@ -431,11 +578,7 @@ impl StoragePage {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let total = self.files.len();
-            let complete = self
-                .files
-                .iter()
-                .filter(|f| matches!(f.status, FileStatus::Complete | FileStatus::Seeding))
-                .count();
+            let seeding = self.files.iter().filter(|f| f.seeding_by_me).count();
             let loading = self
                 .files
                 .iter()
@@ -449,7 +592,7 @@ impl StoragePage {
 
             ui.label(
                 RichText::new(format!(
-                    "Файлов: {total}   |   Готово: {complete}   |   Загружается: {loading}   |   Ожидает: {pending}"
+                    "Файлов: {total}   |   Раздаёте: {seeding}   |   Загружается: {loading}   |   Ожидает: {pending}"
                 ))
                 .size(12.0)
                 .color(ui.visuals().weak_text_color()),
@@ -533,13 +676,23 @@ fn table_row(
                 });
             });
             
-            // Имя (Скролл + жесткая фиксация)
+            // Имя файла + маркер «вы раздаёте» (Скролл + жесткая фиксация)
             ui.allocate_ui(egui::vec2(col_name_w, ROW_H), |ui| {
                 ui.set_width(col_name_w); // <--- Запрещаем ячейке расширяться
                 ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                    let mut name_w = col_name_w;
+                    if file.seeding_by_me {
+                        ui.label(
+                            RichText::new("⬆")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(90, 190, 120)),
+                        )
+                        .on_hover_text("Вы раздаёте этот файл");
+                        name_w -= 16.0;
+                    }
                     ScrollArea::horizontal()
                         .id_source(format!("name_scroll_{}", idx))
-                        .max_width(col_name_w) // <--- Запрещаем скроллу распирать ячейку
+                        .max_width(name_w.max(40.0)) // <--- Запрещаем скроллу распирать ячейку
                         .show(ui, |ui| {
                             ui.add(Label::new(RichText::new(&file.name).size(13.0)).wrap(false));
                         });

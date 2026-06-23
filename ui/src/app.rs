@@ -120,6 +120,9 @@ impl VoidApp {
         storage.download_tx   = Some(backend.download_tx.clone());
         storage.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
         storage.downloads_dir = Some(backend.downloads_dir.clone());
+        storage.peer_profiles = Some(std::sync::Arc::clone(&backend.peer_profiles));
+        storage.my_id         = Some(backend.my_id_node.clone());
+        storage.my_name       = backend.my_name.clone();
 
         // Страница сайтов: канал публикации + список сайтов + имена .void.
         let mut sites = SitesPage::default();
@@ -191,7 +194,12 @@ impl eframe::App for VoidApp {
                     }
                 }
                 Page::Private => self.private.show(ui),
-                Page::Storage => self.storage.show(ui),
+                Page::Storage => {
+                    self.storage.show(ui);
+                    if let Some((target, reason)) = self.storage.pending_report.take() {
+                        let _ = self.backend.report_tx.send((target, reason));
+                    }
+                }
                 Page::Sites   => self.sites.show(ui),
                 Page::Profile => self.profile.show(ui),
                 Page::Graph   => {

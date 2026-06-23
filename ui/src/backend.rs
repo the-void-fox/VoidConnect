@@ -33,6 +33,10 @@ pub struct StorageFileInfo {
     pub is_mine:      bool,
     /// Сколько узлов раздают файл (по данным манифеста)
     pub seeders:      i64,
+    /// Исходный публикатор файла (его публичный ключ = ID). Сохраняется навсегда
+    /// при первом появлении файла — по нему файлы группируются в «папки» и можно
+    /// найти/пожаловаться на того, кто опубликовал вредоносный контент.
+    pub owner_key:    String,
 }
 
 /// Запись о сайте — снимок для GUI.
@@ -1202,6 +1206,7 @@ fn start_storage_tasks(
                 out.push(StorageFileInfo {
                     is_mine,
                     seeders,
+                    owner_key:    f.owner_key,
                     file_id:      f.file_id,
                     name:         f.name,
                     size_bytes:   f.size_bytes,
