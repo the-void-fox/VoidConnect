@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -44,6 +44,10 @@ pub struct StorageManager {
     my_id: NodeId,
     /// Опциональный канал событий о качестве чанков (для репутации).
     events: Option<mpsc::UnboundedSender<ChunkEvent>>,
+    /// Счётчик отданных байт (чанки, разосланные пирам). Для статистики профиля.
+    bytes_uploaded: Arc<AtomicU64>,
+    /// Счётчик принятых байт (чанки, скачанные у пиров по сети).
+    bytes_downloaded: Arc<AtomicU64>,
 }
 
 impl StorageManager {
@@ -74,6 +78,8 @@ impl StorageManager {
             index,
             my_id,
             events: None,
+            bytes_uploaded: Arc::new(AtomicU64::new(0)),
+            bytes_downloaded: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -83,12 +89,24 @@ impl StorageManager {
         self.events = Some(tx);
     }
 
+    /// Подключает внешние счётчики трафика (общие с GUI). Вызывать ДО клонирования
+    /// менеджера в задачи — Arc делится между всеми клонами. Без него счётчики
+    /// локальны для менеджера (storage/тесты работают как прежде).
+    pub fn set_traffic_counters(
+        &mut self,
+        uploaded: Arc<AtomicU64>,
+        downloaded: Arc<AtomicU64>,
+    ) {
+        self.bytes_uploaded = uploaded;
+        self.bytes_downloaded = downloaded;
+    }
+
     /// Запускает TCP chunk-сервер.
     /// Вызывай через `tokio::spawn` — блокирует задачу.
     pub async fn start_server(&self, port: u16) -> Result<(), StorageError> {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()
             .map_err(|e: std::net::AddrParseError| StorageError::Network(e.to_string()))?;
-        run_chunk_server(addr, self.store.clone()).await
+        run_chunk_server(addr, self.store.clone(), Arc::clone(&self.bytes_uploaded)).await
     }
 
     // ─── Публикация ──────────────────────────────────────────────────────────
@@ -352,6 +370,9 @@ impl StorageManager {
             for handle in handles {
                 match handle.await {
                     Ok(Ok((index, data))) => {
+                        // Учёт принятого по сети трафика (локальные чанки сюда не
+                        // попадают — они читаются с диска ветвью `is_local` выше).
+                        self.bytes_downloaded.fetch_add(data.len() as u64, Ordering::Relaxed);
                         ordered_data[index] = Some(data);
                     }
                     Ok(Err(e)) => return Err(e),

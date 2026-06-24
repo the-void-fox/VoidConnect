@@ -6,14 +6,19 @@ use crate::profile_store;
 pub struct ProfilePage {
     pub name:            String,
     pub description:     String,
-    pub dns_name:        String,
     pub status:          String,
     pub pub_key_display: String,
     pub my_node_id:      Option<NodeId>,
-    pub reputation:      f32,
-    pub uptime_hours:    u32,
-    pub upload_gb:       f32,
-    pub download_gb:     f32,
+    /// Аптайм текущей сессии (от старта бэкенда) — реальное значение.
+    pub uptime:          std::time::Duration,
+    /// Реальные счётчики трафика за сессию (в байтах).
+    pub upload_bytes:    u64,
+    pub download_bytes:  u64,
+    /// Наша репутация глазами пиров: (средний балл, число сообщивших пиров).
+    /// `None` — данных пока нет. Источник — `backend.my_reputation` (gossip).
+    pub my_reputation:   Option<(f64, usize)>,
+    /// Есть ли сейчас подключённые пиры (для текста про репутацию).
+    pub has_peers:       bool,
     pub my_ip:           String,
     pub base_port:       u16,
     /// Запущены ли мы в публичном (bootstrap) режиме.
@@ -41,13 +46,13 @@ impl Default for ProfilePage {
         Self {
             name:            "Anonymous".to_string(),
             description:     "Узел в Void Connect".to_string(),
-            dns_name:        "anonymous.void".to_string(),
             status:          "online".to_string(),
             pub_key_display: "--------".to_string(),
-            reputation:      0.0,
-            uptime_hours:    0,
-            upload_gb:       0.0,
-            download_gb:     0.0,
+            uptime:          std::time::Duration::ZERO,
+            upload_bytes:    0,
+            download_bytes:  0,
+            my_reputation:   None,
+            has_peers:       false,
             my_ip:           "?".to_string(),
             base_port:       7700,
             bootstrap:         false,
@@ -201,11 +206,6 @@ impl ProfilePage {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(".void адрес:").strong());
-                    ui.label(egui::RichText::new(&self.dns_name).monospace());
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("ID (pubkey):").strong());
                     ui.label(
                         egui::RichText::new(&self.pub_key_display)
@@ -245,22 +245,42 @@ impl ProfilePage {
         ui.separator();
         ui.add_space(12.0);
 
-        // ── Репутация ───────────────────────────────────────────────────────
+        // ── Репутация (по оценкам других узлов) ─────────────────────────────
         ui.label(egui::RichText::new("Репутация").strong());
         ui.add_space(6.0);
-        let rep_color = if self.reputation > 0.7 {
-            egui::Color32::from_rgb(80, 200, 80)
-        } else if self.reputation > 0.4 {
-            egui::Color32::from_rgb(220, 180, 40)
-        } else {
-            egui::Color32::from_rgb(220, 80, 60)
-        };
-        ui.add(
-            egui::ProgressBar::new(self.reputation)
-                .desired_width(300.0)
-                .fill(rep_color)
-                .text(format!("{:.0}%", self.reputation * 100.0)),
-        );
+        match self.my_reputation {
+            Some((score, n)) => {
+                let rep_color = if score > 60.0 {
+                    egui::Color32::from_rgb(80, 200, 80)
+                } else if score > 25.0 {
+                    egui::Color32::from_rgb(220, 180, 40)
+                } else {
+                    egui::Color32::from_rgb(220, 120, 80)
+                };
+                ui.label(egui::RichText::new(format!("{:.1}", score)).size(20.0).strong().color(rep_color));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "󰔟  по оценкам {} {} · поле уточняется, возможна задержка",
+                        n,
+                        if n == 1 { "пира" } else { "пиров" },
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+            }
+            None if self.has_peers => {
+                ui.label(
+                    egui::RichText::new("󰔟  Уточняется… ждём оценок от пиров")
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("Невозможно узнать свою репутацию — нет подключённых пиров")
+                        .color(egui::Color32::from_rgb(220, 160, 70)),
+                );
+            }
+        }
 
         ui.add_space(16.0);
         ui.separator();
@@ -271,13 +291,13 @@ impl ProfilePage {
         ui.add_space(8.0);
         egui::Grid::new("stats_grid").num_columns(2).spacing([40.0, 8.0]).show(ui, |ui| {
             ui.label("󰔛 Аптайм:");
-            ui.label(format!("{} ч", self.uptime_hours));
+            ui.label(format_uptime(self.uptime));
             ui.end_row();
             ui.label("⬆ Отдано:");
-            ui.label(format!("{:.1} ГБ", self.upload_gb));
+            ui.label(format_bytes(self.upload_bytes));
             ui.end_row();
             ui.label("⬇ Получено:");
-            ui.label(format!("{:.1} ГБ", self.download_gb));
+            ui.label(format_bytes(self.download_bytes));
             ui.end_row();
         });
 
@@ -533,5 +553,36 @@ impl ProfilePage {
                 }
             }
         });
+    }
+}
+
+/// Форматирует аптайм сессии: «Xч Yмин» / «Yмин» / «Zс».
+fn format_uptime(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 {
+        format!("{} ч {} мин", h, m)
+    } else if m > 0 {
+        format!("{} мин", m)
+    } else {
+        format!("{} с", secs)
+    }
+}
+
+/// Человекочитаемый размер трафика: Б / КБ / МБ / ГБ.
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    let f = n as f64;
+    if f >= GB {
+        format!("{:.2} ГБ", f / GB)
+    } else if f >= MB {
+        format!("{:.1} МБ", f / MB)
+    } else if f >= KB {
+        format!("{:.1} КБ", f / KB)
+    } else {
+        format!("{} Б", n)
     }
 }

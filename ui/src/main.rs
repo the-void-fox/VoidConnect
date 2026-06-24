@@ -6,6 +6,7 @@ mod pages;
 mod profile_store;
 mod private_store;
 mod settings_store;
+mod sys_open;
 mod vote_service;
 mod widgets;
 

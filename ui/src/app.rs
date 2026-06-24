@@ -96,7 +96,6 @@ impl VoidApp {
         profile.description     = if saved.description.is_empty() { profile.description } else { saved.description };
         profile.status          = if saved.status.is_empty()      { profile.status }      else { saved.status };
         profile.pub_key_display = backend.my_id_short.clone();
-        profile.dns_name        = format!("{}.void", backend.my_name);
         profile.my_ip           = backend.my_ip.clone();
         profile.base_port       = backend.base_port;
         profile.bootstrap       = backend.bootstrap;
@@ -393,6 +392,15 @@ impl VoidApp {
             Reachability::Blocked   => Some(false),
             Reachability::Unknown   => None,
         };
+
+        // Реальная статистика сессии для профиля (аптайм + трафик).
+        self.profile.uptime         = self.backend.start_time.elapsed();
+        self.profile.upload_bytes   = self.backend.bytes_uploaded.load(std::sync::atomic::Ordering::Relaxed);
+        self.profile.download_bytes = self.backend.bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Своя репутация глазами пиров (из периодического gossip) + есть ли пиры.
+        self.profile.my_reputation = *self.backend.my_reputation.lock().unwrap();
+        self.profile.has_peers     = self.peer_count > 0;
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {

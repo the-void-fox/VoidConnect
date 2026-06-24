@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use void_core::dns::{DnsKind, DnsRecord};
@@ -191,8 +191,13 @@ pub enum DownloadCmd {
     Start(String),
     /// Поставить на паузу скачивание файла по его file_id.
     Pause(String),
-    /// Удалить файл из раздачи (стереть локально) по его file_id.
+    /// Удалить файл из СЕТИ целиком. Разрешено только владельцу и только если файл
+    /// больше никто (из живых узлов) не раздаёт: стираем локально + подавляем
+    /// «воскрешение» входящим манифестом.
     Remove(String),
+    /// Убрать только свою ЛОКАЛЬНУЮ копию (перестать раздавать). Доступно всем, кто
+    /// скачал файл; сам файл остаётся в сети у других сидеров.
+    RemoveLocal(String),
 }
 
 /// Компоненты системы репутации, разделяемые между фоновыми задачами.
@@ -346,6 +351,18 @@ pub struct BackendHandle {
     pub voted_channels: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
     /// Наша собственная репутация (для проверки права голоса/предложения в UI).
     pub my_score: Arc<Mutex<f64>>,
+
+    // ── Статистика сессии (для профиля) ──────────────────────────────────────
+    /// Момент старта бэкенда — для подсчёта аптайма сессии.
+    pub start_time: std::time::Instant,
+    /// Всего отдано байт чанков пирам за сессию.
+    pub bytes_uploaded: Arc<AtomicU64>,
+    /// Всего принято байт чанков по сети за сессию.
+    pub bytes_downloaded: Arc<AtomicU64>,
+    /// Наша репутация глазами подключённых пиров: среднее их оценок о нас + число
+    /// сообщивших пиров. `None` — данных нет (нет пиров или gossip ещё не пришёл).
+    /// Обновляется периодически из входящего reputation-gossip, НЕ по запросу из UI.
+    pub my_reputation: Arc<Mutex<Option<(f64, usize)>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -441,6 +458,16 @@ pub fn start_backend(
     let voted_channels_bg = Arc::clone(&voted_channels);
     let my_score_bg   = Arc::clone(&my_score);
 
+    // Статистика сессии (профиль): аптайм + реальные счётчики трафика.
+    let start_time = std::time::Instant::now();
+    let bytes_uploaded:   Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let bytes_downloaded: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let bytes_uploaded_bg   = Arc::clone(&bytes_uploaded);
+    let bytes_downloaded_bg = Arc::clone(&bytes_downloaded);
+    // Наша репутация глазами пиров (заполняется из входящего gossip).
+    let my_reputation: Arc<Mutex<Option<(f64, usize)>>> = Arc::new(Mutex::new(None));
+    let my_reputation_bg = Arc::clone(&my_reputation);
+
     let downloads_dir = data_dir.join("downloads");
 
     // Подключены ли мы к глобальной сети как клиент (заданы bootstrap-узлы).
@@ -462,6 +489,7 @@ pub fn start_backend(
                 dns_bg, reach_bg, mirror_rx,
                 propose_rx, vote_cast_rx, proposals_bg,
                 blocklist_bg, voted_channels_bg, my_score_bg,
+                bytes_uploaded_bg, bytes_downloaded_bg, my_reputation_bg,
             ).await;
         });
     });
@@ -506,6 +534,10 @@ pub fn start_backend(
         blocklist,
         voted_channels,
         my_score,
+        start_time,
+        bytes_uploaded,
+        bytes_downloaded,
+        my_reputation,
     }
 }
 
@@ -550,6 +582,9 @@ async fn backend_main(
     blocklist_out: Arc<Mutex<HashMap<NodeId, i64>>>,
     voted_channels_out: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
     my_score_out: Arc<Mutex<f64>>,
+    bytes_uploaded: Arc<AtomicU64>,
+    bytes_downloaded: Arc<AtomicU64>,
+    my_reputation_out: Arc<Mutex<Option<(f64, usize)>>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -738,7 +773,8 @@ async fn backend_main(
     chat.set_profile(initial_profile).await;
 
     // ── Внутренний DNS зоны .void ─────────────────────────────────────────────
-    // Заявляем имя нашего узла и слушаем чужие записи (синхронизация через relay).
+    // Слушаем чужие записи (синхронизация через relay) и заявляем имена САЙТОВ при
+    // публикации. Имя самого узла НЕ заявляем: пользователю .void-адрес узла не нужен.
     let dns = DnsService {
         registry: DnsRegistry::new(),
         chat:     chat.clone(),
@@ -746,12 +782,6 @@ async fn backend_main(
         my_id:    my_peer.id.clone(),
         snapshot: Arc::clone(&dns_out),
     };
-    {
-        // Имя узла = нормализованное отображаемое имя (иначе короткий ID).
-        let label = void_core::dns::normalize_name(&my_peer.name)
-            .unwrap_or_else(|| my_peer.id.as_str()[..8.min(my_peer.id.as_str().len())].to_string());
-        dns.claim(DnsKind::Node, &label, Some(my_peer.ip.to_string()), Some(base_port)).await;
-    }
     // Задача: входящие DNS-записи из сети → проверяем подпись и применяем.
     {
         let dns_in = dns.clone();
@@ -974,10 +1004,15 @@ async fn backend_main(
     // Задача: периодически снимаем peer_list и профили для GUI.
     // Здесь же ведём репутацию: события подключения/отключения (аптайм) и
     // обновление снимка score для GUI.
+    // Своя репутация: задача приёма кладёт сюда оценки других о нас (peer → score),
+    // снапшот-задача чистит карту до живых пиров и усредняет в my_reputation_out.
+    let my_rep_views: Arc<Mutex<HashMap<NodeId, f64>>> = Arc::new(Mutex::new(HashMap::new()));
     let pl       = peer_list.clone();
     let chat_p   = chat.clone();
     let rep_snap = reputation.clone();
     let rep_out  = Arc::clone(&reputation_out);
+    let snap_rep_views = Arc::clone(&my_rep_views);
+    let my_rep_out = Arc::clone(&my_reputation_out);
     let reports_pool = db_pool.clone();
     let reports_out_t = Arc::clone(&reports_out);
     let my_rep_id = my_peer.id.clone();
@@ -1053,8 +1088,10 @@ async fn backend_main(
                 for id in prev_ids.difference(&cur_ids) {
                     rep.events.process(ReputationEvent::PeerDisconnected { peer_id: id.clone() }).await;
                 }
-                // Появились новые узлы — рассылаем им наш снимок оценок (gossip).
-                if !newly.is_empty() {
+                // Рассылаем наш снимок оценок (gossip): при появлении новых узлов и
+                // периодически (~раз в 3 мин, tick=2с) — чтобы каждый узел регулярно
+                // узнавал свою репутацию из чужих снимков, без отдельных запросов.
+                if !newly.is_empty() || tick % 90 == 0 {
                     if let Ok(signed) = rep.sync.build_signed_sync().await {
                         chat_p.broadcast_reputation_sync(my_rep_id.clone(), signed).await;
                     }
@@ -1065,6 +1102,21 @@ async fn backend_main(
                     snapshot.insert(id.clone(), rep.score.score(id).await);
                 }
                 *rep_out.lock().unwrap() = snapshot;
+
+                // Своя репутация: усредняем оценки о нас от ЖИВЫХ пиров (карту
+                // наполняет задача приёма gossip). Нет данных → None (UI покажет,
+                // что узнать репутацию нельзя / она ещё уточняется).
+                {
+                    let mut views = snap_rep_views.lock().unwrap();
+                    views.retain(|id, _| cur_ids.contains(id));
+                    let agg = if views.is_empty() {
+                        None
+                    } else {
+                        let sum: f64 = views.values().sum();
+                        Some((sum / views.len() as f64, views.len()))
+                    };
+                    *my_rep_out.lock().unwrap() = agg;
+                }
             }
 
             // Снимок жалоб на текущие узлы (для просмотра в профиле). Реже —
@@ -1097,12 +1149,29 @@ async fn backend_main(
     // Задача: входящие пакеты репутации из сети (sync/жалобы) → применяем.
     if let Some(rep) = reputation.clone() {
         let mut rep_rx = chat.subscribe_reputation();
+        let rep_views = Arc::clone(&my_rep_views);
+        let rep_my_key = my_peer.id.as_str().to_string();
         tokio::spawn(async move {
             loop {
                 match rep_rx.recv().await {
                     Ok(RepGossip::Sync { from, signed }) => {
-                        if let Err(e) = rep.sync.apply_signed_sync(&from, &signed).await {
-                            tracing::debug!("Отклонён sync репутации от {}: {}", from, e);
+                        match rep.sync.apply_signed_sync(&from, &signed).await {
+                            Ok(()) => {
+                                // Подпись уже проверена внутри. Вытаскиваем оценку НАС
+                                // этим узлом (apply_sync её намеренно игнорирует) — это и
+                                // есть «узнать свою репутацию у пира», без отдельного запроса.
+                                if let Ok(payload) = serde_json::from_slice::<
+                                    void_reputation::sync::SyncPayload,
+                                >(&signed.payload)
+                                {
+                                    if let Some(e) =
+                                        payload.entries.iter().find(|e| e.target_key == rep_my_key)
+                                    {
+                                        rep_views.lock().unwrap().insert(from.clone(), e.score);
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::debug!("Отклонён sync репутации от {}: {}", from, e),
                         }
                     }
                     Ok(RepGossip::Report { signed }) => {
@@ -1190,6 +1259,11 @@ async fn backend_main(
                     if let Some(tx) = chunk_ev_tx.clone() {
                         manager.set_event_sink(tx);
                     }
+                    // Общие с GUI счётчики трафика (до клонирования менеджера в задачи).
+                    manager.set_traffic_counters(
+                        Arc::clone(&bytes_uploaded),
+                        Arc::clone(&bytes_downloaded),
+                    );
                     // Голосования (нужны БД + storage для RemoveFile).
                     start_vote_tasks(
                         manager.clone(), pool.clone(), chat.clone(), reputation.clone(),
@@ -1514,6 +1588,32 @@ async fn refresh_sites(
 /// Запускает фоновые задачи хранилища: chunk-сервер, обработку публикаций
 /// (с рассылкой манифеста по сети), приём чужих манифестов, скачивание по
 /// запросу и периодическое обновление списка файлов для GUI.
+/// Останавливает активное скачивание файла (если идёт) и ДОЖИДАЕТСЯ фактического
+/// завершения задачи — иначе она может дописать чанк/владельца уже после
+/// `delete_file` (гонка с осиротевшими блобами). Общий шаг для обоих видов удаления.
+async fn cancel_active_download(
+    cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    file_id: &str,
+) {
+    if let Some(flag) = cancels.lock().unwrap().get(file_id).cloned() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    if let Some(mut handle) = tasks.remove(file_id) {
+        if tokio::time::timeout(std::time::Duration::from_secs(15), &mut handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "Задача скачивания {} не завершилась за 15с — прерываю",
+                &file_id[..8.min(file_id.len())]
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_storage_tasks(
     manager:    StorageManager,
@@ -1593,6 +1693,8 @@ fn start_storage_tasks(
     let dl_chat  = chat.clone();
     let dl_pool  = pool.clone();
     let dl_pl    = peer_list.clone();
+    let dl_my_id = my_id.clone();
+    let dl_removed = Arc::clone(&removed_files);
     let downloads_dir = data_dir.join("downloads");
     // Флаги отмены активных скачиваний. Завершившаяся задача убирает свой флаг,
     // поэтому карта не растёт бесконечно.
@@ -1611,29 +1713,53 @@ fn start_storage_tasks(
                     }
                 }
                 DownloadCmd::Remove(file_id) => {
-                    // Останавливаем активное скачивание (если идёт)...
-                    if let Some(flag) = cancels.lock().unwrap().get(&file_id).cloned() {
-                        flag.store(true, Ordering::Relaxed);
+                    // Удаление из СЕТИ: только владелец и только если файл больше никто
+                    // (из живых узлов) не раздаёт. Иначе отказ — файл живёт у других
+                    // сидеров, его нельзя выпилить из сети (UI это тоже не предлагает,
+                    // но проверяем на стороне backend для надёжности).
+                    let is_owner = matches!(
+                        void_db::chunks::get_file(&dl_pool, &file_id).await,
+                        Ok(Some(f)) if f.owner_key == dl_my_id.as_str()
+                    );
+                    if !is_owner {
+                        tracing::warn!("Удаление из сети {} отклонено: не владелец файла",
+                            &file_id[..8.min(file_id.len())]);
+                        continue;
                     }
-                    // ...и ДОЖИДАЕМСЯ фактического завершения задачи, иначе она может
-                    // дописать чанк/владельца уже после delete_file — гонка, оставляющая
-                    // осиротевшие блобы и неконсистентное состояние.
-                    if let Some(mut handle) = tasks.remove(&file_id) {
-                        if tokio::time::timeout(std::time::Duration::from_secs(15), &mut handle)
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!(
-                                "Задача скачивания {} не завершилась за 15с — прерываю",
-                                &file_id[..8.min(file_id.len())]
-                            );
-                            handle.abort();
-                            let _ = handle.await;
-                        }
+                    let live: HashSet<String> = dl_pl.all().await.into_iter()
+                        .map(|p| p.id.as_str().to_string())
+                        .chain(std::iter::once(dl_my_id.as_str().to_string()))
+                        .collect();
+                    let others_seed = dl_chat.get_manifests().await.into_iter()
+                        .find(|m| m.file_id == file_id)
+                        .map(|m| m.owners.iter()
+                            .any(|o| o.as_str() != dl_my_id.as_str() && live.contains(o.as_str())))
+                        .unwrap_or(false);
+                    if others_seed {
+                        tracing::warn!("Удаление из сети {} отклонено: файл раздают другие узлы",
+                            &file_id[..8.min(file_id.len())]);
+                        continue;
                     }
+                    // Подавляем «воскрешение» файла входящим манифестом, затем стираем.
+                    {
+                        let mut set = dl_removed.lock().unwrap();
+                        set.insert(file_id.clone());
+                        crate::vote_service::save_removed_files(&set);
+                    }
+                    cancel_active_download(&cancels, &mut tasks, &file_id).await;
                     match dl_mgr.delete_file(&file_id).await {
-                        Ok(()) => tracing::info!("Файл {} удалён из раздачи", &file_id[..8.min(file_id.len())]),
+                        Ok(()) => tracing::info!("Файл {} удалён из сети", &file_id[..8.min(file_id.len())]),
                         Err(e) => tracing::warn!("Не удалось удалить файл {}: {}", &file_id[..8.min(file_id.len())], e),
+                    }
+                }
+                DownloadCmd::RemoveLocal(file_id) => {
+                    // Убираем ТОЛЬКО свою локальную копию (перестаём раздавать). Файл
+                    // остаётся в сети у других сидеров и может быть скачан снова, поэтому
+                    // в removed_files НЕ заносим (не подавляем будущие манифесты).
+                    cancel_active_download(&cancels, &mut tasks, &file_id).await;
+                    match dl_mgr.delete_file(&file_id).await {
+                        Ok(()) => tracing::info!("Локальная копия {} удалена", &file_id[..8.min(file_id.len())]),
+                        Err(e) => tracing::warn!("Не удалось убрать копию {}: {}", &file_id[..8.min(file_id.len())], e),
                     }
                 }
                 DownloadCmd::Start(file_id) => {

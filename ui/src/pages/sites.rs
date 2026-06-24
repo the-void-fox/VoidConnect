@@ -75,7 +75,8 @@ impl SitesPage {
     }
 
     fn open(url: &str) {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        // Кросс-платформенно (Windows/macOS/Linux) — не только `xdg-open`.
+        crate::sys_open::open_external(url);
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {

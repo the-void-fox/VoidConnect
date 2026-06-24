@@ -9,6 +9,8 @@
 //! Клиент вызывает `fetch_chunk_from_peer`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +98,7 @@ async fn read_message<T: for<'de> Deserialize<'de>>(
 pub async fn run_chunk_server(
     bind_addr: SocketAddr,
     store: ChunkStore,
+    bytes_uploaded: Arc<AtomicU64>,
 ) -> Result<(), StorageError> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -113,8 +116,9 @@ pub async fn run_chunk_server(
         };
 
         let store = store.clone();
+        let bytes_uploaded = Arc::clone(&bytes_uploaded);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, store).await {
+            if let Err(e) = handle_connection(stream, peer_addr, store, bytes_uploaded).await {
                 debug!("Connection from {} closed: {}", peer_addr, e);
             }
         });
@@ -125,6 +129,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     store: ChunkStore,
+    bytes_uploaded: Arc<AtomicU64>,
 ) -> Result<(), StorageError> {
     debug!("Incoming chunk request from {}", peer_addr);
 
@@ -145,6 +150,8 @@ async fn handle_connection(
             write_message(&mut stream, &response).await?;
             stream.write_all(&data).await
                 .map_err(|e| StorageError::Network(e.to_string()))?;
+            // Учёт отданного трафика (для статистики профиля).
+            bytes_uploaded.fetch_add(data.len() as u64, Ordering::Relaxed);
             debug!(
                 "Sent chunk {} ({} bytes) to {}",
                 &request.chunk_hash[..8],

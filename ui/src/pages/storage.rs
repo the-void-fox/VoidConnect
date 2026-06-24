@@ -78,8 +78,8 @@ pub struct StoragePage {
     pub downloading: HashSet<String>,
     /// Папка скачанных файлов (для действия «Открыть»).
     pub downloads_dir: Option<PathBuf>,
-    /// Индекс файла, ожидающего подтверждения удаления (показывается диалог).
-    pending_delete: Option<usize>,
+    /// Файл, ожидающий подтверждения удаления (индекс + вид удаления).
+    pending_delete: Option<(usize, DeleteKind)>,
     /// Профили узлов — для перевода ключа публикатора в читаемое имя.
     pub peer_profiles: Option<Arc<Mutex<HashMap<NodeId, PeerProfile>>>>,
     /// Наш ID — чтобы пометить свою «папку».
@@ -284,22 +284,31 @@ impl StoragePage {
         }
     }
 
-    /// Открывает скачанный файл системным приложением (xdg-open).
+    /// Открывает скачанный файл системным приложением (кросс-платформенно).
     fn open_file(&self, idx: usize) {
         let Some(file) = self.files.get(idx) else { return };
         let Some(dir) = &self.downloads_dir else { return };
         let path = dir.join(&file.name);
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        // Скачанные файлы лежат в <data_dir>/downloads/<name>. Свой раздаваемый
+        // файл там может отсутствовать (раздаётся из чанк-стора) — тогда не пытаемся.
+        if path.exists() {
+            crate::sys_open::open_external(&path);
+        }
     }
 
-    /// Удаляет файл из раздачи: просит backend стереть его и сразу убирает из
-    /// списка (снимок backend подтвердит на следующем тике).
-    fn remove_file(&mut self, idx: usize) {
+    /// Удаляет файл: «из сети» (только владелец, нет других сидеров) или «свою
+    /// копию» (перестать раздавать). Сразу убирает из списка — снимок backend
+    /// подтвердит на следующем тике.
+    fn remove_file(&mut self, idx: usize, kind: DeleteKind) {
         let Some(file) = self.files.get(idx) else { return };
         let file_id = file.file_id.clone();
         if file_id.is_empty() { return; }
         if let Some(tx) = &self.download_tx {
-            let _ = tx.send(DownloadCmd::Remove(file_id.clone()));
+            let cmd = match kind {
+                DeleteKind::Network => DownloadCmd::Remove(file_id.clone()),
+                DeleteKind::Local   => DownloadCmd::RemoveLocal(file_id.clone()),
+            };
+            let _ = tx.send(cmd);
         }
         self.downloading.remove(&file_id);
         self.files.retain(|f| f.file_id != file_id);
@@ -441,21 +450,36 @@ impl StoragePage {
                 RowAction::Pause    => self.pause_download(idx),
                 RowAction::Open     => self.open_file(idx),
                 RowAction::Report   => self.report_target = Some(idx),
-                RowAction::Delete   => self.pending_delete = Some(idx),
+                RowAction::Delete      => self.pending_delete = Some((idx, DeleteKind::Network)),
+                RowAction::RemoveLocal => self.pending_delete = Some((idx, DeleteKind::Local)),
             }
         }
 
         // === Диалог подтверждения удаления ===
-        if let Some(idx) = self.pending_delete {
+        if let Some((idx, kind)) = self.pending_delete {
             let Some(file) = self.files.get(idx) else {
                 self.pending_delete = None;
                 return;
             };
             let name = file.name.clone();
-            let is_mine = file.is_mine;
             let mut close = false;
             let mut confirm = false;
-            egui::Window::new("󰩺  Удалить файл")
+            let (title, msg, btn_label) = match kind {
+                DeleteKind::Network => (
+                    "󰩺  Удалить из сети",
+                    "Файл будет убран из вашей раздачи и стёрт с диска. Других сидеров нет — \
+                     файл станет недоступен в сети, и его манифест больше не будет приниматься. \
+                     Действие необратимо.",
+                    "󰩺  Удалить из сети",
+                ),
+                DeleteKind::Local => (
+                    "󰮞  Убрать мою копию",
+                    "Ваша локальная копия будет удалена, вы перестанете раздавать файл. Сам файл \
+                     останется доступен в сети у других сидеров — его можно будет скачать снова.",
+                    "󰮞  Убрать копию",
+                ),
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .fixed_size([380.0, 0.0])
@@ -464,13 +488,6 @@ impl StoragePage {
                     ui.add_space(6.0);
                     ui.label(RichText::new(&name).strong());
                     ui.add_space(6.0);
-                    let msg = if is_mine {
-                        "Файл будет убран из вашей раздачи, а его чанки удалены с диска. \
-                         Если других сидеров нет — файл станет недоступен в сети."
-                    } else {
-                        "Локальная копия и метаданные файла будут удалены. Файл можно будет \
-                         скачать снова, пока есть сидеры."
-                    };
                     ui.label(RichText::new(msg).small().color(ui.visuals().weak_text_color()));
                     ui.add_space(12.0);
                     ui.separator();
@@ -480,7 +497,7 @@ impl StoragePage {
                             close = true;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let del = Button::new(RichText::new("󰩺  Удалить").color(egui::Color32::WHITE))
+                            let del = Button::new(RichText::new(btn_label).color(egui::Color32::WHITE))
                                 .fill(egui::Color32::from_rgb(180, 60, 50));
                             if ui.add(del).clicked() {
                                 confirm = true;
@@ -489,7 +506,7 @@ impl StoragePage {
                     });
                 });
             if confirm {
-                self.remove_file(idx);
+                self.remove_file(idx, kind);
                 close = true;
             }
             if close {
@@ -754,16 +771,31 @@ fn table_row(
             ui.allocate_ui(egui::vec2(COL_REPORT, ROW_H), |ui| {
                 ui.set_width(COL_REPORT);
                 ui.centered_and_justified(|ui| {
+                    // Удаление из сети — только владельцу и только если файл больше
+                    // никто не раздаёт (seeders ≤ 1 = только мы). Иначе доступно лишь
+                    // «убрать мою копию», и только когда копия реально есть локально.
+                    let can_network_delete = file.is_mine && file.seeders <= 1;
+                    let has_local_copy = !matches!(file.status, FileStatus::NotStarted);
+                    let can_remove_local = !can_network_delete && (file.is_mine || has_local_copy);
                     ui.menu_button(RichText::new("\u{F01D9}").size(15.0).color(ui.visuals().weak_text_color()), |ui| {
-                        if ui.button("\u{F0026}  Пожаловаться").clicked() {
+                        if !file.is_mine && ui.button("\u{F0026}  Пожаловаться").clicked() {
                             *action = Some((idx, RowAction::Report));
                             ui.close_menu();
                         }
-                        if ui.button(RichText::new("\u{F0A7A}  Удалить из раздачи")
-                            .color(egui::Color32::from_rgb(220, 90, 70))).clicked()
-                        {
-                            *action = Some((idx, RowAction::Delete));
-                            ui.close_menu();
+                        if can_network_delete {
+                            if ui.button(RichText::new("\u{F0A7A}  Удалить из сети")
+                                .color(egui::Color32::from_rgb(220, 90, 70))).clicked()
+                            {
+                                *action = Some((idx, RowAction::Delete));
+                                ui.close_menu();
+                            }
+                        } else if can_remove_local {
+                            if ui.button(RichText::new("\u{F0A7A}  Убрать мою копию")
+                                .color(egui::Color32::from_rgb(220, 160, 80))).clicked()
+                            {
+                                *action = Some((idx, RowAction::RemoveLocal));
+                                ui.close_menu();
+                            }
                         }
                     });
                 });
@@ -1034,5 +1066,17 @@ enum RowAction {
     Pause,
     Open,
     Report,
+    /// Удалить файл из сети (владелец, других сидеров нет).
     Delete,
+    /// Убрать только свою локальную копию (перестать раздавать).
+    RemoveLocal,
+}
+
+/// Какой вид удаления подтверждается в диалоге.
+#[derive(Clone, Copy, PartialEq)]
+enum DeleteKind {
+    /// Удалить файл из сети целиком (владелец, других сидеров нет).
+    Network,
+    /// Убрать только свою локальную копию.
+    Local,
 }
