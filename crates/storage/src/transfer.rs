@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use void_core::identity::NodeId;
+use void_network::conn_guard::ConnLimiter;
 
 use crate::chunk_store::ChunkStore;
 use crate::error::StorageError;
@@ -27,6 +28,16 @@ use crate::integrity::verify_chunk;
 
 /// Таймаут на получение одного чанка
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Сколько одновременных входящих соединений обслуживает сервер чанков суммарно.
+/// Запросы короткоживущие (запрос → ответ), поэтому потолок щедрый.
+const MAX_CHUNK_CONNS: usize = 256;
+/// Сколько соединений к серверу чанков допускается с одного IP одновременно —
+/// чтобы один адрес не вытеснил остальных (защита от connection-flood).
+const MAX_CHUNK_CONNS_PER_IP: usize = 16;
+/// Таймаут на чтение запроса от клиента (защита от slowloris: соединение открыто,
+/// но запрос не присылается — не должно держать слот вечно).
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ─── Протокол ─────────────────────────────────────────────────────────────────
 
@@ -106,6 +117,8 @@ pub async fn run_chunk_server(
 
     info!("Chunk server listening on {}", bind_addr);
 
+    let limiter = ConnLimiter::new(MAX_CHUNK_CONNS, MAX_CHUNK_CONNS_PER_IP);
+
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
@@ -115,9 +128,21 @@ pub async fn run_chunk_server(
             }
         };
 
+        // Защита от connection-flood: при достижении лимита соединение сразу
+        // закрывается, не порождая задачу.
+        let permit = match limiter.try_accept(peer_addr.ip()) {
+            Some(p) => p,
+            None => {
+                debug!("Chunk server at capacity, dropping {}", peer_addr);
+                drop(stream);
+                continue;
+            }
+        };
+
         let store = store.clone();
         let bytes_uploaded = Arc::clone(&bytes_uploaded);
         tokio::spawn(async move {
+            let _permit = permit; // удерживается на всё время обработки
             if let Err(e) = handle_connection(stream, peer_addr, store, bytes_uploaded).await {
                 debug!("Connection from {} closed: {}", peer_addr, e);
             }
@@ -133,7 +158,10 @@ async fn handle_connection(
 ) -> Result<(), StorageError> {
     debug!("Incoming chunk request from {}", peer_addr);
 
-    let request: ChunkRequest = read_message(&mut stream).await?;
+    // Slowloris-защита: на чтение запроса даём ограниченное время.
+    let request: ChunkRequest = timeout(REQUEST_READ_TIMEOUT, read_message(&mut stream))
+        .await
+        .map_err(|_| StorageError::Network("request read timed out".into()))??;
     debug!(
         "Request chunk {} from {}",
         &request.chunk_hash[..8.min(request.chunk_hash.len())],

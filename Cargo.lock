@@ -5042,6 +5042,7 @@ dependencies = [
  "tokio",
  "tracing",
  "void-core",
+ "void-network",
 ]
 
 [[package]]
@@ -5088,6 +5089,7 @@ dependencies = [
  "uuid",
  "void-core",
  "void-db",
+ "void-network",
 ]
 
 [[package]]

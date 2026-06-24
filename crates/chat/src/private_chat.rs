@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 
 use void_core::identity::NodeId;
 use void_core::peer::PeerInfo;
+use void_network::conn_guard::ConnLimiter;
 use void_crypto::encrypt::EncryptedMessage;
 use void_crypto::keys::EncryptionKeypair;
 
@@ -131,15 +132,34 @@ pub async fn start_private_chat(
 
 // ── TCP-сервер (принимаем входящие DM) ────────────────────────────────────────
 
+/// Глобальный потолок одновременных входящих DM-соединений.
+const MAX_DM_CONNS: usize = 1024;
+/// Лимит одновременных DM-соединений с одного IP (защита от connection-flood).
+const MAX_DM_CONNS_PER_IP: usize = 64;
+/// Таймаут на приветственный Hello (slowloris-защита).
+const DM_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn run_dm_server(handle: PrivateChatHandle, port: u16) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     info!("DM server listening on {}", addr);
+    let limiter = ConnLimiter::new(MAX_DM_CONNS, MAX_DM_CONNS_PER_IP);
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, peer_addr)) => {
+                let permit = match limiter.try_accept(peer_addr.ip()) {
+                    Some(p) => p,
+                    None => {
+                        debug!("DM server at capacity, dropping {}", peer_addr);
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let h = handle.clone();
-                tokio::spawn(async move { accept_dm_conn(stream, h).await; });
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    accept_dm_conn(stream, h).await;
+                });
             }
             Err(e) => warn!("DM accept error: {}", e),
         }
@@ -153,10 +173,11 @@ async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
     debug!("DM incoming from {}", addr);
     let (mut rd, mut wr) = stream.into_split();
 
-    // Читаем Hello от клиента
-    let hello = match read_dm_pkt(&mut rd).await {
-        Ok(p) => p,
-        Err(e) => { warn!("DM: no Hello from {}: {}", addr, e); return; }
+    // Читаем Hello от клиента (с таймаутом — защита от slowloris)
+    let hello = match timeout(DM_HELLO_TIMEOUT, read_dm_pkt(&mut rd)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => { warn!("DM: no Hello from {}: {}", addr, e); return; }
+        Err(_) => { warn!("DM: Hello timeout from {}", addr); return; }
     };
     let (peer_id, peer_name, their_enc_pub) = match hello {
         DmPacket::Hello { node_id, name, enc_pubkey } => {

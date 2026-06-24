@@ -10,6 +10,8 @@ pub struct PeerPopupAction {
     pub start_dm: bool,
     /// Выбрана причина жалобы на узел.
     pub report: Option<ReportReason>,
+    /// Пользователь переключил отметку «проверен» (сверил safety number).
+    pub toggle_verify: bool,
 }
 
 pub fn status_colors(status: Option<&str>) -> (egui::Color32, egui::Color32) {
@@ -31,6 +33,8 @@ pub fn show_peer_profile(
     reputation: Option<f64>,
     reports:    &[ReportRow],
     banned:     bool,
+    my_id:      &str,
+    verified:   bool,
 ) -> PeerPopupAction {
     let name        = profile.map(|p| p.name.as_str())
         .or_else(|| peer.map(|p| p.name.as_str()))
@@ -39,6 +43,7 @@ pub fn show_peer_profile(
     let status      = profile.map(|p| p.status.as_str()).unwrap_or("online");
     let has_dm_key  = profile.and_then(|p| p.enc_pubkey.as_ref()).is_some();
     let is_bootstrap = profile.map(|p| p.is_bootstrap).unwrap_or(false);
+    let mut toggle_verify = false;
 
     // Avatar + name/status row
     ui.horizontal(|ui| {
@@ -83,6 +88,14 @@ pub fn show_peer_profile(
                         .color(egui::Color32::from_rgb(220, 80, 60)),
                 );
             }
+            if verified {
+                ui.label(
+                    egui::RichText::new("󰄬  Контакт проверен")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(80, 190, 110)),
+                );
+            }
         });
     });
 
@@ -117,6 +130,44 @@ pub fn show_peer_profile(
                 .small()
                 .color(ui.visuals().weak_text_color()),
         );
+    }
+
+    // ── Проверка контакта (safety number) ────────────────────────────────────
+    let peer_id = peer.map(|p| p.id.as_str())
+        .or_else(|| profile.map(|p| p.node_id.as_str()));
+    if let Some(pid) = peer_id {
+        if !my_id.is_empty() && pid != my_id {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            let header = if verified {
+                egui::RichText::new("󰄬  Проверка контакта: подтверждён")
+                    .color(egui::Color32::from_rgb(80, 190, 110))
+            } else {
+                egui::RichText::new("󰀦  Проверка контакта: не подтверждён")
+                    .color(egui::Color32::from_rgb(220, 170, 70))
+            };
+            egui::CollapsingHeader::new(header).id_source("peer_verify").show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Имена не удостоверены — кто угодно может назваться так же. Сверьте эти \
+                         цифры с собеседником по другому каналу (звонок, личная встреча). \
+                         Совпали — отметьте контакт проверенным. Если код вдруг изменился — \
+                         возможна подмена личности.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(4.0);
+                let code = void_crypto::verify::safety_number(my_id, pid);
+                ui.label(egui::RichText::new(&code).monospace().size(15.0));
+                ui.add_space(6.0);
+                let label = if verified { "Снять отметку «проверен»" } else { "Отметить проверенным" };
+                if ui.button(label).clicked() {
+                    toggle_verify = true;
+                }
+            });
+        }
     }
 
     // Репутация узла (по локальным данным; сетевая синхронизация — отд. фаза)
@@ -212,5 +263,5 @@ pub fn show_peer_profile(
         }
     });
 
-    PeerPopupAction { start_dm: clicked, report }
+    PeerPopupAction { start_dm: clicked, report, toggle_verify }
 }

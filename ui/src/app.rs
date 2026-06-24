@@ -74,6 +74,12 @@ pub struct VoidApp {
     settings_bootstrap_input: String,
     /// Показать отметку «сохранено» после записи настроек.
     settings_saved:   bool,
+    // ── Пароль аккаунта (в окне настроек) ─────────────────────────────────
+    pw_current:       String,
+    pw_new:           String,
+    pw_confirm:       String,
+    /// Результат последней операции с паролем: (это_ошибка, текст).
+    pw_msg:           Option<(bool, String)>,
 }
 
 impl VoidApp {
@@ -87,6 +93,10 @@ impl VoidApp {
         chat.reports = Some(std::sync::Arc::clone(&backend.reports));
         chat.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
         chat.voted_channels = Some(std::sync::Arc::clone(&backend.voted_channels));
+        // Локальный список проверенных контактов (общий для chat и graph).
+        let verified = std::sync::Arc::new(std::sync::Mutex::new(crate::verify_store::load_verified()));
+        chat.verified = Some(std::sync::Arc::clone(&verified));
+        chat.my_id_hex = backend.my_id_full.clone();
 
         // Load saved profile values (description, status) for the profile page
         let saved = crate::profile_store::load_or_create();
@@ -111,6 +121,7 @@ impl VoidApp {
         graph.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
         graph.reports = Some(std::sync::Arc::clone(&backend.reports));
         graph.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
+        graph.verified = Some(std::sync::Arc::clone(&verified));
 
         // Инициализируем страницу личных сообщений
         let mut private = PrivatePage::default();
@@ -166,6 +177,10 @@ impl VoidApp {
             backend,
             peer_count: 0,
             history_loaded: false,
+            pw_current: String::new(),
+            pw_new: String::new(),
+            pw_confirm: String::new(),
+            pw_msg: None,
             show_settings: false,
             show_about: false,
             show_docs: false,
@@ -619,8 +634,122 @@ impl VoidApp {
                     "Сейчас активен: обычный режим"
                 };
                 ui.label(egui::RichText::new(live).small().color(ui.visuals().weak_text_color()));
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+                self.show_password_section(ui);
             });
         self.show_settings = open;
+    }
+
+    /// Раздел «Безопасность аккаунта»: установка/смена/снятие пароля.
+    ///
+    /// Пароль шифрует ключи на диске (KEK = KDF(machine-id + пароль)). NodeId при
+    /// этом не меняется — пароль можно включать и снимать, не теряя личность.
+    fn show_password_section(&mut self, ui: &mut egui::Ui) {
+        use void_crypto::identity::KeystoreState;
+
+        let data_dir = crate::profile_store::profile_dir();
+        let has_pw = matches!(
+            void_crypto::Identity::keystore_status(&data_dir),
+            KeystoreState::PasswordRequired,
+        );
+
+        ui.label(egui::RichText::new("\u{F0BC4}  Безопасность аккаунта").strong().size(15.0));
+        ui.add_space(6.0);
+
+        if has_pw {
+            ui.label(
+                egui::RichText::new("\u{F0BC5}  Аккаунт защищён паролем — он спрашивается при запуске.")
+                    .color(egui::Color32::from_rgb(80, 190, 110)),
+            );
+        } else {
+            ui.label("Пароль не задан: на этом устройстве ключи расшифровываются автоматически.");
+        }
+        ui.label(
+            egui::RichText::new(
+                "Пароль шифрует ключи на диске — с ним изъятие компьютера не даёт доступ к \
+                 аккаунту. Внимание: если забыть пароль, личность на этом ПК восстановить нельзя.",
+            )
+            .small()
+            .color(ui.visuals().weak_text_color()),
+        );
+
+        ui.add_space(8.0);
+        egui::Grid::new("pw_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            if has_pw {
+                ui.label("Текущий пароль:");
+                ui.add(egui::TextEdit::singleline(&mut self.pw_current).password(true).desired_width(220.0));
+                ui.end_row();
+            }
+            ui.label(if has_pw { "Новый пароль:" } else { "Пароль:" });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pw_new)
+                    .password(true)
+                    .hint_text(if has_pw { "пусто = снять пароль" } else { "" })
+                    .desired_width(220.0),
+            );
+            ui.end_row();
+
+            ui.label("Повтор:");
+            ui.add(egui::TextEdit::singleline(&mut self.pw_confirm).password(true).desired_width(220.0));
+            ui.end_row();
+        });
+
+        ui.add_space(8.0);
+        let btn_label = if has_pw {
+            if self.pw_new.is_empty() { "\u{F0BC5}  Снять пароль" } else { "\u{F0193}  Сменить пароль" }
+        } else {
+            "\u{F0BC4}  Установить пароль"
+        };
+        if ui.button(btn_label).clicked() {
+            self.apply_password_change(&data_dir, has_pw);
+        }
+
+        if let Some((is_err, msg)) = &self.pw_msg {
+            ui.add_space(6.0);
+            let color = if *is_err {
+                egui::Color32::from_rgb(220, 80, 60)
+            } else {
+                egui::Color32::from_rgb(80, 200, 80)
+            };
+            ui.label(egui::RichText::new(msg).color(color));
+        }
+    }
+
+    /// Валидирует поля и применяет смену пароля (блокирующий вызов: PBKDF2).
+    fn apply_password_change(&mut self, data_dir: &std::path::Path, has_pw: bool) {
+        if self.pw_new != self.pw_confirm {
+            self.pw_msg = Some((true, "Пароли не совпадают".into()));
+            return;
+        }
+        let new = if self.pw_new.is_empty() { None } else { Some(self.pw_new.as_str()) };
+        if !has_pw && new.is_none() {
+            self.pw_msg = Some((true, "Введите новый пароль".into()));
+            return;
+        }
+        let current = if has_pw { Some(self.pw_current.as_str()) } else { None };
+
+        match void_crypto::Identity::set_password(data_dir, current, new) {
+            Ok(()) => {
+                let what = match (has_pw, new.is_some()) {
+                    (false, _)      => "Пароль установлен",
+                    (true, true)    => "Пароль изменён",
+                    (true, false)   => "Пароль снят",
+                };
+                self.pw_current.clear();
+                self.pw_new.clear();
+                self.pw_confirm.clear();
+                self.pw_msg = Some((false, what.into()));
+            }
+            Err(void_crypto::CryptoError::WrongPassword) => {
+                self.pw_msg = Some((true, "Неверный текущий пароль".into()));
+            }
+            Err(e) => {
+                self.pw_msg = Some((true, format!("Ошибка: {e}")));
+            }
+        }
     }
 
     fn show_about_window(&mut self, ctx: &egui::Context) {

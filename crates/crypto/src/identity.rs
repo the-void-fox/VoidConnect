@@ -34,9 +34,19 @@ use zeroize::Zeroizing;
 
 use crate::error::CryptoError;
 use crate::keys::{SigningKeypair, EncryptionKeypair, PublicKeys};
+use crate::keystore::{Keystore, KEYSTORE_FILE};
 use crate::machine::MachineFingerprint;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Нужен ли пароль для загрузки личности (результат `Identity::keystore_status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeystoreState {
+    /// Кейстора нет (первый запуск/легаси) или он без пароля — авто-разблокировка.
+    NoPasswordNeeded,
+    /// Кейстор защищён паролем — нужно спросить пользователя.
+    PasswordRequired,
+}
 
 // ---------------------------------------------------------------------------
 // AccountId
@@ -91,30 +101,122 @@ impl Identity {
     // Загрузка / создание
     // -----------------------------------------------------------------------
 
-    /// Загружает Identity для текущего устройства.
+    /// Загружает Identity для текущего устройства (без пароля).
     ///
-    /// - Если `machine.secret` не существует — создаёт его (первый запуск).
-    /// - Собирает аппаратный отпечаток.
-    /// - Деривирует keypair детерминированно.
-    ///
-    /// `data_dir` — директория данных приложения, например `~/.void/`.
+    /// Эквивалент `load_or_create_with_password(data_dir, None)`. Если кейстор
+    /// защищён паролем — вернёт [`CryptoError::WrongPassword`]; в этом случае
+    /// вызывающий код должен спросить пароль (см. [`Identity::keystore_status`]).
     pub fn load_or_create(data_dir: &Path) -> Result<Self, CryptoError> {
-        let secret_path = data_dir.join("machine.secret");
+        Self::load_or_create_with_password(data_dir, None)
+    }
 
-        // Читаем или создаём machine.secret
-        let machine_secret = Self::load_or_create_machine_secret(&secret_path)?;
+    /// Загружает Identity, расшифровывая master-секрет паролем (если задан).
+    ///
+    /// Логика хранения секрета (machine.secret):
+    /// - есть `keystore.json` → расшифровать им (`password` обязателен, если
+    ///   кейстор защищён);
+    /// - есть старый открытый `machine.secret` → мигрировать в кейстор
+    ///   (без пароля), личность не меняется;
+    /// - ничего нет → новый аккаунт: случайный секрет, сразу в кейстор.
+    ///
+    /// AccountId/NodeId зависит ТОЛЬКО от байт секрета + железа — пароль на него
+    /// не влияет (его можно включать/снимать, не теряя личность).
+    pub fn load_or_create_with_password(
+        data_dir: &Path,
+        password: Option<&str>,
+    ) -> Result<Self, CryptoError> {
+        let machine_id = crate::machine::machine_id();
+        let secret = Self::resolve_secret(data_dir, &machine_id, password)?;
+        Self::build_from_secret(&secret)
+    }
 
-        // Собираем аппаратный отпечаток
+    /// Сообщает, нужен ли пароль для загрузки (для UI — спрашивать или нет).
+    /// Не расшифровывает секрет, только читает заголовок кейстора.
+    pub fn keystore_status(data_dir: &Path) -> KeystoreState {
+        let path = data_dir.join(KEYSTORE_FILE);
+        match Keystore::load(&path) {
+            Ok(ks) if ks.password_protected => KeystoreState::PasswordRequired,
+            _ => KeystoreState::NoPasswordNeeded,
+        }
+    }
+
+    /// Устанавливает / меняет / снимает пароль.
+    ///
+    /// `current` — текущий пароль (None, если его нет), `new` — новый (None =
+    /// снять пароль). При установке пароля удаляет устаревший открытый
+    /// `machine.secret`, иначе защита на диске обходится.
+    pub fn set_password(
+        data_dir: &Path,
+        current: Option<&str>,
+        new: Option<&str>,
+    ) -> Result<(), CryptoError> {
+        let machine_id = crate::machine::machine_id();
+        // Получаем секрет под текущим паролем (заодно мигрируем при необходимости).
+        let secret = Self::resolve_secret(data_dir, &machine_id, current)?;
+        // Перешифровываем под новым паролем.
+        let keystore_path = data_dir.join(KEYSTORE_FILE);
+        Keystore::create(&machine_id, &secret, new)?.save(&keystore_path)?;
+        // С паролем открытый machine.secret больше не должен лежать на диске.
+        if new.is_some() {
+            let _ = fs::remove_file(data_dir.join("machine.secret"));
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Вспомогательные методы
+    // -----------------------------------------------------------------------
+
+    /// Достаёт 32-байтовый master-секрет: из кейстора, из старого открытого
+    /// файла (с миграцией) или генерирует новый.
+    fn resolve_secret(
+        data_dir: &Path,
+        machine_id: &str,
+        password: Option<&str>,
+    ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+        let keystore_path = data_dir.join(KEYSTORE_FILE);
+        let legacy_path = data_dir.join("machine.secret");
+
+        if keystore_path.exists() {
+            let ks = Keystore::load(&keystore_path)?;
+            return ks.unlock(machine_id, password);
+        }
+
+        if let Some(parent) = keystore_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        if legacy_path.exists() {
+            // Миграция: открытый machine.secret → зашифрованный кейстор без пароля.
+            let bytes = fs::read(&legacy_path)?;
+            if bytes.len() != 32 {
+                return Err(CryptoError::MachineFingerprint(
+                    "machine.secret повреждён (неверный размер)".into(),
+                ));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let secret = Zeroizing::new(arr);
+            Keystore::create(machine_id, &secret, None)?.save(&keystore_path)?;
+            return Ok(secret);
+        }
+
+        // Новый аккаунт — случайный секрет сразу в кейстор (без открытого файла).
+        let mut arr = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut arr);
+        let secret = Zeroizing::new(arr);
+        Keystore::create(machine_id, &secret, None)?.save(&keystore_path)?;
+        Ok(secret)
+    }
+
+    /// Детерминированно строит Identity из master-секрета + отпечатка железа.
+    fn build_from_secret(machine_secret: &[u8; 32]) -> Result<Self, CryptoError> {
         let fingerprint = MachineFingerprint::collect()?;
+        let machine_seed = Self::derive_machine_seed(&fingerprint.digest, machine_secret);
 
-        // Деривируем seed через HMAC(fingerprint | machine_secret)
-        let machine_seed = Self::derive_machine_seed(&fingerprint.digest, &machine_secret);
-
-        // Из seed получаем два независимых seed через BLAKE3 KDF
         let signing_seed    = Self::kdf(&machine_seed, "void-connect/signing/v1");
         let encryption_seed = Self::kdf(&machine_seed, "void-connect/encryption/v1");
 
-        // Создаём keypair
         let signing    = SigningKeypair::from_seed(&signing_seed)?;
         let encryption = EncryptionKeypair::from_seed(&encryption_seed);
 
@@ -122,44 +224,6 @@ impl Identity {
         let id = AccountId(hex::encode(signing.public_bytes()));
 
         Ok(Self { id, signing, encryption, public_keys })
-    }
-
-    // -----------------------------------------------------------------------
-    // Вспомогательные методы
-    // -----------------------------------------------------------------------
-
-    /// Читает machine.secret из файла или генерирует новый (первый запуск).
-    fn load_or_create_machine_secret(path: &Path) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-        if path.exists() {
-            let bytes = fs::read(path)?;
-            if bytes.len() != 32 {
-                return Err(CryptoError::MachineFingerprint(
-                    "machine.secret повреждён (неверный размер)".into()
-                ));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            Ok(Zeroizing::new(arr))
-        } else {
-            // Первый запуск — генерируем 32 случайных байта
-            let mut secret = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut secret);
-
-            // Создаём директорию если нет
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(path, &secret)?;
-
-            // Устанавливаем права только для владельца (Unix)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-            }
-
-            Ok(Zeroizing::new(secret))
-        }
     }
 
     /// HMAC-SHA256(key=machine_secret, data=fingerprint_digest) → 32-байтовый seed.
@@ -273,5 +337,67 @@ mod tests {
         let s = Identity::kdf(&master, "void-connect/signing/v1");
         let e = Identity::kdf(&master, "void-connect/encryption/v1");
         assert_ne!(s, e);
+    }
+
+    #[test]
+    fn first_run_creates_keystore_not_plaintext() {
+        let dir = tempdir().unwrap();
+        let _ = Identity::load_or_create(dir.path()).unwrap();
+        // Новый аккаунт хранит секрет только в кейсторе, без открытого файла.
+        assert!(dir.path().join(KEYSTORE_FILE).exists());
+        assert!(!dir.path().join("machine.secret").exists());
+        // Без пароля кейстор не помечен как защищённый.
+        assert_eq!(Identity::keystore_status(dir.path()), KeystoreState::NoPasswordNeeded);
+    }
+
+    #[test]
+    fn legacy_plaintext_migrates_preserving_identity() {
+        let dir = tempdir().unwrap();
+        // Эмулируем старую установку: открытый machine.secret из 32 байт.
+        std::fs::write(dir.path().join("machine.secret"), [5u8; 32]).unwrap();
+
+        let id1 = Identity::load_or_create(dir.path()).unwrap();
+        // После загрузки появился кейстор; повторная загрузка даёт тот же ID.
+        assert!(dir.path().join(KEYSTORE_FILE).exists());
+        let id2 = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(id1.id, id2.id);
+    }
+
+    #[test]
+    fn setting_password_preserves_identity_and_requires_it() {
+        let dir = tempdir().unwrap();
+        let id1 = Identity::load_or_create(dir.path()).unwrap();
+
+        // Ставим пароль.
+        Identity::set_password(dir.path(), None, Some("s3cret")).unwrap();
+        assert_eq!(Identity::keystore_status(dir.path()), KeystoreState::PasswordRequired);
+
+        // Без пароля теперь не загрузиться.
+        assert!(matches!(
+            Identity::load_or_create(dir.path()),
+            Err(CryptoError::WrongPassword)
+        ));
+
+        // С верным паролем — тот же NodeId, что и до установки пароля.
+        let id2 = Identity::load_or_create_with_password(dir.path(), Some("s3cret")).unwrap();
+        assert_eq!(id1.id, id2.id);
+
+        // Снимаем пароль — снова авто-разблокировка, ID сохраняется.
+        Identity::set_password(dir.path(), Some("s3cret"), None).unwrap();
+        assert_eq!(Identity::keystore_status(dir.path()), KeystoreState::NoPasswordNeeded);
+        let id3 = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(id1.id, id3.id);
+    }
+
+    #[test]
+    fn wrong_current_password_cannot_change() {
+        let dir = tempdir().unwrap();
+        let _ = Identity::load_or_create(dir.path()).unwrap();
+        Identity::set_password(dir.path(), None, Some("right")).unwrap();
+        // Неверный текущий пароль → смена отклонена.
+        assert!(matches!(
+            Identity::set_password(dir.path(), Some("wrong"), Some("new")),
+            Err(CryptoError::WrongPassword)
+        ));
     }
 }

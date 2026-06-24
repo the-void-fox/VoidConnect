@@ -22,6 +22,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use void_core::peer::PeerInfo;
+use void_network::conn_guard::ConnLimiter;
 
 use crate::peer_list::PeerList;
 
@@ -39,6 +40,12 @@ const MAX_MSG: usize = 1024 * 1024;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Реальный узел имеет 64-символьный hex NodeId (не stub-заглушка).
 const REAL_ID_LEN: usize = 64;
+/// Сколько одновременных регистраций обслуживает bootstrap суммарно.
+const MAX_BOOTSTRAP_CONNS: usize = 128;
+/// Лимит одновременных соединений с одного IP (защита от connection-flood).
+const MAX_BOOTSTRAP_CONNS_PER_IP: usize = 8;
+/// Таймаут на чтение Hello от клиента (защита от slowloris).
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -109,13 +116,24 @@ pub async fn start_bootstrap_server(
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Bootstrap server listening on 0.0.0.0:{}", port);
+    let limiter = ConnLimiter::new(MAX_BOOTSTRAP_CONNS, MAX_BOOTSTRAP_CONNS_PER_IP);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Защита от connection-flood: при переполнении сразу закрываем.
+                    let permit = match limiter.try_accept(addr.ip()) {
+                        Some(p) => p,
+                        None => {
+                            debug!("Bootstrap at capacity, dropping {}", addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let pl = peer_list.clone();
                     let me = my_peer.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_bootstrap_client(stream, me, pl).await {
                             debug!("Bootstrap client {} error: {}", addr, e);
                         }
@@ -137,8 +155,12 @@ async fn handle_bootstrap_client(
     let src_ip = stream.peer_addr().ok().map(|a| a.ip());
 
     // Шаг 1: читаем Hello и регистрируем новичка (только реальные узлы).
+    // Slowloris-защита: ограничиваем время ожидания первого сообщения.
     let mut probe_port: Option<u16> = None;
-    if let BootstrapMsg::Hello { mut peer } = read_msg(&mut stream).await? {
+    let first = timeout(CLIENT_READ_TIMEOUT, read_msg(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client read timed out"))??;
+    if let BootstrapMsg::Hello { mut peer } = first {
         if peer.id.as_str().len() == REAL_ID_LEN {
             // NAT-traversal: узел рекламирует свой LAN-адрес, но из другой сети он
             // недостижим. Подменяем приватный/loopback ip на ВНЕШНИЙ (источник

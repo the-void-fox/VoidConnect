@@ -1,17 +1,18 @@
 mod app;
 mod avatar;
 mod backend;
+mod boot;
 mod device_lock;
 mod pages;
 mod profile_store;
 mod private_store;
 mod settings_store;
 mod sys_open;
+mod verify_store;
 mod vote_service;
 mod widgets;
 
 use eframe::egui;
-use void_core::identity::NodeId;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -105,19 +106,17 @@ fn main() -> eframe::Result<()> {
         return run_locked_ui(data_dir, recorded, current);
     }
 
-    let identity = void_crypto::Identity::load_or_create(&data_dir)
-        .expect("Failed to load or create crypto identity");
-    let node_id = NodeId(identity.id.as_str().to_string());
-    // Keep profile.json node_id in sync with the real crypto-derived ID
-    saved.node_id = identity.id.as_str().to_string();
-    profile_store::save_profile(&saved).ok();
-
-    // Оборачиваем keypair'ы в Arc, чтобы шарить между backend и GUI.
-    let enc_kp = std::sync::Arc::new(identity.encryption);
-    // Ключ подписи сообщений общего чата (его pubkey == node_id).
-    let sign_kp = std::sync::Arc::new(identity.signing);
-
-    let backend = backend::start_backend(name, base_port, node_id, local_mode, public_mode, bootstrap_addrs, enc_kp, sign_kp, data_dir);
+    // Идентичность загружается отложенно в `BootApp`: если кейстор защищён
+    // паролем, бэкенд не стартует, пока пользователь не введёт верный пароль.
+    let params = boot::LaunchParams {
+        name,
+        base_port,
+        local_mode,
+        public_mode,
+        bootstrap_addrs,
+        data_dir,
+        saved,
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -137,7 +136,7 @@ fn main() -> eframe::Result<()> {
             install_fonts(&cc.egui_ctx);
             cc.egui_ctx.set_pixels_per_point(1.5);
 
-            Box::new(app::VoidApp::new(backend))
+            Box::new(boot::BootApp::new(params))
         }),
     )
 }

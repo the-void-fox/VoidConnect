@@ -34,12 +34,19 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use void_core::identity::NodeId;
+use void_network::conn_guard::ConnLimiter;
 
 /// Смещение порта relay-сервиса относительно `base_port`.
 pub const RELAY_PORT_OFFSET: u16 = 6;
 
 const MAX_FRAME: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Глобальный потолок одновременных соединений с relay-узлом.
+const MAX_RELAY_CONNS: usize = 512;
+/// Лимит одновременных соединений с одного IP (защита от connection-flood).
+const MAX_RELAY_CONNS_PER_IP: usize = 32;
+/// Таймаут на первый кадр (роль соединения) — защита от slowloris.
+const RELAY_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Сколько relay ждёт, пока принимающая сторона откроет data-соединение.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 /// Период keep-alive контрольного соединения.
@@ -109,12 +116,22 @@ pub async fn start_relay_server(port: u16) -> io::Result<()> {
         registry: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
     });
+    let limiter = ConnLimiter::new(MAX_RELAY_CONNS, MAX_RELAY_CONNS_PER_IP);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    let permit = match limiter.try_accept(addr.ip()) {
+                        Some(p) => p,
+                        None => {
+                            debug!("Relay at capacity, dropping {}", addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let inner = Arc::clone(&inner);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_relay_conn(stream, inner).await {
                             debug!("Relay conn {} ended: {}", addr, e);
                         }
@@ -129,7 +146,11 @@ pub async fn start_relay_server(port: u16) -> io::Result<()> {
 
 /// Разбирает первый кадр соединения и направляет в нужную роль.
 async fn handle_relay_conn(mut stream: TcpStream, inner: Arc<RelayInner>) -> io::Result<()> {
-    match read_frame(&mut stream).await? {
+    // Slowloris-защита: на первый кадр (роль) даём ограниченное время.
+    let first = timeout(RELAY_HELLO_TIMEOUT, read_frame(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "relay first frame timed out"))??;
+    match first {
         RelayFrame::Register { node_id } => serve_control(stream, node_id, inner).await,
         RelayFrame::Open { session, from, to } => {
             serve_open(stream, session, from, to, inner).await

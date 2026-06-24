@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
 use void_core::identity::NodeId;
@@ -25,6 +25,8 @@ pub struct Graph {
     pub blocklist: Option<Arc<Mutex<HashMap<NodeId, i64>>>>,
     /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
     pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
+    /// Локальный список проверенных контактов (NodeId hex) — общий с chat/app.
+    pub verified: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl Graph {
@@ -34,6 +36,7 @@ impl Graph {
             peers: Vec::new(), profiles: HashMap::new(), avatar_tex: HashMap::new(),
             selected: None, pending_dm: None, reputation: None,
             reports: None, blocklist: None, pending_report: None,
+            verified: None,
         }
     }
 
@@ -56,6 +59,25 @@ impl Graph {
         self.blocklist.as_ref()
             .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
             .is_some_and(|until| until > now)
+    }
+
+    /// Проверен ли контакт (safety number сверён вручную).
+    fn is_verified(&self, id: &NodeId) -> bool {
+        self.verified.as_ref()
+            .and_then(|m| m.lock().ok().map(|set| set.contains(id.as_str())))
+            .unwrap_or(false)
+    }
+
+    /// Переключает отметку «проверен» и сохраняет на диск.
+    fn toggle_verified(&mut self, id: &NodeId) {
+        if let Some(shared) = &self.verified {
+            if let Ok(mut set) = shared.lock() {
+                if !set.remove(id.as_str()) {
+                    set.insert(id.as_str().to_string());
+                }
+                crate::verify_store::save_verified(&set);
+            }
+        }
     }
 
     pub fn update_peers(&mut self, peers: Vec<PeerInfo>, profiles: HashMap<NodeId, PeerProfile>) {
@@ -121,6 +143,7 @@ impl Graph {
         let mut close_popup = false;
         let mut start_dm_id: Option<NodeId> = None;
         let mut report_reason: Option<void_reputation::ReportReason> = None;
+        let mut do_toggle_verify = false;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -135,8 +158,10 @@ impl Graph {
                         let rep = self.peer_score(&sel_id);
                         let reports = self.peer_reports(&sel_id);
                         let banned = self.is_banned(&sel_id);
+                        let verified = self.is_verified(&sel_id);
                         let action = show_peer_profile(
                             ui, Some(&peer), profile.as_ref(), rep, &reports, banned,
+                            self.my_id.as_str(), verified,
                         );
                         ui.add_space(6.0);
                         if action.start_dm {
@@ -147,6 +172,9 @@ impl Graph {
                             report_reason = Some(reason);
                             close_popup = true;
                         }
+                        if action.toggle_verify {
+                            do_toggle_verify = true;
+                        }
                         if ui.button("Закрыть").clicked() {
                             close_popup = true;
                         }
@@ -156,6 +184,9 @@ impl Graph {
             }
             if let Some(reason) = report_reason {
                 self.pending_report = Some((sel_id.clone(), reason));
+            }
+            if do_toggle_verify {
+                self.toggle_verified(&sel_id);
             }
         }
         if close_popup { self.selected = None; }

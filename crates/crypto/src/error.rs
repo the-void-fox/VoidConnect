@@ -22,6 +22,13 @@ pub enum CryptoError {
     #[error("Decryption failed")]
     Decryption,
 
+    /// Кейстор требует пароль или введён неверный пароль.
+    #[error("Wrong or missing password")]
+    WrongPassword,
+
+    #[error("Keystore corrupted: {0}")]
+    Keystore(String),
+
     #[error("Invalid signature")]
     InvalidSignature,
 

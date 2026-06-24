@@ -28,6 +28,7 @@ use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
 use void_network::rate_limit::RateLimiter;
+use void_network::conn_guard::ConnLimiter;
 
 /// Потолок размера одного пакета на проводе. Поднят до 16 МиБ, чтобы вмещать
 /// манифесты крупных файлов (список хэшей чанков): при 256 КБ/чанк это
@@ -658,15 +659,36 @@ pub async fn start_public_chat(
 
 // ─── TCP-сервер (роль ретранслятора) ─────────────────────────────────────────
 
+/// Глобальный потолок одновременных клиентских соединений к relay-узлу.
+const MAX_CHAT_CONNS: usize = 1024;
+/// Лимит одновременных соединений с одного IP (защита от connection-flood; берём
+/// с запасом, чтобы не мешать локальному запуску нескольких узлов на 127.0.0.1).
+const MAX_CHAT_CONNS_PER_IP: usize = 64;
+/// Таймаут на приветственный Hello (slowloris-защита; не затрагивает уже
+/// установленное долгоживущее соединение).
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn run_server(chat: PublicChat) -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", chat.inner.chat_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Chat TCP server listening on {}", addr);
+    let limiter = ConnLimiter::new(MAX_CHAT_CONNS, MAX_CHAT_CONNS_PER_IP);
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                let permit = match limiter.try_accept(addr.ip()) {
+                    Some(p) => p,
+                    None => {
+                        debug!("Chat server at capacity, dropping {}", addr);
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let c = chat.clone();
-                tokio::spawn(async move { handle_client(stream, addr, c).await; });
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_client(stream, addr, c).await;
+                });
             }
             Err(e) => warn!("Accept error: {}", e),
         }
@@ -676,10 +698,11 @@ async fn run_server(chat: PublicChat) -> anyhow::Result<()> {
 async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: PublicChat) {
     debug!("Incoming connection from {}", addr);
 
-    // Шаг 1: читаем Hello
-    let hello = match read_packet(&mut stream).await {
-        Ok(p) => p,
-        Err(e) => { warn!("No Hello from {}: {}", addr, e); return; }
+    // Шаг 1: читаем Hello (с таймаутом — защита от slowloris)
+    let hello = match timeout(HELLO_TIMEOUT, read_packet(&mut stream)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => { warn!("No Hello from {}: {}", addr, e); return; }
+        Err(_) => { warn!("Hello timeout from {}", addr); return; }
     };
     let (node_id, peer_name, client_chat_port) = match hello {
         ChatPacket::Hello { node_id, name, chat_port } => (node_id, name, chat_port),
