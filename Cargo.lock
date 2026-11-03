@@ -5146,6 +5146,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "void-trust"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "void-core",
+ "void-crypto",
+ "void-db",
+]
+
+[[package]]
 name = "void-ui"
 version = "0.1.0"
 dependencies = [
