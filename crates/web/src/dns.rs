@@ -2,14 +2,18 @@
 //!
 //! Хранит записи `имя → DnsRecord`, синхронизируемые по сети (подписанные
 //! сообщения форвардятся через relay чата). Приём проверяет подпись и что
-//! `signer == record.node_id` (нельзя заявить чужое имя), а конфликты имён
-//! разрешает по принципу «первый зарегистрировал» ([`DnsRecord::wins_over`]).
+//! `signer == record.node_id` (нельзя заявить чужое имя). Конфликт имён:
+//! имя остаётся за владельцем, которого этот узел узнал первым — «более ранняя»
+//! заявка ничего не доказывает, ведь `created_at` указывает сам заявитель.
+//! Обновления того же владельца принимаются только с большим `updated_at`.
+//! Таблицу можно сохранить и загрузить ([`DnsRegistry::export`] /
+//! [`DnsRegistry::import`]), чтобы занятые имена переживали перезапуск.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use void_core::dns::DnsRecord;
+use void_core::dns::{normalize_name, DnsRecord};
 use void_core::identity::NodeId;
 use void_crypto::sign::SignedMessage;
 
@@ -35,9 +39,9 @@ impl DnsRegistry {
 
     /// Применяет подписанную запись из сети (или нашу собственную).
     ///
-    /// Шаги: проверка подписи → `signer == node_id` → разрешение конфликта.
-    /// Возвращает `Some(record)`, если таблица изменилась (новое имя, более
-    /// ранний владелец или обновление от того же владельца) — это и сигнал
+    /// Шаги: проверка подписи → `signer == node_id` → имя нормализовано →
+    /// разрешение конфликта. Возвращает `Some(record)`, если таблица изменилась
+    /// (новое имя или более свежая версия того же владельца) — это и сигнал
     /// «переслать дальше». `None` — запись отвергнута или дубликат (гасит петли
     /// форвардинга).
     pub async fn apply_signed(&self, signed: &SignedMessage) -> Result<Option<DnsRecord>, WebError> {
@@ -51,21 +55,29 @@ impl DnsRegistry {
         if signed.signer != record.node_id.as_str() {
             return Err(WebError::Invalid("DNS: signer ≠ владелец записи".into()));
         }
+        if normalize_name(&record.name).as_deref() != Some(record.name.as_str()) {
+            return Err(WebError::Invalid(format!("DNS: недопустимое имя {:?}", record.name)));
+        }
 
         let mut map = self.names.write().await;
         match map.get(&record.name) {
-            // Тот же владелец: обновление (refresh ip/port/времени). Идентичную
-            // запись отбрасываем — это дедуп, гасящий петли форвардинга.
+            // Тот же владелец: только более свежая версия. Повтор старой
+            // подписанной записи не воскресит удалённое имя и не откатит адрес;
+            // идентичная запись — дедуп, гасящий петли форвардинга.
             Some(e) if e.record.node_id == record.node_id => {
-                if e.record == record {
+                if record.updated_at <= e.record.updated_at {
                     return Ok(None);
                 }
             }
-            // Другой владелец удерживает имя: принимаем только более раннего.
-            Some(e) if !record.wins_over(&e.record) => {
+            // Имя уже за другим владельцем — остаётся за ним.
+            Some(e) => {
+                tracing::debug!(
+                    "DNS: '{}' уже за {}, заявка {} отклонена",
+                    record.name, e.record.node_id, record.node_id
+                );
                 return Ok(None);
             }
-            _ => {}
+            None => {}
         }
 
         map.insert(record.name.clone(), Entry { record: record.clone(), signed: signed.clone() });
@@ -87,6 +99,23 @@ impl DnsRegistry {
             .map(|e| e.record.clone())
             .filter(|r| !r.deleted)
             .collect()
+    }
+
+    /// Все подписанные записи (включая надгробия) — для сохранения на диск.
+    pub async fn export(&self) -> Vec<SignedMessage> {
+        self.names.read().await.values().map(|e| e.signed.clone()).collect()
+    }
+
+    /// Загружает сохранённые записи, проверяя каждую так же, как пришедшую из
+    /// сети (подпорченный файл не подсунет чужое имя). Возвращает число принятых.
+    pub async fn import(&self, records: &[SignedMessage]) -> usize {
+        let mut accepted = 0;
+        for signed in records {
+            if let Ok(Some(_)) = self.apply_signed(signed).await {
+                accepted += 1;
+            }
+        }
+        accepted
     }
 
     /// Подписанные записи, принадлежащие `owner` — для перерассылки новым пирам.
@@ -120,6 +149,13 @@ mod tests {
     }
 
     fn signed_record_del(kp: &SigningKeypair, owner: NodeId, name: &str, created_at: i64, deleted: bool) -> SignedMessage {
+        let updated_at = created_at * 10 + deleted as i64; // надгробие новее записи
+        signed_record_v(kp, owner, name, created_at, updated_at, deleted)
+    }
+
+    fn signed_record_v(
+        kp: &SigningKeypair, owner: NodeId, name: &str, created_at: i64, updated_at: i64, deleted: bool,
+    ) -> SignedMessage {
         let rec = DnsRecord {
             name: name.into(),
             kind: DnsKind::Site,
@@ -127,6 +163,7 @@ mod tests {
             ip: None,
             port: Some(8080),
             created_at,
+            updated_at,
             deleted,
         };
         SignedMessage::sign(rec.to_bytes(), kp).unwrap()
@@ -160,25 +197,54 @@ mod tests {
         assert!(reg.resolve("evil").await.is_none());
     }
 
+    /// Имя остаётся за первым известным владельцем: заявка с датой «из прошлого»
+    /// (её указывает сам заявитель) имя не отбирает.
     #[tokio::test]
-    async fn earlier_owner_wins_conflict() {
+    async fn backdated_claim_cannot_steal_name() {
         let (kp1, id1) = keypair(1);
         let (kp2, id2) = keypair(2);
         let reg = DnsRegistry::new();
 
-        // Сначала приходит поздняя заявка от id2.
-        reg.apply_signed(&signed_record(&kp2, id2.clone(), "blog", 200)).await.unwrap();
-        assert_eq!(reg.resolve("blog").await.unwrap().node_id, id2);
-
-        // Затем — более ранняя от id1: вытесняет (первый зарегистрировал).
-        let accepted = reg.apply_signed(&signed_record(&kp1, id1.clone(), "blog", 100)).await.unwrap();
-        assert!(accepted.is_some());
+        reg.apply_signed(&signed_record(&kp1, id1.clone(), "blog", 200)).await.unwrap();
+        let stolen = reg.apply_signed(&signed_record(&kp2, id2, "blog", 0)).await.unwrap();
+        assert!(stolen.is_none(), "заявка задним числом отклонена");
         assert_eq!(reg.resolve("blog").await.unwrap().node_id, id1);
+    }
 
-        // Повторная поздняя заявка id2 теперь отвергается.
-        let rejected = reg.apply_signed(&signed_record(&kp2, id2, "blog", 200)).await.unwrap();
-        assert!(rejected.is_none());
-        assert_eq!(reg.resolve("blog").await.unwrap().node_id, id1);
+    /// Повтор старой подписанной записи владельца не воскрешает удалённое имя.
+    #[tokio::test]
+    async fn replayed_old_record_cannot_undelete() {
+        let (kp, id) = keypair(1);
+        let reg = DnsRegistry::new();
+        let original = signed_record_v(&kp, id.clone(), "blog", 100, 1000, false);
+        reg.apply_signed(&original).await.unwrap();
+        reg.apply_signed(&signed_record_v(&kp, id, "blog", 100, 2000, true)).await.unwrap();
+        assert!(reg.resolve("blog").await.is_none());
+
+        assert!(reg.apply_signed(&original).await.unwrap().is_none(), "старая версия отвергнута");
+        assert!(reg.resolve("blog").await.is_none(), "имя осталось удалённым");
+    }
+
+    #[tokio::test]
+    async fn unnormalized_name_rejected() {
+        let (kp, id) = keypair(1);
+        let reg = DnsRegistry::new();
+        assert!(reg.apply_signed(&signed_record(&kp, id, "x&calc", 1)).await.is_err());
+    }
+
+    /// Сохранённая таблица восстанавливается: имя остаётся за прежним владельцем.
+    #[tokio::test]
+    async fn export_import_roundtrip_keeps_owner() {
+        let (kp1, id1) = keypair(1);
+        let (kp2, id2) = keypair(2);
+        let reg = DnsRegistry::new();
+        reg.apply_signed(&signed_record(&kp1, id1.clone(), "blog", 100)).await.unwrap();
+        let saved = reg.export().await;
+
+        let restored = DnsRegistry::new();
+        assert_eq!(restored.import(&saved).await, 1);
+        restored.apply_signed(&signed_record(&kp2, id2, "blog", 0)).await.unwrap();
+        assert_eq!(restored.resolve("blog").await.unwrap().node_id, id1);
     }
 
     #[tokio::test]
@@ -204,7 +270,7 @@ mod tests {
         assert!(reg.apply_signed(&signed_record(&kp2, id2, "blog", 200)).await.unwrap().is_none());
         assert!(reg.resolve("blog").await.is_none());
 
-        // Владелец может переопубликовать (un-delete) тем же именем.
+        // Владелец может переопубликовать (un-delete) тем же именем — более новой версией.
         reg.apply_signed(&signed_record(&kp, id.clone(), "blog", 300)).await.unwrap();
         assert_eq!(reg.resolve("blog").await.unwrap().node_id, id);
     }

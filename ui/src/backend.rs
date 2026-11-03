@@ -82,6 +82,9 @@ struct DnsService {
     my_id:    NodeId,
     /// Снимок известных имён для GUI.
     snapshot: Arc<Mutex<Vec<DnsInfo>>>,
+    /// Файл таблицы имён: занятые имена переживают перезапуск (иначе после
+    /// рестарта имя достаётся тому, кто первым его снова объявит).
+    store:    PathBuf,
 }
 
 impl DnsService {
@@ -95,6 +98,7 @@ impl DnsService {
             ip,
             port,
             created_at: chrono::Utc::now().timestamp(),
+            updated_at: chrono::Utc::now().timestamp_millis(),
             deleted: false,
         };
         let signed = match SignedMessage::sign(record.to_bytes(), &self.keypair) {
@@ -134,6 +138,7 @@ impl DnsService {
         let Some(mut rec) = self.registry.resolve(key).await else { return };
         if rec.node_id != self.my_id { return; } // отзываем только своё
         rec.deleted = true;
+        rec.updated_at = chrono::Utc::now().timestamp_millis().max(rec.updated_at + 1);
         let signed = match SignedMessage::sign(rec.to_bytes(), &self.keypair) {
             Ok(s) => s,
             Err(e) => { tracing::warn!("DNS: не удалось подписать надгробие '{}': {}", key, e); return; }
@@ -156,8 +161,31 @@ impl DnsService {
         }
     }
 
-    /// Обновляет снимок имён для GUI.
+    /// Загружает сохранённую таблицу имён (записи проверяются как из сети).
+    async fn load(&self) {
+        let Ok(json) = std::fs::read_to_string(&self.store) else { return };
+        match serde_json::from_str::<Vec<SignedMessage>>(&json) {
+            Ok(records) => {
+                let n = self.registry.import(&records).await;
+                tracing::info!("DNS: загружено {} сохранённых имён", n);
+            }
+            Err(e) => tracing::warn!("DNS: файл {} повреждён: {}", self.store.display(), e),
+        }
+    }
+
+    /// Сохраняет таблицу имён (временный файл → rename, без «полузаписанного» JSON).
+    async fn save(&self) {
+        let records = self.registry.export().await;
+        let Ok(json) = serde_json::to_vec(&records) else { return };
+        let tmp = self.store.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &self.store)).is_err() {
+            tracing::warn!("DNS: не удалось сохранить {}", self.store.display());
+        }
+    }
+
+    /// Обновляет снимок имён для GUI и сохраняет таблицу на диск.
     async fn refresh(&self) {
+        self.save().await;
         let my_key = self.my_id.as_str();
         let infos: Vec<DnsInfo> = self.registry.list().await.into_iter().map(|r| {
             let owner = r.node_id.as_str();
@@ -763,6 +791,7 @@ async fn backend_main(
     let dns_kp = sign_kp.clone();
     let vote_kp = sign_kp.clone();
     let site_kp = sign_kp.clone();
+    let storage_kp = sign_kp.clone(); // подпись манифестов публикуемых файлов
     let chat = match start_public_chat(
         my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp,
         Some(rate_limiter.clone()),
@@ -790,7 +819,10 @@ async fn backend_main(
         keypair:  dns_kp,
         my_id:    my_peer.id.clone(),
         snapshot: Arc::clone(&dns_out),
+        store:    data_dir.join("dns.json"),
     };
+    dns.load().await;
+    dns.refresh().await;
     // Задача: входящие DNS-записи из сети → проверяем подпись и применяем.
     {
         let dns_in = dns.clone();
@@ -1264,7 +1296,7 @@ async fn backend_main(
     // download у пиров идёт именно на их base_port.
     if let Some(pool) = db_pool.clone() {
         match ChunkStore::new(data_dir.join("chunks")).await {
-            Ok(store) => match StorageManager::new(pool.clone(), store, noise.clone()).await {
+            Ok(store) => match StorageManager::new(pool.clone(), store, Arc::clone(&storage_kp)).await {
                 Ok(mut manager) => {
                     // Подключаем события качества чанков к репутации (если включена).
                     if let Some(tx) = chunk_ev_tx.clone() {
@@ -1343,7 +1375,8 @@ fn start_site_tasks(
     let mirror_key   = my_key.clone();
     let mirror_set   = Arc::clone(&mirrored);
     let mirror_dns   = dns.clone();   // для отзыва домена при удалении сайта
-    let mirror_kp    = keypair;       // для подписи надгробия (больше нигде не нужен)
+    let mirror_kp    = Arc::clone(&keypair); // для подписи надгробия
+    let pub_kp       = keypair;              // для подписи манифестов публикуемых сайтов
 
     // HTTP-сервер сайтов (peers — источник для докачки файлов сетевых сайтов).
     let srv_reg = registry.clone();
@@ -1422,7 +1455,7 @@ fn start_site_tasks(
     let pub_mirror = Arc::clone(&mirrored);
     tokio::spawn(async move {
         while let Some((dir, name)) = publish_site_rx.recv().await {
-            match publish_site(&manager, &dir, &name, my_id.clone()).await {
+            match publish_site(&manager, &dir, &name, &pub_kp).await {
                 Ok(manifest) => {
                     tracing::info!("Опубликован сайт '{}' ({} файлов) → http://127.0.0.1:{}/{}",
                         manifest.name, manifest.entries.len(), http_port, manifest.name);

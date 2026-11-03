@@ -1,10 +1,11 @@
 //! Внутренний DNS зоны `.void`: записи `имя.void` → узел/сайт.
 //!
 //! Каждая запись подписывается ключом владельца (`signer == node_id`), поэтому
-//! заявить чужое имя нельзя. Конфликт имён разрешается по принципу
-//! «первый зарегистрировал» (наименьший `created_at`; при равенстве — меньший
-//! `node_id`). Записи рассылаются по сети так же, как репутация/манифесты —
-//! через relay общего чата (как подписанные сообщения).
+//! заявить чужое имя нельзя. Конфликт имён разрешается по принципу «кто первым
+//! известен этому узлу»: метки времени самозаявляемы, и правило «самая ранняя
+//! `created_at`» позволяло отобрать любое имя, указав дату из прошлого.
+//! Записи рассылаются по сети так же, как репутация/манифесты — через relay
+//! общего чата (как подписанные сообщения).
 
 use serde::{Deserialize, Serialize};
 
@@ -36,10 +37,15 @@ pub struct DnsRecord {
     pub ip: Option<String>,
     /// Порт сервиса (HTTP-порт сайта / порт узла), если применимо.
     pub port: Option<u16>,
-    /// Unix-таймстемп регистрации — для разрешения конфликтов имён.
+    /// Unix-таймстемп регистрации (информационно; конфликты им не решаются).
     pub created_at: i64,
+    /// Версия записи (unix-миллисекунды), растёт с каждым обновлением владельца.
+    /// Принимается только более новая версия того же владельца — повтор старой
+    /// подписанной записи не воскресит удалённое имя и не откатит адрес.
+    #[serde(default)]
+    pub updated_at: i64,
     /// Надгробие: владелец отозвал имя (удалил сайт). Запись держит имя за собой
-    /// (антисквоттинг по `created_at`), но не резолвится и скрыта из списков.
+    /// (никто другой его не займёт), но не резолвится и скрыта из списков.
     /// `#[serde(default)]` — совместимость со старыми записями без поля.
     #[serde(default)]
     pub deleted: bool,
@@ -56,16 +62,6 @@ impl DnsRecord {
         serde_json::to_vec(self).expect("DnsRecord serialization failed")
     }
 
-    /// Истинно, если `self` имеет приоритет над `other` на одно и то же имя:
-    /// раньше зарегистрирован, при равенстве — лексически меньший `node_id`.
-    /// (Антисквоттинг в кооперативной сети; таймстемпы самозаявляемы.)
-    pub fn wins_over(&self, other: &DnsRecord) -> bool {
-        match self.created_at.cmp(&other.created_at) {
-            std::cmp::Ordering::Less => true,
-            std::cmp::Ordering::Greater => false,
-            std::cmp::Ordering::Equal => self.node_id.as_str() < other.node_id.as_str(),
-        }
-    }
 }
 
 /// Нормализует произвольную строку в DNS-метку зоны `.void`:
@@ -110,6 +106,7 @@ mod tests {
             ip: Some("192.168.0.5".into()),
             port: Some(7700),
             created_at,
+            updated_at: created_at,
             deleted: false,
         }
     }
@@ -122,22 +119,6 @@ mod tests {
         assert_eq!(back, r);
         // kind сериализуется в нижнем регистре
         assert!(String::from_utf8_lossy(&r.to_bytes()).contains("\"node\""));
-    }
-
-    #[test]
-    fn earlier_registration_wins() {
-        let early = rec("blog", node(1), 100);
-        let late = rec("blog", node(2), 200);
-        assert!(early.wins_over(&late));
-        assert!(!late.wins_over(&early));
-    }
-
-    #[test]
-    fn tie_break_by_node_id() {
-        let a = rec("blog", node(1), 100); // node(1) < node(2) лексически
-        let b = rec("blog", node(2), 100);
-        assert!(a.wins_over(&b));
-        assert!(!b.wins_over(&a));
     }
 
     #[test]

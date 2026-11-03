@@ -33,6 +33,11 @@ pub struct SiteManifest {
     pub entries: Vec<SiteEntry>,
     /// Время публикации (unix-таймстемп).
     pub created_at: i64,
+    /// Подпись Ed25519 владельца (`owner`) над [`SiteManifest::signing_bytes`].
+    /// Без неё любой узел мог бы разослать манифест «от имени» владельца с
+    /// подменёнными файлами — и сайт показывал бы чужое содержимое.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Подписанное «надгробие» сайта: владелец отзывает публикацию.
@@ -61,6 +66,14 @@ impl SiteRevocation {
 }
 
 impl SiteManifest {
+    /// Канонические байты для подписи: манифест без поля подписи с контекстом.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let unsigned = SiteManifest { signature: None, ..self.clone() };
+        let mut out = b"void-connect/site-manifest/v1\n".to_vec();
+        out.extend_from_slice(&serde_json::to_vec(&unsigned).expect("SiteManifest сериализуется"));
+        out
+    }
+
     /// Полное DNS-имя сайта в зоне `.void`.
     pub fn dns_name(&self) -> String {
         format!("{}.void", self.name)
@@ -97,7 +110,19 @@ mod tests {
                 SiteEntry { path: "css/style.css".into(), file_id: "f2".into(), size_bytes: 40 },
             ],
             created_at: 0,
+            signature: None,
         }
+    }
+
+    #[test]
+    fn signing_bytes_ignore_signature_and_cover_content() {
+        let m = manifest();
+        let mut signed = m.clone();
+        signed.signature = Some("ab".into());
+        assert_eq!(m.signing_bytes(), signed.signing_bytes(), "подпись не входит в подписываемое");
+        let mut evil = m.clone();
+        evil.entries[0].file_id = "evil".into();
+        assert_ne!(m.signing_bytes(), evil.signing_bytes(), "подмена файла меняет подписываемое");
     }
 
     #[test]

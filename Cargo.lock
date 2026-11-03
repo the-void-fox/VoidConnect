@@ -5211,7 +5211,6 @@ dependencies = [
  "void-core",
  "void-crypto",
  "void-db",
- "void-network",
  "void-storage",
 ]
 

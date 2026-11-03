@@ -282,9 +282,24 @@ impl PublicChat {
         self.inner.profiles.lock().await.values().cloned().collect()
     }
 
-    /// Обновить собственный профиль и разослать всем подключённым.
-    pub async fn set_profile(&self, profile: PeerProfile) {
-        *self.inner.my_profile.lock().await = Some(profile.clone());
+    /// Обновить собственный профиль и разослать всем подключённым. Профиль
+    /// приводится к лимитам, получает метку времени и подписывается нашим ключом.
+    pub async fn set_profile(&self, mut profile: PeerProfile) {
+        profile.node_id = self.inner.my_peer.id.clone();
+        profile.sanitize();
+        {
+            let mut mine = self.inner.my_profile.lock().await;
+            // Строго растущая метка: два обновления за одну миллисекунду не
+            // должны выглядеть у получателей как «старая версия».
+            let prev = mine.as_ref().map(|p| p.updated_at).unwrap_or(0);
+            profile.updated_at = Utc::now().timestamp_millis().max(prev + 1);
+            profile.signature = None;
+            match SignedMessage::sign(profile.signing_bytes(), &self.inner.signing_kp) {
+                Ok(signed) => profile.signature = Some(signed.signature),
+                Err(e) => warn!("Не удалось подписать профиль: {:?}", e),
+            }
+            *mine = Some(profile.clone());
+        }
         let clients = self.inner.clients.lock().await;
         for tx in clients.values() {
             let _ = tx.try_send(ChatPacket::ProfileUpdate(profile.clone()));
@@ -333,6 +348,14 @@ impl PublicChat {
                 if changed { Some(existing.clone()) } else { None }
             }
             None => {
+                // Новый файл принимаем только с подписью публикатора: иначе
+                // любой узел объявлял бы файлы «от имени» другого (или
+                // переименовывал чужие). Для уже известного file_id из входящего
+                // берём лишь сидеров — подписанная часть остаётся прежней.
+                if !verify_file_manifest(&incoming) {
+                    warn!("Отброшен манифест файла {} без верной подписи публикатора", incoming.file_id);
+                    return None;
+                }
                 map.insert(incoming.file_id.clone(), incoming.clone());
                 Some(incoming)
             }
@@ -385,6 +408,11 @@ impl PublicChat {
         // принимаем только нормализованную метку `[a-z0-9-]` (как при публикации).
         if !is_normalized_site_name(&incoming.name) {
             warn!("Отброшен анонс сайта с недопустимым именем {:?}", incoming.name);
+            return None;
+        }
+        // Владелец подписывает манифест: подменить файлы сайта «от его имени» нельзя.
+        if !verify_site(&incoming) {
+            warn!("Отброшен манифест сайта '{}' без верной подписи владельца", incoming.name);
             return None;
         }
         // Надгробие подавляет воскрешение: устаревший анонс того же владельца
@@ -937,27 +965,60 @@ async fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, chat: Publ
 
 // ─── Обработка входящих данных ────────────────────────────────────────────────
 
+/// Подпись профиля сделана ключом его `node_id`.
+fn verify_profile(p: &PeerProfile) -> bool {
+    let Some(signature) = p.signature.clone() else { return false };
+    SignedMessage { payload: p.signing_bytes(), signature, signer: p.node_id.as_str().to_string() }
+        .verify()
+        .is_ok()
+}
+
+/// Подпись манифеста файла сделана ключом его публикатора.
+fn verify_file_manifest(m: &FileManifest) -> bool {
+    let (Some(publisher), Some(signature)) = (m.publisher.as_ref(), m.signature.clone()) else {
+        return false;
+    };
+    SignedMessage { payload: m.signing_bytes(), signature, signer: publisher.as_str().to_string() }
+        .verify()
+        .is_ok()
+}
+
+/// Подпись манифеста сайта сделана ключом его владельца.
+fn verify_site(m: &SiteManifest) -> bool {
+    let Some(signature) = m.signature.clone() else { return false };
+    SignedMessage { payload: m.signing_bytes(), signature, signer: m.owner.as_str().to_string() }
+        .verify()
+        .is_ok()
+}
+
 /// Имя сайта — нормализованная метка зоны `.void` (`[a-z0-9-]`).
 fn is_normalized_site_name(name: &str) -> bool {
     normalize_name(name).as_deref() == Some(name)
 }
 
 /// Поля сообщения в пределах лимитов (проверяется до проверки подписи — дёшево).
+/// Имя отправителя подписано, поэтому «чистить» его нельзя — только отвергнуть.
 fn message_within_limits(msg: &ChatMessage) -> bool {
     msg.text.len() <= MAX_CHAT_TEXT_BYTES
         && msg.channel.chars().count() <= MAX_CHANNEL_CHARS
+        && void_core::sanitize::display_text(&msg.from_name, MAX_SENDER_NAME_CHARS) == msg.from_name
 }
 
 /// Канонические байты сообщения для подписи/проверки.
 /// Привязывает отправителя, порядковый номер, время и текст.
-fn message_signing_bytes(from: &NodeId, seq: u64, timestamp: i64, channel: &str, text: &str) -> Vec<u8> {
-    format!("{}\n{}\n{}\n{}\n{}", from.as_str(), seq, timestamp, channel, text).into_bytes()
+fn message_signing_bytes(msg: &ChatMessage) -> Vec<u8> {
+    // Имя отправителя тоже подписано: иначе релей мог бы переименовать автора.
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        msg.from.as_str(), msg.seq, msg.timestamp, msg.channel, msg.from_name, msg.text
+    )
+    .into_bytes()
 }
 
 impl PublicChat {
     /// Подписывает исходящее сообщение нашим Ed25519-ключом.
     fn sign_message(&self, msg: &mut ChatMessage) {
-        let bytes = message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.channel, &msg.text);
+        let bytes = message_signing_bytes(msg);
         match SignedMessage::sign(bytes, &self.inner.signing_kp) {
             Ok(signed) => msg.signature = Some(signed.signature),
             Err(e) => warn!("Failed to sign chat message: {:?}", e),
@@ -972,14 +1033,14 @@ impl PublicChat {
             return false;
         };
         let signed = SignedMessage {
-            payload:   message_signing_bytes(&msg.from, msg.seq, msg.timestamp, &msg.channel, &msg.text),
+            payload:   message_signing_bytes(msg),
             signature,
             signer:    msg.from.as_str().to_string(),
         };
         signed.verify().is_ok()
     }
 
-    async fn handle_incoming(&self, mut msg: ChatMessage) {
+    async fn handle_incoming(&self, msg: ChatMessage) {
         if !message_within_limits(&msg) {
             warn!("Отброшено сообщение сверх лимитов от {}", msg.from);
             return;
@@ -988,9 +1049,6 @@ impl PublicChat {
             warn!("Отброшено сообщение с неверной/отсутствующей подписью от {}", msg.from);
             return;
         }
-        // Имя отправителя не входит в подпись (его может переписать релей) —
-        // как минимум убираем управляющие/bidi-символы и обрезаем.
-        msg.from_name = void_core::sanitize::display_text(&msg.from_name, MAX_SENDER_NAME_CHARS);
 
         let key = (msg.from.as_str().to_string(), msg.seq);
         {
@@ -1020,11 +1078,28 @@ impl PublicChat {
         }
     }
 
-    async fn handle_profile_update(&self, mut profile: PeerProfile) {
-        // Профиль из сети: лимиты полей, без управляющих/bidi-символов в имени,
-        // без аватара-бомбы и ключа неверного формата.
-        profile.sanitize();
-        self.inner.profiles.lock().await.insert(profile.node_id.clone(), profile.clone());
+    async fn handle_profile_update(&self, profile: PeerProfile) {
+        // Профиль подписан владельцем: чужое имя/аватар от имени узла не пройдут.
+        if !verify_profile(&profile) {
+            warn!("Отброшен профиль {} без верной подписи владельца", profile.node_id);
+            return;
+        }
+        // Подписанное нельзя «почистить» — профиль вне лимитов (аватар-бомба,
+        // bidi-символы в имени, ключ неверного формата) просто отвергаем.
+        let mut clean = profile.clone();
+        clean.sanitize();
+        if clean != profile {
+            warn!("Отброшен профиль {} вне лимитов", profile.node_id);
+            return;
+        }
+        {
+            let mut profiles = self.inner.profiles.lock().await;
+            // Повтор старой версии не откатывает профиль (и гасит петли рассылки).
+            if profiles.get(&profile.node_id).is_some_and(|old| old.updated_at >= profile.updated_at) {
+                return;
+            }
+            profiles.insert(profile.node_id.clone(), profile.clone());
+        }
 
         // Обновляем имя в PeerInfo тоже — чтобы граф и чат показывали актуальное имя
         if !profile.name.is_empty() {
@@ -1080,6 +1155,7 @@ impl PublicChat {
                 .unwrap_or_else(|| self.inner.my_peer.name.clone())
         };
 
+        let my_name = void_core::sanitize::display_text(&my_name, MAX_SENDER_NAME_CHARS);
         let mut msg = ChatMessage::new(self.inner.my_peer.id.clone(), my_name, text, channel, seq);
         self.sign_message(&mut msg);
 
@@ -1298,11 +1374,10 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
             let total = messages.len();
             let mut h = chat.inner.history.lock().await;
             let mut accepted = 0usize;
-            for mut msg in messages {
+            for msg in messages {
                 if !message_within_limits(&msg) || !chat.verify_message(&msg) {
                     continue;
                 }
-                msg.from_name = void_core::sanitize::display_text(&msg.from_name, MAX_SENDER_NAME_CHARS);
                 if h.len() >= 100 { h.pop_front(); }
                 h.push_back(msg);
                 accepted += 1;
@@ -1513,6 +1588,20 @@ mod tests {
         let kp = Arc::new(SigningKeypair::from_seed(&[seed; 32]).unwrap());
         let id = NodeId::from_public_key_bytes(&kp.public_bytes());
         (kp, id)
+    }
+
+    /// Подписывает манифест файла ключом публикатора (как это делает storage).
+    fn sign_file(mut m: FileManifest, kp: &SigningKeypair) -> FileManifest {
+        m.publisher = Some(NodeId::from_public_key_bytes(&kp.public_bytes()));
+        m.signature = Some(SignedMessage::sign(m.signing_bytes(), kp).unwrap().signature);
+        m
+    }
+
+    /// Подписывает манифест сайта ключом владельца (как это делает `publish_site`).
+    fn sign_site(mut m: SiteManifest, kp: &SigningKeypair) -> SiteManifest {
+        m.signature = None;
+        m.signature = Some(SignedMessage::sign(m.signing_bytes(), kp).unwrap().signature);
+        m
     }
 
     /// Две пары ключей, упорядоченные по NodeId: первая выигрывает выборы релея.
@@ -1726,19 +1815,22 @@ mod tests {
         a_pl.upsert(b_peer.clone()).await;
         b_pl.upsert(a_peer.clone()).await;
 
+        let a_sign = a_kp.clone();
         let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp, None).await.unwrap();
         let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
 
         let mut bob_manifests = bob.subscribe_manifests();
 
-        let manifest = FileManifest {
+        let manifest = sign_file(FileManifest {
             file_id:    "deadbeefcafe".into(),
             name:       "photo.jpg".into(),
             size_bytes: 1000,
             mime_type:  Some("image/jpeg".into()),
             owners:     vec![a_id.clone()],
             chunks:     vec![ChunkMeta { hash: "a".repeat(64), index: 0, size: 1000 }],
-        };
+            publisher:  None,
+            signature:  None,
+        }, &a_sign);
 
         // Повторяем анонс, пока relay-соединение не установится и объявление
         // не дойдёт до Bob (первые попытки могут прийтись на момент до связи).
@@ -1795,18 +1887,19 @@ mod tests {
         a_pl.upsert(b_peer.clone()).await;
         b_pl.upsert(a_peer.clone()).await;
 
-        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp, None).await.unwrap();
+        let alice = start_public_chat(a_peer.clone(), a_pl, a_port, a_kp.clone(), None).await.unwrap();
         let bob = start_public_chat(b_peer.clone(), b_pl, b_port, b_kp, None).await.unwrap();
 
         let mut bob_sites = bob.subscribe_sites();
 
-        let manifest = SiteManifest {
+        let manifest = sign_site(SiteManifest {
             site_id:    "site-abc".into(),
             name:       "blog".into(),
             owner:      a_id.clone(),
             entries:    vec![SiteEntry { path: "index.html".into(), file_id: "f1".into(), size_bytes: 10 }],
             created_at: 1,
-        };
+            signature:  None,
+        }, &a_kp);
 
         let mut delivered = false;
         for _ in 0..40 {
@@ -1853,6 +1946,7 @@ mod tests {
             ip: Some("10.0.0.1".into()),
             port: Some(a_port.wrapping_sub(2)),
             created_at: 1,
+            updated_at: 1,
             deleted: false,
         };
         let signed = SignedMessage::sign(record.to_bytes(), &a_kp).unwrap();
@@ -2063,10 +2157,10 @@ mod tests {
         let (kp, id) = keypair(7);
         let chat = PublicChat::new(test_peer("o", id.clone(), 1), PeerList::new(), 1, kp.clone(), None);
 
-        let mk = |sid: &str, created_at: i64| SiteManifest {
+        let mk = |sid: &str, created_at: i64| sign_site(SiteManifest {
             site_id: sid.into(), name: "blog".into(), owner: id.clone(),
-            entries: vec![], created_at,
-        };
+            entries: vec![], created_at, signature: None,
+        }, &kp);
 
         // Сайт сперва известен.
         assert!(chat.merge_site(mk("s1", 100)).await.is_some());
@@ -2198,11 +2292,11 @@ mod tests {
     #[tokio::test]
     async fn site_with_unsafe_name_rejected() {
         let (kp, id) = keypair(7);
-        let chat = PublicChat::new(test_peer("x", id.clone(), 1), PeerList::new(), 1, kp, None);
-        let mk = |name: &str| SiteManifest {
+        let chat = PublicChat::new(test_peer("x", id.clone(), 1), PeerList::new(), 1, kp.clone(), None);
+        let mk = |name: &str| sign_site(SiteManifest {
             site_id: "sid".into(), name: name.into(), owner: id.clone(),
-            entries: vec![], created_at: 1,
-        };
+            entries: vec![], created_at: 1, signature: None,
+        }, &kp);
         assert!(chat.merge_site(mk("x&calc")).await.is_none());
         assert!(chat.merge_site(mk("My Site")).await.is_none());
         assert!(chat.merge_site(mk("../blog")).await.is_none());
@@ -2237,5 +2331,121 @@ mod tests {
             !wait_for_text(&mut m_rx, "secret", 2).await,
             "самозванец получил сообщения, выдав себя за релей"
         );
+    }
+
+    /// Манифест сайта «от имени» владельца, но без его подписи (или с подменой
+    /// после подписи) не принимается.
+    #[tokio::test]
+    async fn forged_site_manifest_rejected() {
+        let (owner_kp, owner_id) = keypair(1);
+        let (evil_kp, _evil_id) = keypair(9);
+        let (kp, id) = keypair(5);
+        let chat = PublicChat::new(test_peer("x", id, 1), PeerList::new(), 1, kp, None);
+
+        let base = SiteManifest {
+            site_id: "sid".into(), name: "bank".into(), owner: owner_id.clone(),
+            entries: vec![], created_at: 1, signature: None,
+        };
+        assert!(chat.merge_site(base.clone()).await.is_none(), "без подписи");
+        assert!(chat.merge_site(sign_site(base.clone(), &evil_kp)).await.is_none(), "подписал не владелец");
+
+        let mut tampered = sign_site(base.clone(), &owner_kp);
+        tampered.entries.push(void_core::site::SiteEntry {
+            path: "index.html".into(), file_id: "evil".into(), size_bytes: 1,
+        });
+        assert!(chat.merge_site(tampered).await.is_none(), "подмена файлов после подписи");
+
+        assert!(chat.merge_site(sign_site(base, &owner_kp)).await.is_some(), "подпись владельца проходит");
+    }
+
+    /// Профиль принимается только с подписью своего узла; старая версия не
+    /// откатывает новую.
+    #[tokio::test]
+    async fn profiles_must_be_signed_by_owner() {
+        let (alice_kp, alice_id) = keypair(1);
+        let (evil_kp, _) = keypair(9);
+        let (kp, id) = keypair(5);
+        let chat = PublicChat::new(test_peer("x", id, 1), PeerList::new(), 1, kp, None);
+
+        let sign = |mut p: PeerProfile, k: &SigningKeypair| {
+            p.signature = None;
+            p.signature = Some(SignedMessage::sign(p.signing_bytes(), k).unwrap().signature);
+            p
+        };
+        let mut genuine = PeerProfile::new(alice_id.clone(), "Alice".into());
+        genuine.updated_at = 10;
+        let mut fake = PeerProfile::new(alice_id.clone(), "Alice (настоящая)".into());
+        fake.updated_at = 20;
+
+        chat.handle_profile_update(fake.clone()).await;
+        chat.handle_profile_update(sign(fake.clone(), &evil_kp)).await;
+        assert!(chat.get_profiles().await.is_empty(), "неподписанный/чужой профиль не принят");
+
+        chat.handle_profile_update(sign(genuine.clone(), &alice_kp)).await;
+        assert_eq!(chat.get_profiles().await[0].name, "Alice");
+
+        let mut renamed = sign(genuine.clone(), &alice_kp);
+        renamed.name = "Mallory".into(); // подмена после подписи
+        renamed.updated_at = 30;
+        chat.handle_profile_update(renamed).await;
+        assert_eq!(chat.get_profiles().await[0].name, "Alice");
+
+        let mut newer = genuine.clone();
+        newer.name = "Alice 2".into();
+        newer.updated_at = 40;
+        chat.handle_profile_update(sign(newer, &alice_kp)).await;
+        chat.handle_profile_update(sign(genuine, &alice_kp)).await; // повтор старой версии
+        assert_eq!(chat.get_profiles().await[0].name, "Alice 2", "старая версия не откатывает новую");
+    }
+
+    /// Свой профиль подписывается при set_profile и проходит проверку получателем.
+    #[tokio::test]
+    async fn own_profile_is_signed() {
+        let (kp, id) = keypair(3);
+        let chat = PublicChat::new(test_peer("x", id.clone(), 1), PeerList::new(), 1, kp, None);
+        chat.set_profile(PeerProfile::new(id.clone(), "Боб".into())).await;
+        chat.set_profile(PeerProfile::new(id, "Боб 2".into())).await;
+        let mine = chat.inner.my_profile.lock().await.clone().unwrap();
+        assert!(verify_profile(&mine));
+        assert_eq!(mine.name, "Боб 2");
+    }
+
+    /// Имя отправителя входит в подпись: релей не может переименовать автора.
+    #[tokio::test]
+    async fn sender_name_is_signed() {
+        let (kp, id) = keypair(5);
+        let chat = PublicChat::new(test_peer("x", id.clone(), 1), PeerList::new(), 1, kp, None);
+        let mut msg = ChatMessage::new(id, "Alice".into(), "привет".into(), "global".into(), 1);
+        chat.sign_message(&mut msg);
+        assert!(chat.verify_message(&msg));
+        msg.from_name = "Admin".into();
+        assert!(!chat.verify_message(&msg), "переименование автора ломает подпись");
+    }
+
+    /// Новый файл без подписи публикатора (или переименованный после подписи)
+    /// не принимается; известный — пополняется сидерами.
+    #[tokio::test]
+    async fn file_manifest_requires_publisher_signature() {
+        let (alice_kp, _) = keypair(1);
+        let (kp, id) = keypair(5);
+        let chat = PublicChat::new(test_peer("x", id, 1), PeerList::new(), 1, kp, None);
+        let base = FileManifest {
+            file_id: "f1".into(), name: "report.pdf".into(), size_bytes: 1, mime_type: None,
+            owners: vec![], chunks: vec![ChunkMeta { hash: "a".repeat(64), index: 0, size: 1 }],
+            publisher: None, signature: None,
+        };
+        assert!(chat.merge_manifest(base.clone()).await.is_none(), "без подписи");
+
+        let mut renamed = sign_file(base.clone(), &alice_kp);
+        renamed.name = "report.pdf.exe".into();
+        assert!(chat.merge_manifest(renamed).await.is_none(), "переименование после подписи");
+
+        assert!(chat.merge_manifest(sign_file(base.clone(), &alice_kp)).await.is_some());
+        // Сидер без подписи пополняет уже известный файл.
+        let mut seeder = base;
+        seeder.owners = vec![NodeId("c".repeat(64))];
+        let merged = chat.merge_manifest(seeder).await.expect("новый сидер");
+        assert_eq!(merged.name, "report.pdf");
+        assert!(merged.signature.is_some(), "подписанная часть сохранилась");
     }
 }

@@ -471,6 +471,8 @@ impl ProfilePage {
             enc_pubkey:   None,  // backend добавит enc_pubkey перед рассылкой
             is_bootstrap: false, // backend проставит флаг перед рассылкой
             avatar_png:   self.avatar_png.clone(),
+            updated_at:   0,    // чат проставит время и подпись перед рассылкой
+            signature:    None,
         };
         let _ = tx.send(profile);
         self.last_sent_profile = Some((self.name.clone(), self.description.clone(), self.status.clone()));
