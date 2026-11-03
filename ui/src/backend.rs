@@ -14,6 +14,7 @@ use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd, Private
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
+use void_network::secure::NoiseIdentity;
 use void_storage::{ChunkEvent, ChunkStore, StorageManager};
 use void_reputation::{
     EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager, SyncManager,
@@ -250,7 +251,7 @@ fn set_dm_status(
 async fn try_deliver_dm(
     dm_h:      &PrivateChatHandle,
     relay_set: &Arc<Mutex<HashSet<String>>>,
-    my_id:     &NodeId,
+    noise:     &NoiseIdentity,
     cmd:       &DmSendCmd,
 ) -> bool {
     // send_dm переиспользует уже поднятое соединение (в т.ч. relay-туннель),
@@ -261,9 +262,11 @@ async fn try_deliver_dm(
     // Снимок текущих relay-адресов (статические + узнанные по gossip).
     let relay_addrs: Vec<String> = { relay_set.lock().unwrap().iter().cloned().collect() };
     for raddr in &relay_addrs {
-        match void_discovery::relay::open_tunnel(raddr, my_id, &cmd.to).await {
+        match void_discovery::relay::open_tunnel(raddr, noise, &cmd.to).await {
             Ok(stream) => {
-                if let Err(e) = dm_h.send_dm_over_stream(cmd.clone(), stream).await {
+                // Поверх relay-хопа DM проводит своё сквозное Noise-рукопожатие с
+                // `cmd.to` — relay не может ни прочитать, ни подменить собеседника.
+                if let Err(e) = dm_h.send_dm_over_stream(cmd.clone(), Box::new(stream)).await {
                     tracing::debug!("DM через relay {} не прошёл: {}", raddr, e);
                 } else {
                     tracing::info!("DM доставлено через relay {}", raddr);
@@ -614,6 +617,10 @@ async fn backend_main(
     // отрицательным score). Clone дешёвый — состояние (bucket map) общее.
     let rate_limiter = RateLimiter::new();
 
+    // Noise-ключ узла (привязан подписью к NodeId): им аутентифицируются все
+    // TCP-соединения — DM, чанки, bootstrap, relay (чат создаёт свой из sign_kp).
+    let noise = NoiseIdentity::new(&sign_kp);
+
     // ── Система репутации (локальный скоринг + сетевая синхронизация) ─────────
     // Доступна, если есть БД.
     let reputation: Option<Reputation> = db_pool.clone().map(|pool| {
@@ -677,7 +684,7 @@ async fn backend_main(
         tracing::info!("Bootstrap-адреса: {:?}", service_addrs);
         void_discovery::bootstrap::start_bootstrap_client(
             my_peer.clone(), peer_list.clone(), service_addrs,
-            Arc::clone(&reachability_out),
+            Arc::clone(&reachability_out), noise.clone(),
         );
     }
     // Relay-адреса тех же bootstrap-узлов (host:base+6). Через них идёт fallback
@@ -693,16 +700,18 @@ async fn backend_main(
     if bootstrap {
         let me = my_peer.clone();
         let pl = peer_list.clone();
+        let srv_noise = noise.clone();
         tokio::spawn(async move {
             // 0. Relay-сервер не зависит от внешнего адреса — поднимаем сразу,
             //    не дожидаясь UPnP/STUN (иначе он стартует с задержкой в десятки
             //    секунд, пока идут таймауты поиска UPnP-шлюза).
             let rport = base_port + void_discovery::relay::RELAY_PORT_OFFSET;
-            if let Err(e) = void_discovery::relay::start_relay_server(rport).await {
+            if let Err(e) = void_discovery::relay::start_relay_server(rport, srv_noise.clone()).await {
                 tracing::error!("Relay server failed on {}: {}", rport, e);
             }
-            // 1. UPnP: открываем TCP-порты на роутере (base/+2/+3/+4/+5/+6) + внешний IP.
-            let ports = [base_port, base_port + 2, base_port + 3, base_port + 4, base_port + 5, base_port + 6];
+            // 1. UPnP: открываем TCP-порты на роутере (base/+2/+3/+5/+6) + внешний IP.
+            //    +4 (HTTP сайтов) не пробрасываем — он только для своего браузера.
+            let ports = [base_port, base_port + 2, base_port + 3, base_port + 5, base_port + 6];
             let upnp_ip = void_discovery::nat::map_ports(me.ip, &ports, "Void Connect").await;
             // 2. Если UPnP не дал внешний IP — пробуем STUN (публичные серверы).
             let ext_ip = match upnp_ip {
@@ -729,20 +738,20 @@ async fn backend_main(
             // 4. Bootstrap-сервер с рекламируемым адресом.
             let bport = base_port + void_discovery::bootstrap::BOOTSTRAP_PORT_OFFSET;
             if let Err(e) = void_discovery::bootstrap::start_bootstrap_server(
-                advertised, pl, bport,
+                advertised, pl, bport, srv_noise,
             ).await {
                 tracing::error!("Bootstrap server failed on {}: {}", bport, e);
             }
         });
     } else if !local_mode {
         // Не публичный режим, но в LAN/глобальной сети: best-effort пробуем
-        // UPnP-проброс наших рабочих портов (чанки/чат/DM/сайты). В паре со
+        // UPnP-проброс наших рабочих портов (чанки/чат/DM). В паре со
         // штамповкой внешнего адреса на bootstrap это даёт прямое подключение к
         // нам из других сетей (если роутер поддерживает UPnP) — без relay.
         // Неудача (нет UPnP-шлюза) игнорируется молча.
         let ip = my_peer.ip;
         tokio::spawn(async move {
-            let ports = [base_port, base_port + 2, base_port + 3, base_port + 4];
+            let ports = [base_port, base_port + 2, base_port + 3];
             if void_discovery::nat::map_ports(ip, &ports, "Void Connect").await.is_some() {
                 tracing::info!("UPnP: рабочие порты проброшены на роутере");
             }
@@ -800,7 +809,7 @@ async fn backend_main(
     }
 
     // Запускаем DM-сервер
-    let dm_handle = match start_private_chat(my_peer.clone(), Arc::clone(&enc_kp), dm_port).await {
+    let dm_handle = match start_private_chat(my_peer.clone(), Arc::clone(&enc_kp), noise.clone(), dm_port).await {
         Ok(h)  => h,
         Err(e) => {
             tracing::error!("DM server failed on port {}: {}", dm_port, e);
@@ -822,14 +831,14 @@ async fn backend_main(
         tracing::info!("Relay-адреса: {:?}", relay_addrs);
         for raddr in &relay_addrs {
             let mut accepted = void_discovery::relay::start_relay_client(
-                raddr.clone(), my_peer.id.clone(),
+                raddr.clone(), noise.clone(),
             );
             let dm_accept = dm_handle.clone();
             tokio::spawn(async move {
                 while let Some((stream, from)) = accepted.recv().await {
                     tracing::info!("Relay: входящий туннель от {}", from);
                     let h = dm_accept.clone();
-                    tokio::spawn(async move { h.accept_stream(stream).await; });
+                    tokio::spawn(async move { h.accept_stream(Box::new(stream)).await; });
                 }
             });
         }
@@ -918,7 +927,7 @@ async fn backend_main(
     // GUI статус доставки через `dm_status`.
     let dm_h = dm_handle.clone();
     let dm_relay_set = Arc::clone(&relay_set);
-    let dm_my_id = my_peer.id.clone();
+    let dm_noise = noise.clone();
     let dm_status_loop = Arc::clone(&dm_status);
     let dm_peer_list = peer_list.clone();
     tokio::spawn(async move {
@@ -929,7 +938,7 @@ async fn backend_main(
                 maybe_cmd = dm_rx.recv() => {
                     let Some(cmd) = maybe_cmd else { break; }; // канал закрыт — выходим
                     set_dm_status(&dm_status_loop, &cmd.message_id, DeliveryState::Sending);
-                    if try_deliver_dm(&dm_h, &dm_relay_set, &dm_my_id, &cmd).await {
+                    if try_deliver_dm(&dm_h, &dm_relay_set, &dm_noise, &cmd).await {
                         set_dm_status(&dm_status_loop, &cmd.message_id, DeliveryState::Delivered);
                     } else {
                         // Пир, возможно, офлайн — повторим позже.
@@ -952,7 +961,7 @@ async fn backend_main(
                             p.cmd.to_dm_addr =
                                 format!("{}:{}", info.ip, info.port.saturating_add(DM_PORT_OFFSET));
                         }
-                        if try_deliver_dm(&dm_h, &dm_relay_set, &dm_my_id, &p.cmd).await {
+                        if try_deliver_dm(&dm_h, &dm_relay_set, &dm_noise, &p.cmd).await {
                             set_dm_status(&dm_status_loop, &p.cmd.message_id, DeliveryState::Delivered);
                         } else if p.attempts >= DM_MAX_ATTEMPTS {
                             tracing::warn!(
@@ -1022,6 +1031,7 @@ async fn backend_main(
     let dm_for_relay = dm_handle.clone();
     let relay_set_disc = Arc::clone(&relay_set);
     let my_relay_id = my_peer.id.clone();
+    let relay_noise = noise.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         let mut prev_ids: HashSet<NodeId> = HashSet::new();
@@ -1061,14 +1071,14 @@ async fn backend_main(
                 if is_new {
                     tracing::info!("Relay (gossip): регистрируюсь на {} ({})", raddr, info.name);
                     let mut accepted = void_discovery::relay::start_relay_client(
-                        raddr.clone(), my_relay_id.clone(),
+                        raddr.clone(), relay_noise.clone(),
                     );
                     let dm_accept = dm_for_relay.clone();
                     tokio::spawn(async move {
                         while let Some((stream, from)) = accepted.recv().await {
                             tracing::info!("Relay: входящий туннель от {}", from);
                             let h = dm_accept.clone();
-                            tokio::spawn(async move { h.accept_stream(stream).await; });
+                            tokio::spawn(async move { h.accept_stream(Box::new(stream)).await; });
                         }
                     });
                 }
@@ -1254,7 +1264,7 @@ async fn backend_main(
     // download у пиров идёт именно на их base_port.
     if let Some(pool) = db_pool.clone() {
         match ChunkStore::new(data_dir.join("chunks")).await {
-            Ok(store) => match StorageManager::new(pool.clone(), store, my_peer.id.clone()).await {
+            Ok(store) => match StorageManager::new(pool.clone(), store, noise.clone()).await {
                 Ok(mut manager) => {
                     // Подключаем события качества чанков к репутации (если включена).
                     if let Some(tx) = chunk_ev_tx.clone() {
@@ -1339,7 +1349,9 @@ fn start_site_tasks(
     let srv_reg = registry.clone();
     let srv_mgr = manager.clone();
     tokio::spawn(async move {
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
+        // Только loopback: страницы сайтов нужны своему браузеру. Открытый в сеть
+        // порт позволял бы любому заставить узел скачивать произвольные файлы.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], http_port));
         if let Err(e) = void_web::serve(addr, srv_reg, srv_mgr, peers).await {
             tracing::error!("Site HTTP server failed on {}: {}", http_port, e);
         }

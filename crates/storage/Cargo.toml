@@ -22,3 +22,4 @@ tokio-util   = { workspace = true }
 
 [dev-dependencies]
 tempfile     = { workspace = true }
+void-crypto  = { path = "../crypto" }

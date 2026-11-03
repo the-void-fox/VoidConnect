@@ -18,3 +18,6 @@ rand = { workspace = true }
 mdns-sd = "0.10"
 # UPnP/IGD проброс портов для bootstrap-узлов (NAT traversal). best-effort.
 igd-next = { version = "0.14", features = ["aio_tokio"] }
+
+[dev-dependencies]
+void-crypto = { path = "../crypto" }

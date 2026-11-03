@@ -30,6 +30,7 @@ use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
 use void_network::rate_limit::RateLimiter;
 use void_network::conn_guard::ConnLimiter;
+use void_network::secure::{self, Channel, NoiseIdentity};
 
 /// Потолок размера одного пакета на проводе. Поднят до 16 МиБ, чтобы вмещать
 /// манифесты крупных файлов (список хэшей чанков): при 256 КБ/чанк это
@@ -158,6 +159,8 @@ struct PublicChatInner {
     /// Ключ подписи исходящих сообщений. Его публичная часть должна
     /// совпадать с `my_peer.id` (NodeId = hex(Ed25519 pubkey)).
     signing_kp:  Arc<SigningKeypair>,
+    /// Noise-ключ соединений чата, привязанный к нашему NodeId.
+    noise:       NoiseIdentity,
     incoming_tx: broadcast::Sender<ChatMessage>,
     history:     Mutex<VecDeque<ChatMessage>>,
     seq_counter: Mutex<u64>,
@@ -218,9 +221,10 @@ impl PublicChat {
         let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (vote_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (spam_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
+        let noise = NoiseIdentity::new(&signing_kp);
         PublicChat {
             inner: Arc::new(PublicChatInner {
-                my_peer, peer_list, chat_port, signing_kp, incoming_tx,
+                my_peer, peer_list, chat_port, signing_kp, noise, incoming_tx,
                 history:     Mutex::new(VecDeque::with_capacity(100)),
                 seq_counter: Mutex::new(0),
                 seen:        Mutex::new(HashSet::new()),
@@ -724,8 +728,15 @@ async fn run_server(chat: PublicChat) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: PublicChat) {
+async fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, chat: PublicChat) {
     debug!("Incoming connection from {}", addr);
+
+    // Noise: клиент доказывает свой NodeId; дальше всё зашифровано.
+    let mut stream = match secure::accept(stream, &chat.inner.noise, Channel::Chat).await {
+        Ok(s) => s,
+        Err(e) => { warn!("Chat handshake with {} failed: {}", addr, e); return; }
+    };
+    let authed = stream.peer().clone();
 
     // Шаг 1: читаем Hello (с таймаутом — защита от slowloris)
     let hello = match timeout(HELLO_TIMEOUT, read_packet(&mut stream)).await {
@@ -735,8 +746,9 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
     };
     let (node_id, peer_name, client_chat_port) = match hello {
         ChatPacket::Hello { node_id, name, chat_port } => {
-            if !void_core::sanitize::is_hex64(node_id.as_str()) {
-                warn!("Hello с недопустимым node_id от {}", addr);
+            // Назваться можно только своим (доказанным рукопожатием) NodeId.
+            if node_id != authed {
+                warn!("Hello от {} заявляет чужой node_id {}", authed, node_id);
                 return;
             }
             (node_id, void_core::sanitize::display_text(&name, MAX_SENDER_NAME_CHARS), chat_port)
@@ -834,14 +846,14 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
     let (fwd_tx, mut fwd_rx) = mpsc::channel::<ChatPacket>(64);
     chat.inner.clients.lock().await.insert(node_id.clone(), fwd_tx.clone());
 
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = tokio::io::split(stream);
 
     // Таск чтения: пакеты от клиента → обрабатываем
     let chat_r = chat.clone();
     let nid    = node_id.clone();
     let read_task = tokio::spawn(async move {
         loop {
-            let pkt = match read_packet_rd(&mut rd).await {
+            let pkt = match read_packet(&mut rd).await {
                 Ok(p) => p,
                 Err(e) => {
                     debug!("Client {} disconnected (read): {}", nid, e);
@@ -910,7 +922,7 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
     let nid2 = node_id.clone();
     let write_task = tokio::spawn(async move {
         while let Some(pkt) = fwd_rx.recv().await {
-            if send_packet_wr(&mut wr, &pkt).await.is_err() {
+            if send_packet(&mut wr, &pkt).await.is_err() {
                 debug!("Client {} disconnected (write)", nid2);
                 break;
             }
@@ -1256,8 +1268,13 @@ async fn relay_attempt(chat: &PublicChat) -> bool {
 async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<mpsc::Sender<ChatPacket>> {
     let addr = peer.chat_addr();
     info!("TCP connect → {}", addr);
-    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await??;
-    let (mut rd, mut wr) = stream.into_split();
+    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await??;
+    // Проверяем, что на том конце именно выбранный релей: подменённый адрес
+    // (анонс чужого ID со своим IP) обрывается здесь, и выборы идут дальше.
+    // У stub-записи (ручной --peer) настоящий ID ещё неизвестен.
+    let expected = (!peer.id.as_str().starts_with("stub-")).then_some(&peer.id);
+    let stream = secure::connect(tcp, &chat.inner.noise, Channel::Chat, expected).await?;
+    let (mut rd, mut wr) = tokio::io::split(stream);
 
     // Hello — используем актуальное имя из профиля (не PeerInfo.name который может устареть)
     let hello_name = {
@@ -1267,14 +1284,14 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| chat.inner.my_peer.name.clone())
     };
-    send_packet_wr(&mut wr, &ChatPacket::Hello {
+    send_packet(&mut wr, &ChatPacket::Hello {
         node_id:   chat.inner.my_peer.id.clone(),
         name:      hello_name,
         chat_port: chat.inner.chat_port,
     }).await?;
 
     // Читаем History (первый пакет от ретранслятора)
-    match read_packet_rd(&mut rd).await? {
+    match read_packet(&mut rd).await? {
         ChatPacket::History { messages } => {
             // Историю присылает релей — он может подложить сообщения «от»
             // кого угодно. Принимаем только сообщения с верной подписью автора.
@@ -1302,7 +1319,7 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
 
     // Отправляем свой профиль ретранслятору
     if let Some(profile) = chat.inner.my_profile.lock().await.as_ref() {
-        send_packet_wr(&mut wr, &ChatPacket::ProfileUpdate(profile.clone())).await?;
+        send_packet(&mut wr, &ChatPacket::ProfileUpdate(profile.clone())).await?;
     }
 
     // Отправляем известные нам манифесты файлов ретранслятору (на случай если
@@ -1310,7 +1327,7 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
     {
         let manifests = chat.inner.manifests.lock().await;
         for manifest in manifests.values() {
-            send_packet_wr(&mut wr, &ChatPacket::FileAnnounce(manifest.clone())).await?;
+            send_packet(&mut wr, &ChatPacket::FileAnnounce(manifest.clone())).await?;
         }
     }
 
@@ -1318,7 +1335,7 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
     {
         let sites = chat.inner.sites.lock().await;
         for site in sites.values() {
-            send_packet_wr(&mut wr, &ChatPacket::SiteAnnounce(site.clone())).await?;
+            send_packet(&mut wr, &ChatPacket::SiteAnnounce(site.clone())).await?;
         }
     }
 
@@ -1326,7 +1343,7 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
     {
         let tombs = chat.inner.site_tombstones.lock().await;
         for (_, signed) in tombs.values() {
-            send_packet_wr(&mut wr, &ChatPacket::SiteRevoke { signed: signed.clone() }).await?;
+            send_packet(&mut wr, &ChatPacket::SiteRevoke { signed: signed.clone() }).await?;
         }
     }
 
@@ -1335,7 +1352,7 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
     // Таск записи (наши пакеты → ретранслятор)
     tokio::spawn(async move {
         while let Some(pkt) = rx.recv().await {
-            if send_packet_wr(&mut wr, &pkt).await.is_err() {
+            if send_packet(&mut wr, &pkt).await.is_err() {
                 debug!("Write to relay failed");
                 break;
             }
@@ -1349,7 +1366,7 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
     let chat_r = chat.clone();
     tokio::spawn(async move {
         loop {
-            match read_packet_rd(&mut rd).await {
+            match read_packet(&mut rd).await {
                 Ok(ChatPacket::Message(msg)) => {
                     debug!("Message from relay: {} chars", msg.text.len());
                     chat_r.handle_incoming(msg).await;
@@ -1451,14 +1468,8 @@ async fn send_packet<W: AsyncWriteExt + Unpin>(stream: &mut W, packet: &ChatPack
     if json.len() > MAX_MESSAGE_LEN { anyhow::bail!("Packet too large"); }
     stream.write_all(&(json.len() as u32).to_be_bytes()).await?;
     stream.write_all(&json).await?;
-    Ok(())
-}
-
-async fn send_packet_wr(wr: &mut tokio::net::tcp::OwnedWriteHalf, packet: &ChatPacket) -> anyhow::Result<()> {
-    let json = serde_json::to_vec(packet)?;
-    if json.len() > MAX_MESSAGE_LEN { anyhow::bail!("Packet too large"); }
-    wr.write_all(&(json.len() as u32).to_be_bytes()).await?;
-    wr.write_all(&json).await?;
+    // Noise-поток буферизует кадр до flush (как TLS).
+    stream.flush().await?;
     Ok(())
 }
 
@@ -1472,15 +1483,6 @@ async fn read_packet<R: AsyncReadExt + Unpin>(stream: &mut R) -> anyhow::Result<
     Ok(serde_json::from_slice(&buf)?)
 }
 
-async fn read_packet_rd(rd: &mut tokio::net::tcp::OwnedReadHalf) -> anyhow::Result<ChatPacket> {
-    let mut len_buf = [0u8; 4];
-    rd.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_LEN { anyhow::bail!("Packet too large: {} bytes", len); }
-    let mut buf = vec![0u8; len];
-    rd.read_exact(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf)?)
-}
 
 // ─── Тесты ───────────────────────────────────────────────────────────────────
 
@@ -1511,6 +1513,13 @@ mod tests {
         let kp = Arc::new(SigningKeypair::from_seed(&[seed; 32]).unwrap());
         let id = NodeId::from_public_key_bytes(&kp.public_bytes());
         (kp, id)
+    }
+
+    /// Две пары ключей, упорядоченные по NodeId: первая выигрывает выборы релея.
+    fn ordered_keypairs(a: u8, b: u8) -> ((Arc<SigningKeypair>, NodeId), (Arc<SigningKeypair>, NodeId)) {
+        let (ka, ia) = keypair(a);
+        let (kb, ib) = keypair(b);
+        if ia.as_str() < ib.as_str() { ((ka, ia), (kb, ib)) } else { ((kb, ib), (ka, ia)) }
     }
 
     fn test_peer(name: &str, id: NodeId, chat_port: u16) -> PeerInfo {
@@ -2136,10 +2145,14 @@ mod tests {
         forged.seq = 2;
         forged.text = "forged".into();
 
-        // Злой релей: принимает Hello, шлёт историю и держит соединение.
+        // Злой релей (настоящий узел с меньшим ID — его законно выбирают):
+        // проходит рукопожатие, принимает Hello, шлёт историю и держит соединение.
+        let ((relay_kp, relay_id), (my_kp, my_id)) = ordered_keypairs(4, 8);
+        let relay_noise = NoiseIdentity::new(&relay_kp);
         let listener = TcpListener::bind(("127.0.0.1", relay_port)).await.unwrap();
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = secure::accept(tcp, &relay_noise, Channel::Chat).await.unwrap();
             let _hello = read_packet(&mut stream).await.unwrap();
             send_packet(&mut stream, &ChatPacket::History { messages: vec![genuine, forged] })
                 .await
@@ -2147,9 +2160,8 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let (my_kp, my_id) = keypair(4);
         let pl = PeerList::new();
-        pl.upsert(test_peer("relay", NodeId("0".repeat(64)), relay_port)).await;
+        pl.upsert(test_peer("relay", relay_id, relay_port)).await;
         let me = start_public_chat(test_peer("me", my_id, my_port), pl, my_port, my_kp, None).await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2195,5 +2207,35 @@ mod tests {
         assert!(chat.merge_site(mk("My Site")).await.is_none());
         assert!(chat.merge_site(mk("../blog")).await.is_none());
         assert!(chat.merge_site(mk("my-site")).await.is_some());
+    }
+
+    /// Анонс «Алисы» (выигрывает выборы) с адресом самозванца: клиент обрывает
+    /// рукопожатие — на том конце не Алиса — и не отдаёт самозванцу сообщения.
+    #[tokio::test]
+    async fn impostor_at_relay_address_gets_nothing() {
+        let ((_alice_kp, alice_id), (bob_kp, bob_id)) = ordered_keypairs(1, 2);
+        let (mallory_kp, mallory_id) = keypair(3);
+        let m_port = free_port();
+        let b_port = free_port();
+
+        let mallory = start_public_chat(
+            test_peer("mallory", mallory_id, m_port), PeerList::new(), m_port, mallory_kp, None,
+        ).await.unwrap();
+        let mut m_rx = mallory.subscribe();
+
+        let b_pl = PeerList::new();
+        b_pl.upsert(test_peer("alice", alice_id, m_port)).await; // ID Алисы, адрес Мэллори
+        let bob = start_public_chat(test_peer("bob", bob_id, b_port), b_pl, b_port, bob_kp, None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            bob.send("global".into(), "secret".into()).await.unwrap();
+        }
+        assert!(
+            !wait_for_text(&mut m_rx, "secret", 2).await,
+            "самозванец получил сообщения, выдав себя за релей"
+        );
     }
 }

@@ -15,7 +15,9 @@ use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, Service};
 
 const SERVICE_TYPE: &str = "_void-connect._tcp.local.";
-const PROTOCOL_VERSION: &str = "1";
+/// v2: все TCP-соединения через Noise (`void_network::secure`) — узлы v1 без
+/// рукопожатия с нами говорить не могут, их не показываем.
+const PROTOCOL_VERSION: &str = "2";
 
 pub async fn start_mdns(
     my_peer: PeerInfo,

@@ -5,6 +5,12 @@
 //! список известных пиров. После знакомства узлы общаются напрямую (по
 //! `PeerInfo.ip:port` / `chat_addr`), а bootstrap из цепочки выпадает.
 //!
+//! Соединение — Noise ([`void_network::secure`], канал `Bootstrap`): сервер
+//! регистрирует новичка только под NodeId, доказанным рукопожатием, поэтому
+//! нельзя «прописать» чужой ID на свой адрес. Полученные от сервера адреса
+//! других узлов — лишь подсказки: каждое последующее соединение с ними само
+//! проверяет NodeId.
+//!
 //! Протокол (length-prefixed JSON, как у чата):
 //!   клиент → сервер: `Hello(PeerInfo)`   — «вот я, добавь меня»
 //!   сервер → клиент: `Peers(Vec<PeerInfo>)` — известные сервером пиры + он сам
@@ -16,7 +22,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -24,6 +30,7 @@ use tracing::{debug, info, warn};
 use void_core::peer::PeerInfo;
 use void_core::sanitize::is_hex64;
 use void_network::conn_guard::ConnLimiter;
+use void_network::secure::{self, Channel, NoiseIdentity};
 
 use crate::peer_list::PeerList;
 
@@ -112,6 +119,7 @@ pub async fn start_bootstrap_server(
     my_peer: PeerInfo,
     peer_list: PeerList,
     port: u16,
+    noise: NoiseIdentity,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     info!("Bootstrap server listening on 0.0.0.0:{}", port);
@@ -131,9 +139,10 @@ pub async fn start_bootstrap_server(
                     };
                     let pl = peer_list.clone();
                     let me = my_peer.clone();
+                    let noise = noise.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = handle_bootstrap_client(stream, me, pl).await {
+                        if let Err(e) = handle_bootstrap_client(stream, me, pl, noise).await {
                             debug!("Bootstrap client {} error: {}", addr, e);
                         }
                     });
@@ -146,12 +155,15 @@ pub async fn start_bootstrap_server(
 }
 
 async fn handle_bootstrap_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     my_peer: PeerInfo,
     peer_list: PeerList,
+    noise: NoiseIdentity,
 ) -> io::Result<()> {
     // Внешний адрес клиента — это источник TCP-соединения (не LAN-IP из Hello).
     let src_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let mut stream = secure::accept(stream, &noise, Channel::Bootstrap).await?;
+    let client_id = stream.peer().clone();
 
     // Шаг 1: читаем Hello и регистрируем новичка (только реальные узлы).
     // Slowloris-защита: ограничиваем время ожидания первого сообщения.
@@ -160,7 +172,12 @@ async fn handle_bootstrap_client(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client read timed out"))??;
     if let BootstrapMsg::Hello { mut peer } = first {
-        if is_hex64(peer.id.as_str()) {
+        // Регистрируем только под NodeId, доказанным рукопожатием.
+        if peer.id != client_id {
+            warn!("Bootstrap: Hello от {} заявляет чужой id {}", client_id, peer.id);
+            return Ok(());
+        }
+        {
             // NAT-traversal: узел рекламирует свой LAN-адрес, но из другой сети он
             // недостижим. Подменяем приватный/loopback ip на ВНЕШНИЙ (источник
             // TCP-соединения, как его видит bootstrap), чтобы остальные пиры могли
@@ -227,10 +244,13 @@ pub async fn bootstrap_exchange(
     my_peer: &PeerInfo,
     peer_list: &PeerList,
     service_addr: &str,
+    noise: &NoiseIdentity,
 ) -> io::Result<ExchangeOutcome> {
-    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(service_addr))
+    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(service_addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+    // NodeId bootstrap-узла по адресу `host:port` заранее не знаем — не закрепляем.
+    let mut stream = secure::connect(tcp, noise, Channel::Bootstrap, None).await?;
 
     write_msg(&mut stream, &BootstrapMsg::Hello { peer: my_peer.clone() }).await?;
 
@@ -239,6 +259,8 @@ pub async fn bootstrap_exchange(
     if let BootstrapMsg::Peers { peers, reachable: r } = read_msg(&mut stream).await? {
         reachable = r;
         for p in peers {
+            // Адреса других узлов от сервера — только подсказки: NodeId каждого
+            // проверит Noise-рукопожатие при подключении к нему.
             if p.id != my_peer.id && is_hex64(p.id.as_str()) {
                 let known = peer_list.get(&p.id).await.is_some();
                 peer_list.upsert(p).await;
@@ -259,6 +281,7 @@ pub fn start_bootstrap_client(
     peer_list: PeerList,
     service_addrs: Vec<String>,
     reach: std::sync::Arc<std::sync::Mutex<Reachability>>,
+    noise: NoiseIdentity,
 ) {
     if service_addrs.is_empty() {
         return;
@@ -270,7 +293,7 @@ pub fn start_bootstrap_client(
             // Доступность за тик: достаточно одного «дозвонились» (true побеждает).
             let mut tick_reach: Option<bool> = None;
             for addr in &service_addrs {
-                match bootstrap_exchange(&my_peer, &peer_list, addr).await {
+                match bootstrap_exchange(&my_peer, &peer_list, addr, &noise).await {
                     Ok(out) => {
                         info!("Bootstrap {} → узнали {} новых пир(ов)", addr, out.learned);
                         if let Some(r) = out.reachable {
@@ -297,7 +320,7 @@ pub fn start_bootstrap_client(
 
 // ─── Сериализация (length-prefixed JSON) ───────────────────────────────────────
 
-async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &BootstrapMsg) -> io::Result<()> {
+async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &BootstrapMsg) -> io::Result<()> {
     let json = serde_json::to_vec(msg).map_err(to_io)?;
     if json.len() > MAX_MSG {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
@@ -307,7 +330,7 @@ async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &BootstrapMsg) -> i
     w.flush().await
 }
 
-async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<BootstrapMsg> {
+async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<BootstrapMsg> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -329,16 +352,19 @@ fn to_io(e: serde_json::Error) -> io::Error {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    use void_core::identity::NodeId;
     use void_core::peer::Service;
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
     }
 
+    fn ident(seed: u8) -> NoiseIdentity {
+        NoiseIdentity::new(&void_crypto::keys::SigningKeypair::from_seed(&[seed; 32]).unwrap())
+    }
+
     fn peer(seed: u8, base_port: u16) -> PeerInfo {
         PeerInfo {
-            id:        NodeId::from_public_key_bytes(&[seed; 32]),
+            id:        ident(seed).node_id().clone(),
             name:      format!("node{seed}"),
             ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
             port:      base_port,
@@ -361,13 +387,13 @@ mod tests {
         let a = peer(1, free_port());
         let svc_port = free_port();
         let pl_a = PeerList::new();
-        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port, ident(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let b = peer(2, free_port());
         let pl_b = PeerList::new();
         let svc = format!("127.0.0.1:{svc_port}");
-        let learned = bootstrap_exchange(&b, &pl_b, &svc).await.unwrap().learned;
+        let learned = bootstrap_exchange(&b, &pl_b, &svc, &ident(2)).await.unwrap().learned;
 
         assert_eq!(learned, 1, "B должен узнать ровно A");
         assert!(pl_b.get(&a.id).await.is_some(), "B знает A");
@@ -380,19 +406,19 @@ mod tests {
         let a = peer(1, free_port());
         let svc_port = free_port();
         let pl_a = PeerList::new();
-        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port, ident(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let svc = format!("127.0.0.1:{svc_port}");
 
         // B знакомится первым (A теперь знает B).
         let b = peer(2, free_port());
         let pl_b = PeerList::new();
-        bootstrap_exchange(&b, &pl_b, &svc).await.unwrap();
+        bootstrap_exchange(&b, &pl_b, &svc, &ident(2)).await.unwrap();
 
         // C знакомится позже — должен узнать и A, и B.
         let c = peer(3, free_port());
         let pl_c = PeerList::new();
-        let learned = bootstrap_exchange(&c, &pl_c, &svc).await.unwrap().learned;
+        let learned = bootstrap_exchange(&c, &pl_c, &svc, &ident(3)).await.unwrap().learned;
 
         assert_eq!(learned, 2, "C узнаёт A и B");
         assert!(pl_c.get(&a.id).await.is_some(), "C знает A");
@@ -406,14 +432,14 @@ mod tests {
         let a = peer(1, free_port());
         let svc_port = free_port();
         let pl_a = PeerList::new();
-        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port, ident(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let svc = format!("127.0.0.1:{svc_port}");
 
         // B рекламирует «LAN»-адрес 10.0.0.5, но подключается с 127.0.0.1.
         let mut b = peer(2, free_port());
         b.ip = "10.0.0.5".parse().unwrap();
-        bootstrap_exchange(&b, &PeerList::new(), &svc).await.unwrap();
+        bootstrap_exchange(&b, &PeerList::new(), &svc, &ident(2)).await.unwrap();
 
         let stored = pl_a.get(&b.id).await.expect("A зарегистрировал B");
         assert_eq!(stored.ip.to_string(), "127.0.0.1",
@@ -426,14 +452,14 @@ mod tests {
         let a = peer(1, free_port());
         let svc_port = free_port();
         let pl_a = PeerList::new();
-        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port, ident(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let svc = format!("127.0.0.1:{svc_port}");
 
         let b = peer(2, free_port());
         let pl_b = PeerList::new();
-        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc).await.unwrap().learned, 1);
-        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc).await.unwrap().learned, 0, "A уже известен");
+        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc, &ident(2)).await.unwrap().learned, 1);
+        assert_eq!(bootstrap_exchange(&b, &pl_b, &svc, &ident(2)).await.unwrap().learned, 0, "A уже известен");
     }
 
     /// Обратная проба: если у клиента открыт base-порт (есть листенер), bootstrap
@@ -443,7 +469,7 @@ mod tests {
         let a = peer(1, free_port());
         let svc_port = free_port();
         let pl_a = PeerList::new();
-        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port).await.unwrap();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port, ident(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let svc = format!("127.0.0.1:{svc_port}");
 
@@ -452,13 +478,30 @@ mod tests {
         let _b_listener = tokio::net::TcpListener::bind(("127.0.0.1", b_base)).await.unwrap();
         let mut b = peer(2, free_port());
         b.port = b_base; // base-порт, который пробует bootstrap
-        let out = bootstrap_exchange(&b, &PeerList::new(), &svc).await.unwrap();
+        let out = bootstrap_exchange(&b, &PeerList::new(), &svc, &ident(2)).await.unwrap();
         assert_eq!(out.reachable, Some(true), "открытый порт → reachable");
 
         // Клиент C с ЗАКРЫТЫМ base-портом (никто не слушает).
         let mut c = peer(3, free_port());
         c.port = free_port(); // свободный, но без листенера → connection refused
-        let out_c = bootstrap_exchange(&c, &PeerList::new(), &svc).await.unwrap();
+        let out_c = bootstrap_exchange(&c, &PeerList::new(), &svc, &ident(3)).await.unwrap();
         assert_eq!(out_c.reachable, Some(false), "закрытый порт → not reachable");
+    }
+
+    /// Нельзя зарегистрировать на bootstrap чужой NodeId (например, свой адрес
+    /// под ID Алисы): Hello обязан совпасть с доказанным рукопожатием.
+    #[tokio::test]
+    async fn cannot_register_foreign_id() {
+        let a = peer(1, free_port());
+        let svc_port = free_port();
+        let pl_a = PeerList::new();
+        start_bootstrap_server(a.clone(), pl_a.clone(), svc_port, ident(1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let svc = format!("127.0.0.1:{svc_port}");
+
+        let alice = peer(5, free_port());
+        let res = bootstrap_exchange(&alice, &PeerList::new(), &svc, &ident(9)).await;
+        assert!(res.is_err(), "сервер обрывает соединение самозванца");
+        assert!(pl_a.get(&alice.id).await.is_none(), "чужой ID не зарегистрирован");
     }
 }

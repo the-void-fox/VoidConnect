@@ -14,6 +14,7 @@ egui_extras = { workspace = true }
 chrono = { workspace = true }
 
 void-core      = { path = "../crates/core" }
+void-network   = { path = "../crates/network" }
 void-crypto    = { path = "../crates/crypto" }
 void-discovery = { path = "../crates/discovery" }
 void-chat      = { path = "../crates/chat" }
