@@ -5016,6 +5016,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "rand",
  "serde",
  "serde_json",
  "tokio",
