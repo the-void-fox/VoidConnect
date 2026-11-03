@@ -5,7 +5,9 @@
 //!     применяют `void-chat` и `void-reputation`);
 //!   - [`conn_guard::ConnLimiter`] — ограничитель числа одновременных входящих
 //!     соединений (глобальный + на один IP); защита от connection-flood, его
-//!     применяют accept-циклы серверов чата/DM/чанков/bootstrap/relay.
+//!     применяют accept-циклы серверов чата/DM/чанков/bootstrap/relay;
+//!   - [`secure`] — рукопожатие Noise XX и зашифрованный поток: каждое
+//!     TCP-соединение между узлами аутентифицирует NodeId собеседника.
 //!
 //! Реальная сеть реализована напрямую в других крейтах:
 //!   - чат и личные сообщения — `void-chat` (свой length-prefixed JSON поверх TCP);
@@ -16,3 +18,4 @@
 
 pub mod conn_guard;
 pub mod rate_limit;
+pub mod secure;

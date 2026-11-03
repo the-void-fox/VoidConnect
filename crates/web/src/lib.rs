@@ -132,15 +132,22 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use void_storage::ChunkStore;
 
+    /// Noise-личность тестового узла: NodeId должен быть настоящим ключом.
+    fn ident(seed: u8) -> void_network::secure::NoiseIdentity {
+        void_network::secure::NoiseIdentity::new(
+            &void_crypto::keys::SigningKeypair::from_seed(&[seed; 32]).unwrap(),
+        )
+    }
+
     fn node(seed: u8) -> NodeId {
-        NodeId::from_public_key_bytes(&[seed; 32])
+        ident(seed).node_id().clone()
     }
 
     async fn storage(seed: u8) -> (tempfile::TempDir, StorageManager) {
         let dir = tempfile::tempdir().unwrap();
         let pool = void_db::open(&dir.path().join("db.sqlite")).await.unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
-        let mgr = StorageManager::new(pool, store, node(seed)).await.unwrap();
+        let mgr = StorageManager::new(pool, store, ident(seed)).await.unwrap();
         (dir, mgr)
     }
 

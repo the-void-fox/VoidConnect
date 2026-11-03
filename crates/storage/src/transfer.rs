@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use void_core::identity::NodeId;
 use void_core::sanitize::is_hex64;
 use void_network::conn_guard::ConnLimiter;
+use void_network::secure::{self, Channel, NoiseIdentity};
 
 use crate::chunk_store::ChunkStore;
 use crate::error::StorageError;
@@ -68,8 +69,8 @@ pub enum ChunkResponseStatus {
 // ─── Вспомогательные функции I/O ──────────────────────────────────────────────
 
 /// Записывает length-prefixed JSON в stream.
-async fn write_message<T: Serialize>(
-    stream: &mut TcpStream,
+async fn write_message<T: Serialize, S: AsyncWrite + Unpin>(
+    stream: &mut S,
     msg: &T,
 ) -> Result<(), StorageError> {
     let json = serde_json::to_vec(msg)?;
@@ -78,12 +79,15 @@ async fn write_message<T: Serialize>(
         .map_err(|e| StorageError::Network(e.to_string()))?;
     stream.write_all(&json).await
         .map_err(|e| StorageError::Network(e.to_string()))?;
+    // Noise-поток буферизует кадр до flush.
+    stream.flush().await
+        .map_err(|e| StorageError::Network(e.to_string()))?;
     Ok(())
 }
 
 /// Читает length-prefixed JSON из stream.
-async fn read_message<T: for<'de> Deserialize<'de>>(
-    stream: &mut TcpStream,
+async fn read_message<T: for<'de> Deserialize<'de>, S: AsyncRead + Unpin>(
+    stream: &mut S,
 ) -> Result<T, StorageError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await
@@ -106,11 +110,14 @@ async fn read_message<T: for<'de> Deserialize<'de>>(
 /// Запускает TCP-сервер, раздающий чанки.
 ///
 /// Принимает входящие соединения и обрабатывает каждое в отдельной задаче.
+/// Каждое соединение — Noise (канал `Chunks`): содержимое чанков шифруется, а
+/// запросивший узел известен по доказанному NodeId.
 /// Блокирует текущую задачу — вызывай через `tokio::spawn`.
 pub async fn run_chunk_server(
     bind_addr: SocketAddr,
     store: ChunkStore,
     bytes_uploaded: Arc<AtomicU64>,
+    noise: NoiseIdentity,
 ) -> Result<(), StorageError> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -142,9 +149,10 @@ pub async fn run_chunk_server(
 
         let store = store.clone();
         let bytes_uploaded = Arc::clone(&bytes_uploaded);
+        let noise = noise.clone();
         tokio::spawn(async move {
             let _permit = permit; // удерживается на всё время обработки
-            if let Err(e) = handle_connection(stream, peer_addr, store, bytes_uploaded).await {
+            if let Err(e) = handle_connection(stream, peer_addr, store, bytes_uploaded, noise).await {
                 debug!("Connection from {} closed: {}", peer_addr, e);
             }
         });
@@ -152,12 +160,16 @@ pub async fn run_chunk_server(
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer_addr: SocketAddr,
     store: ChunkStore,
     bytes_uploaded: Arc<AtomicU64>,
+    noise: NoiseIdentity,
 ) -> Result<(), StorageError> {
-    debug!("Incoming chunk request from {}", peer_addr);
+    let mut stream = secure::accept(stream, &noise, Channel::Chunks)
+        .await
+        .map_err(|e| StorageError::Network(e.to_string()))?;
+    debug!("Incoming chunk request from {} ({})", stream.peer(), peer_addr);
 
     // Slowloris-защита: на чтение запроса даём ограниченное время.
     let request: ChunkRequest = timeout(REQUEST_READ_TIMEOUT, read_message(&mut stream))
@@ -179,6 +191,8 @@ async fn handle_connection(
             };
             write_message(&mut stream, &response).await?;
             stream.write_all(&data).await
+                .map_err(|e| StorageError::Network(e.to_string()))?;
+            stream.flush().await
                 .map_err(|e| StorageError::Network(e.to_string()))?;
             // Учёт отданного трафика (для статистики профиля).
             bytes_uploaded.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -213,25 +227,32 @@ async fn handle_connection(
 
 // ─── Клиент ───────────────────────────────────────────────────────────────────
 
-/// Запрашивает один чанк у конкретного узла.
+/// Запрашивает один чанк у конкретного узла `owner` по адресу `peer_addr`.
 ///
+/// Рукопожатие проверяет, что на том конце именно `owner`: иначе чужой узел
+/// с подменённым адресом подсовывал бы плохие чанки, а штраф репутации
+/// доставался бы настоящему владельцу.
 /// Проверяет целостность после получения.
 /// Если хэш не совпадает — возвращает `IntegrityFailure`
 /// (вызывающий код должен попробовать другой узел и занести штраф репутации).
 pub async fn fetch_chunk_from_peer(
     peer_addr: SocketAddr,
+    owner: &NodeId,
     chunk_hash: &str,
-    my_id: &NodeId,
+    noise: &NoiseIdentity,
 ) -> Result<Vec<u8>, StorageError> {
     let connect = TcpStream::connect(peer_addr);
-    let mut stream = timeout(FETCH_TIMEOUT, connect)
+    let tcp = timeout(FETCH_TIMEOUT, connect)
         .await
         .map_err(|_| StorageError::Timeout(chunk_hash.to_string()))?
+        .map_err(|e| StorageError::Network(e.to_string()))?;
+    let mut stream = secure::connect(tcp, noise, Channel::Chunks, Some(owner))
+        .await
         .map_err(|e| StorageError::Network(e.to_string()))?;
 
     let request = ChunkRequest {
         chunk_hash: chunk_hash.to_string(),
-        requester_id: my_id.as_str().to_string(),
+        requester_id: noise.node_id().as_str().to_string(),
     };
     write_message(&mut stream, &request).await?;
 

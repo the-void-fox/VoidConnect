@@ -2,7 +2,7 @@
 //!
 //! Использование:
 //! ```ignore
-//! let manager = StorageManager::new(pool, chunk_store, peer_list, my_id).await?;
+//! let manager = StorageManager::new(pool, chunk_store, noise_identity).await?;
 //! manager.start_server(storage_port).await;
 //!
 //! // Опубликовать файл
@@ -26,6 +26,7 @@ use void_core::peer::PeerInfo;
 use void_core::sanitize::safe_file_name;
 use void_db::chunks as db_chunks;
 use void_db::DbPool;
+use void_network::secure::NoiseIdentity;
 
 use crate::chunk_store::ChunkStore;
 use crate::chunker::{split_file, assemble_file};
@@ -44,6 +45,8 @@ pub struct StorageManager {
     store: ChunkStore,
     index: ChunkIndex,
     my_id: NodeId,
+    /// Noise-ключ для соединений с другими узлами (раздача и скачивание чанков).
+    noise: NoiseIdentity,
     /// Опциональный канал событий о качестве чанков (для репутации).
     events: Option<mpsc::UnboundedSender<ChunkEvent>>,
     /// Счётчик отданных байт (чанки, разосланные пирам). Для статистики профиля.
@@ -57,8 +60,9 @@ impl StorageManager {
     pub async fn new(
         pool: DbPool,
         store: ChunkStore,
-        my_id: NodeId,
+        noise: NoiseIdentity,
     ) -> Result<Self, StorageError> {
+        let my_id = noise.node_id().clone();
         let index = ChunkIndex::new();
 
         // Загружаем в индекс наши собственные чанки из БД
@@ -79,6 +83,7 @@ impl StorageManager {
             store,
             index,
             my_id,
+            noise,
             events: None,
             bytes_uploaded: Arc::new(AtomicU64::new(0)),
             bytes_downloaded: Arc::new(AtomicU64::new(0)),
@@ -108,7 +113,7 @@ impl StorageManager {
     pub async fn start_server(&self, port: u16) -> Result<(), StorageError> {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()
             .map_err(|e: std::net::AddrParseError| StorageError::Network(e.to_string()))?;
-        run_chunk_server(addr, self.store.clone(), Arc::clone(&self.bytes_uploaded)).await
+        run_chunk_server(addr, self.store.clone(), Arc::clone(&self.bytes_uploaded), self.noise.clone()).await
     }
 
     // ─── Публикация ──────────────────────────────────────────────────────────
@@ -349,7 +354,7 @@ impl StorageManager {
 
                 let chunk_hash = chunk.hash.clone();
                 let chunk_index = chunk.chunk_index as usize;
-                let my_id = self.my_id.clone();
+                let noise = self.noise.clone();
                 let peers = peers.to_vec();
                 let owners_clone = owners.clone();
                 let pool = self.pool.clone();
@@ -362,7 +367,7 @@ impl StorageManager {
                         chunk_index,
                         &owners_clone,
                         &peers,
-                        &my_id,
+                        &noise,
                         &store,
                         &pool,
                         events.as_ref(),
@@ -541,7 +546,7 @@ async fn fetch_chunk_with_fallback(
     index: usize,
     owners: &[NodeId],
     peers: &[PeerInfo],
-    my_id: &NodeId,
+    noise: &NoiseIdentity,
     store: &ChunkStore,
     pool: &DbPool,
     events: Option<&mpsc::UnboundedSender<ChunkEvent>>,
@@ -557,7 +562,7 @@ async fn fetch_chunk_with_fallback(
             }
         };
 
-        match fetch_chunk_from_peer(addr, hash, my_id).await {
+        match fetch_chunk_from_peer(addr, owner_id, hash, noise).await {
             Ok(data) => {
                 // Сохраняем локально
                 if let Err(e) = store.put(hash, &data).await {
@@ -621,8 +626,13 @@ mod tests {
     use void_core::peer::Service;
     use void_db::{open, DbPool};
 
+    /// Noise-личность тестового узла: NodeId должен быть настоящим ключом.
+    fn ident(seed: u8) -> NoiseIdentity {
+        NoiseIdentity::new(&void_crypto::keys::SigningKeypair::from_seed(&[seed; 32]).unwrap())
+    }
+
     fn node(seed: u8) -> NodeId {
-        NodeId::from_public_key_bytes(&[seed; 32])
+        ident(seed).node_id().clone()
     }
 
     fn free_port() -> u16 {
@@ -633,7 +643,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
-        let mgr = StorageManager::new(pool.clone(), store, node(seed)).await.unwrap();
+        let mgr = StorageManager::new(pool.clone(), store, ident(seed)).await.unwrap();
         (dir, pool, mgr)
     }
 
@@ -900,6 +910,47 @@ mod tests {
         }
         assert_eq!(count, 3, "ожидалось 3 события Valid (по чанку)");
         assert_eq!(total, content.len() as i64, "сумма размеров чанков = размер файла");
+    }
+
+    /// Адрес владельца подменён (анонс чужого узла): самозванец раздаёт тот же
+    /// файл, но рукопожатие видит, что это не владелец, и чанки у него не берутся.
+    #[tokio::test]
+    async fn chunks_not_taken_from_impostor_address() {
+        let (dir_a, pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+        let manifest = mgr_a.file_manifest(&file_id).await.unwrap().unwrap();
+        drop(pool_a);
+
+        // Самозванец M раздаёт тот же файл со своего chunk-сервера.
+        let (dir_m, _pool_m, mgr_m) = make_node(9).await;
+        let m_path = dir_m.path().join("data.bin");
+        std::fs::write(&m_path, &content).unwrap();
+        mgr_m.publish_file(&m_path).await.unwrap();
+        let m_port = free_port();
+        let srv = mgr_m.clone();
+        tokio::spawn(async move { let _ = srv.start_server(m_port).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // B знает манифест (владелец A), но адрес «A» указывает на M.
+        let (dir_b, _pool_b, mgr_b) = make_node(2).await;
+        mgr_b.handle_manifest(&manifest).await.unwrap();
+        let spoofed = PeerInfo {
+            id:        node(1),
+            name:      "A".into(),
+            ip:        IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port:      m_port,
+            chat_port: m_port.wrapping_add(2),
+            services:  vec![Service::Storage],
+            last_seen: 0,
+        };
+        let dest = dir_b.path().join("downloaded.bin");
+        let res = mgr_b.download_file(&file_id, &dest, &[spoofed]).await;
+        assert!(res.is_err(), "чанки не должны браться у самозванца");
+        let progress = mgr_b.download_progress(&file_id).await.unwrap();
+        assert_eq!(progress, 0.0);
     }
 }
 
