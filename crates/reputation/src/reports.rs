@@ -13,7 +13,7 @@ use void_crypto::keys::SigningKeypair;
 use void_db::{peers as db_peers, DbPool};
 
 use crate::error::ReputationError;
-use crate::score::ScoreManager;
+use crate::score::{ScoreManager, MIN_TRUSTED_SCORE};
 
 // ─── Константы ───────────────────────────────────────────────────────────────
 
@@ -80,11 +80,13 @@ impl ReportPayload {
 pub struct ReportManager {
     pool: DbPool,
     score_manager: ScoreManager,
+    /// Наш ID: свои жалобы учитываем всегда, чужие — только от доверенных узлов.
+    my_id: NodeId,
 }
 
 impl ReportManager {
-    pub fn new(pool: DbPool, score_manager: ScoreManager) -> Self {
-        Self { pool, score_manager }
+    pub fn new(pool: DbPool, score_manager: ScoreManager, my_id: NodeId) -> Self {
+        Self { pool, score_manager, my_id }
     }
 
     // ─── Создание жалобы (на стороне репортера) ───────────────────────────────
@@ -141,6 +143,14 @@ impl ReportManager {
         // 4. Нельзя пожаловаться на себя
         if payload.target_key == reporter_id.as_str() {
             return Err(ReputationError::SelfReport);
+        }
+
+        // 4.1 Чужая жалоба учитывается, только если жалующийся уже заслужил
+        //     доверие у нас — иначе три свежих ключа штрафовали бы кого угодно.
+        if *reporter_id != self.my_id
+            && !(self.score_manager.score(reporter_id).await >= MIN_TRUSTED_SCORE)
+        {
+            return Err(ReputationError::UntrustedSender);
         }
 
         // 5. Сохраняем жалобу в БД. Сначала гарантируем наличие узла-цели —
@@ -235,13 +245,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
         let score = ScoreManager::new(pool.clone());
-        let mgr = ReportManager::new(pool, score.clone());
+        let mgr = ReportManager::new(pool, score.clone(), NodeId::from_public_key_bytes(&[100u8; 32]));
 
         let target = NodeId::from_public_key_bytes(&[200u8; 32]);
         let before = score.score(&target).await;
 
         for seed in 1..=3u8 {
             let (kp, rid) = reporter(seed);
+            score.record_bootstrap_assist(&rid, 5.0).await; // доверенный жалующийся
             let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
             mgr.receive_report(signed, &rid).await.unwrap();
         }
@@ -257,7 +268,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
         let score = ScoreManager::new(pool.clone());
-        let mgr = ReportManager::new(pool, score);
+        let mgr = ReportManager::new(pool, score, NodeId::from_public_key_bytes(&[100u8; 32]));
 
         let target = NodeId::from_public_key_bytes(&[200u8; 32]);
         let (kp, _real) = reporter(1);
@@ -267,5 +278,30 @@ mod tests {
         // reporter_id (other) ≠ подписант (real) → отклонение.
         let res = mgr.receive_report(signed, &other).await;
         assert!(matches!(res, Err(ReputationError::SignerMismatch)));
+    }
+
+    /// Жалобы от свежих ключей не принимаются и не штрафуют цель; своя
+    /// жалоба принимается всегда.
+    #[tokio::test]
+    async fn untrusted_reports_ignored_own_report_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
+        let score = ScoreManager::new(pool.clone());
+        let (my_kp, my_id) = reporter(50);
+        let mgr = ReportManager::new(pool, score.clone(), my_id.clone());
+        let target = NodeId::from_public_key_bytes(&[200u8; 32]);
+
+        for seed in 1..=6u8 {
+            let (kp, rid) = reporter(seed);
+            let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
+            let res = mgr.receive_report(signed, &rid).await;
+            assert!(matches!(res, Err(ReputationError::UntrustedSender)));
+        }
+        assert_eq!(mgr.report_count(&target).await.unwrap(), 0);
+        assert_eq!(score.score(&target).await, 0.0);
+
+        let own = ReportManager::create_report(&target, ReportReason::Spam, &my_kp).unwrap();
+        mgr.receive_report(own, &my_id).await.unwrap();
+        assert_eq!(mgr.report_count(&target).await.unwrap(), 1);
     }
 }

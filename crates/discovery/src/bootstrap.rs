@@ -22,6 +22,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use void_core::peer::PeerInfo;
+use void_core::sanitize::is_hex64;
 use void_network::conn_guard::ConnLimiter;
 
 use crate::peer_list::PeerList;
@@ -38,8 +39,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_MSG: usize = 1024 * 1024;
 /// Как часто переопрашивать bootstrap-узлы (на случай новых участников/рестарта).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-/// Реальный узел имеет 64-символьный hex NodeId (не stub-заглушка).
-const REAL_ID_LEN: usize = 64;
 /// Сколько одновременных регистраций обслуживает bootstrap суммарно.
 const MAX_BOOTSTRAP_CONNS: usize = 128;
 /// Лимит одновременных соединений с одного IP (защита от connection-flood).
@@ -161,7 +160,7 @@ async fn handle_bootstrap_client(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client read timed out"))??;
     if let BootstrapMsg::Hello { mut peer } = first {
-        if peer.id.as_str().len() == REAL_ID_LEN {
+        if is_hex64(peer.id.as_str()) {
             // NAT-traversal: узел рекламирует свой LAN-адрес, но из другой сети он
             // недостижим. Подменяем приватный/loopback ip на ВНЕШНИЙ (источник
             // TCP-соединения, как его видит bootstrap), чтобы остальные пиры могли
@@ -193,7 +192,7 @@ async fn handle_bootstrap_client(
         .all()
         .await
         .into_iter()
-        .filter(|p| p.id.as_str().len() == REAL_ID_LEN)
+        .filter(|p| is_hex64(p.id.as_str()))
         .collect();
     peers.push(my_peer);
     write_msg(&mut stream, &BootstrapMsg::Peers { peers, reachable }).await
@@ -240,7 +239,7 @@ pub async fn bootstrap_exchange(
     if let BootstrapMsg::Peers { peers, reachable: r } = read_msg(&mut stream).await? {
         reachable = r;
         for p in peers {
-            if p.id != my_peer.id && p.id.as_str().len() == REAL_ID_LEN {
+            if p.id != my_peer.id && is_hex64(p.id.as_str()) {
                 let known = peer_list.get(&p.id).await.is_some();
                 peer_list.upsert(p).await;
                 if !known {

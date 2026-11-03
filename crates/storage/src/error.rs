@@ -31,4 +31,10 @@ pub enum StorageError {
 
     #[error("download cancelled")]
     Cancelled,
+
+    #[error("invalid chunk hash (expected 64 lowercase hex chars)")]
+    InvalidHash,
+
+    #[error("invalid file manifest: {0}")]
+    InvalidManifest(String),
 }

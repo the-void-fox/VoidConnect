@@ -139,6 +139,10 @@ async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo, my_id
         debug!("mDNS: ignoring own announcement");
         return;
     }
+    if !void_core::sanitize::is_hex64(&id_str) {
+        warn!("mDNS: peer '{}' has invalid id, skipping", info.get_fullname());
+        return;
+    }
 
     let version = props.get("version").map(|v| v.val_str().to_string()).unwrap_or_default();
     if version != PROTOCOL_VERSION {

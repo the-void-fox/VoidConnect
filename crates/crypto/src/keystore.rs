@@ -30,6 +30,7 @@
 //! нечего, machine-id и так на устройстве, не тормозим запуск).
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use chacha20poly1305::{
@@ -59,6 +60,9 @@ const PBKDF2_ITERS_PASSWORD: u32 = 600_000;
 const PBKDF2_ITERS_PASSWORD: u32 = 2_000;
 /// Итерации, когда пароля нет (только привязка к machine-id, перебирать нечего).
 const PBKDF2_ITERS_NO_PASSWORD: u32 = 1;
+/// Верхняя граница `iters` из файла: число итераций читается с диска, и
+/// испорченное/подменённое значение (u32::MAX) повесило бы запуск на часы.
+const PBKDF2_ITERS_MAX: u32 = 10_000_000;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const SECRET_LEN: usize = 32;
@@ -123,6 +127,9 @@ impl Keystore {
         machine_id: &str,
         password: Option<&str>,
     ) -> Result<Zeroizing<[u8; SECRET_LEN]>, CryptoError> {
+        if self.iters == 0 || self.iters > PBKDF2_ITERS_MAX {
+            return Err(CryptoError::Keystore(format!("недопустимое число итераций: {}", self.iters)));
+        }
         let salt = hex::decode(&self.salt)?;
         let nonce_bytes = hex::decode(&self.nonce)?;
         if nonce_bytes.len() != NONCE_LEN {
@@ -147,17 +154,39 @@ impl Keystore {
     }
 
     /// Сохраняет кейстор на диск (права 0600 на Unix).
+    /// Сохраняет кейстор атомарно: временный файл (сразу с правами 0600) →
+    /// fsync → rename поверх старого. Обрыв питания посреди смены пароля не
+    /// оставит битый файл, а без кейстора личность восстановить нельзя.
     pub fn save(&self, path: &Path) -> Result<(), CryptoError> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| CryptoError::Keystore(e.to_string()))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, json)?;
-        #[cfg(unix)]
+
+        let tmp = path.with_extension("json.tmp");
+        // Остаток прошлой неудачной записи мог быть создан с другими правами.
+        let _ = fs::remove_file(&tmp);
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        // rename надёжен после fsync каталога (иначе запись каталога может не
+        // дожить до диска). На Windows каталог так не открыть — пропускаем.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
         Ok(())
     }
@@ -291,5 +320,48 @@ mod tests {
 
         let loaded = Keystore::load(&path).unwrap();
         assert_eq!(*loaded.unlock(MID, Some("pw")).unwrap(), secret);
+    }
+
+    /// Эталонные векторы PBKDF2-HMAC-SHA256 из RFC 7914 §11 (первые 32 байта):
+    /// ручная реализация должна совпадать со стандартом бит в бит.
+    #[test]
+    fn pbkdf2_matches_rfc7914_vectors() {
+        assert_eq!(
+            hex::encode(pbkdf2_hmac_sha256(b"passwd", b"salt", 1)),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+        );
+        assert_eq!(
+            hex::encode(pbkdf2_hmac_sha256(b"Password", b"NaCl", 80_000)),
+            "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56"
+        );
+    }
+
+    #[test]
+    fn absurd_iteration_count_rejected() {
+        let mut ks = Keystore::create(MID, &[1u8; SECRET_LEN], None).unwrap();
+        ks.iters = u32::MAX;
+        assert!(matches!(ks.unlock(MID, None), Err(CryptoError::Keystore(_))));
+        ks.iters = 0;
+        assert!(matches!(ks.unlock(MID, None), Err(CryptoError::Keystore(_))));
+    }
+
+    /// Перезапись не оставляет временных файлов; на Unix права — только владелец.
+    #[test]
+    fn save_overwrites_atomically_with_private_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEYSTORE_FILE);
+        Keystore::create(MID, &[1u8; SECRET_LEN], None).unwrap().save(&path).unwrap();
+        // Остаток «упавшей» записи с открытыми правами не должен помешать.
+        std::fs::write(path.with_extension("json.tmp"), b"junk").unwrap();
+        Keystore::create(MID, &[2u8; SECRET_LEN], None).unwrap().save(&path).unwrap();
+
+        assert_eq!(*Keystore::load(&path).unwrap().unlock(MID, None).unwrap(), [2u8; SECRET_LEN]);
+        assert!(!path.with_extension("json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

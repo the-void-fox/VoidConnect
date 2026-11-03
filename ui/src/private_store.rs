@@ -41,15 +41,17 @@ fn dm_dir() -> std::path::PathBuf {
     dir
 }
 
-fn conv_path(peer_id: &str) -> std::path::PathBuf {
-    dm_dir().join(format!("{}.json", peer_id))
+/// Путь файла переписки. `None` для ID не в формате hex64 — ID приходит из
+/// сети, и `../keystore` иначе указал бы на файл ключей рядом с `dm/`.
+fn conv_path(peer_id: &str) -> Option<std::path::PathBuf> {
+    void_core::sanitize::is_hex64(peer_id).then(|| dm_dir().join(format!("{}.json", peer_id)))
 }
 
 // ── Загрузка / сохранение ─────────────────────────────────────────────────────
 
 pub fn load_conv(peer_id: &str) -> StoredConv {
-    std::fs::read_to_string(conv_path(peer_id))
-        .ok()
+    conv_path(peer_id)
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(StoredConv {
             peer_id:   peer_id.to_string(),
@@ -59,8 +61,9 @@ pub fn load_conv(peer_id: &str) -> StoredConv {
 }
 
 pub fn save_conv(conv: &StoredConv) {
+    let Some(path) = conv_path(&conv.peer_id) else { return };
     if let Ok(json) = serde_json::to_string_pretty(conv) {
-        let _ = std::fs::write(conv_path(&conv.peer_id), json);
+        let _ = std::fs::write(path, json);
     }
 }
 

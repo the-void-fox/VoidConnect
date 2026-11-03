@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 use void_core::identity::NodeId;
 use void_core::manifest::{ChunkMeta, FileManifest};
 use void_core::peer::PeerInfo;
+use void_core::sanitize::safe_file_name;
 use void_db::chunks as db_chunks;
 use void_db::DbPool;
 
@@ -31,6 +32,7 @@ use crate::chunker::{split_file, assemble_file};
 use crate::error::StorageError;
 use crate::events::ChunkEvent;
 use crate::index::ChunkIndex;
+use crate::integrity::validate_manifest;
 use crate::transfer::{fetch_chunk_from_peer, run_chunk_server};
 
 /// Параллельность при скачивании (одновременно N чанков)
@@ -201,6 +203,7 @@ impl StorageManager {
     ///
     /// [`download_file`]: Self::download_file
     pub async fn handle_manifest(&self, manifest: &FileManifest) -> Result<(), StorageError> {
+        validate_manifest(manifest)?;
         // owner_key хранит исходного публикатора (для отображения); полный
         // список сидеров живёт в chunk_owners.
         let owner_key = manifest
@@ -209,7 +212,8 @@ impl StorageManager {
             .unwrap_or_default();
         let file_record = void_db::chunks::FileRecord {
             file_id: manifest.file_id.clone(),
-            name: manifest.name.clone(),
+            // Имя из чужого манифеста — только безопасное имя файла, не путь.
+            name: safe_file_name(&manifest.name),
             size_bytes: manifest.size_bytes,
             total_chunks: manifest.chunks.len() as i64,
             owner_key,

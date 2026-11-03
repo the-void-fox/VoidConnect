@@ -112,6 +112,10 @@ async fn listen_loop(peer_list: PeerList, listen_port: u16, my_id: NodeId) -> Re
                             debug!("UDP broadcast: ignoring own packet from {}", from_addr);
                             continue;
                         }
+                        if !void_core::sanitize::is_hex64(peer.id.as_str()) {
+                            debug!("UDP broadcast: invalid node id from {}", from_addr);
+                            continue;
+                        }
                         let already = peer_list.get(&peer.id).await.is_some();
                         peer.ip = from_addr.ip();
                         peer.last_seen = chrono::Utc::now().timestamp();

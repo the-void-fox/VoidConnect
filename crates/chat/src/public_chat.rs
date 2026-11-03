@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use void_core::dns::normalize_name;
 use void_core::identity::NodeId;
 use void_core::manifest::FileManifest;
 use void_core::peer::{PeerInfo, PeerProfile};
@@ -37,6 +38,21 @@ const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 const BROADCAST_BUFFER: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEDUP_WINDOW: usize = 256;
+/// Лимит текста одного сообщения чата (байт). Пакет может быть до
+/// `MAX_MESSAGE_LEN` (манифесты больших файлов), но 16 МиБ текста в чате —
+/// это DoS интерфейса у всех получателей.
+const MAX_CHAT_TEXT_BYTES: usize = 8 * 1024;
+/// Лимиты служебных полей сообщения (символов).
+const MAX_CHANNEL_CHARS: usize = 64;
+const MAX_SENDER_NAME_CHARS: usize = void_core::peer::MAX_PROFILE_NAME_CHARS;
+/// Полный таймаут подключения к релею: TCP + Hello + History + отправка
+/// своих анонсов. Защита от «релея», который принял соединение и молчит.
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Пауза перед повторной попыткой недоступного релея (удваивается до максимума).
+const RELAY_RETRY_BASE: Duration = Duration::from_secs(5);
+const RELAY_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Сколько кандидатов в релеи пробуем за один проход выборов.
+const MAX_RELAY_ATTEMPTS_PER_PASS: usize = 8;
 /// Интервал между пингами для обнаружения "тихой" потери соединения.
 const PING_INTERVAL_SECS: u64 = 15;
 
@@ -182,6 +198,8 @@ struct PublicChatInner {
     spam_tx:     broadcast::Sender<NodeId>,
     /// Счётчик поколений соединения — чтобы старый read-task не затёр новый outbox
     conn_gen:    AtomicU64,
+    /// Недоступные кандидаты в релеи: id → (не пробовать до, число неудач подряд).
+    relay_failures: Mutex<HashMap<String, (Instant, u32)>>,
 }
 
 impl PublicChat {
@@ -224,6 +242,7 @@ impl PublicChat {
                 rate_limiter,
                 spam_tx,
                 conn_gen:    AtomicU64::new(0),
+                relay_failures: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -358,6 +377,12 @@ impl PublicChat {
     /// Возвращает `Some`, если это новый сайт или более свежая версия того же
     /// владельца (по `created_at`), иначе `None` (дедуп / отказ в перехвате).
     async fn merge_site(&self, incoming: SiteManifest) -> Option<SiteManifest> {
+        // Имя сайта попадает в URL, который UI отдаёт системе на открытие:
+        // принимаем только нормализованную метку `[a-z0-9-]` (как при публикации).
+        if !is_normalized_site_name(&incoming.name) {
+            warn!("Отброшен анонс сайта с недопустимым именем {:?}", incoming.name);
+            return None;
+        }
         // Надгробие подавляет воскрешение: устаревший анонс того же владельца
         // (created_at <= revoked_at) отбрасываем. Более новая публикация того же
         // владельца проходит (re-publish после удаления).
@@ -476,6 +501,10 @@ impl PublicChat {
         };
         if signed.verify().is_err() || signed.signer != rev.owner.as_str() {
             warn!("SiteRevoke '{}': подпись неверна или signer ≠ владелец", rev.name);
+            return;
+        }
+        if !is_normalized_site_name(&rev.name) {
+            warn!("SiteRevoke: недопустимое имя сайта {:?}", rev.name);
             return;
         }
         self.apply_revoke_local(rev.clone(), signed.clone()).await;
@@ -705,7 +734,13 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
         Err(_) => { warn!("Hello timeout from {}", addr); return; }
     };
     let (node_id, peer_name, client_chat_port) = match hello {
-        ChatPacket::Hello { node_id, name, chat_port } => (node_id, name, chat_port),
+        ChatPacket::Hello { node_id, name, chat_port } => {
+            if !void_core::sanitize::is_hex64(node_id.as_str()) {
+                warn!("Hello с недопустимым node_id от {}", addr);
+                return;
+            }
+            (node_id, void_core::sanitize::display_text(&name, MAX_SENDER_NAME_CHARS), chat_port)
+        }
         _ => { warn!("Expected Hello from {}, got something else", addr); return; }
     };
     info!("Client connected: {} ({}) from {} chat_port={}", peer_name, node_id, addr, client_chat_port);
@@ -890,6 +925,17 @@ async fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, chat: 
 
 // ─── Обработка входящих данных ────────────────────────────────────────────────
 
+/// Имя сайта — нормализованная метка зоны `.void` (`[a-z0-9-]`).
+fn is_normalized_site_name(name: &str) -> bool {
+    normalize_name(name).as_deref() == Some(name)
+}
+
+/// Поля сообщения в пределах лимитов (проверяется до проверки подписи — дёшево).
+fn message_within_limits(msg: &ChatMessage) -> bool {
+    msg.text.len() <= MAX_CHAT_TEXT_BYTES
+        && msg.channel.chars().count() <= MAX_CHANNEL_CHARS
+}
+
 /// Канонические байты сообщения для подписи/проверки.
 /// Привязывает отправителя, порядковый номер, время и текст.
 fn message_signing_bytes(from: &NodeId, seq: u64, timestamp: i64, channel: &str, text: &str) -> Vec<u8> {
@@ -921,11 +967,18 @@ impl PublicChat {
         signed.verify().is_ok()
     }
 
-    async fn handle_incoming(&self, msg: ChatMessage) {
+    async fn handle_incoming(&self, mut msg: ChatMessage) {
+        if !message_within_limits(&msg) {
+            warn!("Отброшено сообщение сверх лимитов от {}", msg.from);
+            return;
+        }
         if !self.verify_message(&msg) {
             warn!("Отброшено сообщение с неверной/отсутствующей подписью от {}", msg.from);
             return;
         }
+        // Имя отправителя не входит в подпись (его может переписать релей) —
+        // как минимум убираем управляющие/bidi-символы и обрезаем.
+        msg.from_name = void_core::sanitize::display_text(&msg.from_name, MAX_SENDER_NAME_CHARS);
 
         let key = (msg.from.as_str().to_string(), msg.seq);
         {
@@ -955,7 +1008,10 @@ impl PublicChat {
         }
     }
 
-    async fn handle_profile_update(&self, profile: PeerProfile) {
+    async fn handle_profile_update(&self, mut profile: PeerProfile) {
+        // Профиль из сети: лимиты полей, без управляющих/bidi-символов в имени,
+        // без аватара-бомбы и ключа неверного формата.
+        profile.sanitize();
         self.inner.profiles.lock().await.insert(profile.node_id.clone(), profile.clone());
 
         // Обновляем имя в PeerInfo тоже — чтобы граф и чат показывали актуальное имя
@@ -998,6 +1054,9 @@ impl PublicChat {
     }
 
     pub async fn send(&self, channel: String, text: String) -> anyhow::Result<()> {
+        if text.len() > MAX_CHAT_TEXT_BYTES {
+            anyhow::bail!("Сообщение длиннее {} байт — другие узлы его отбросят", MAX_CHAT_TEXT_BYTES);
+        }
         let seq = { let mut c = self.inner.seq_counter.lock().await; *c += 1; *c };
 
         // Используем имя из профиля если оно установлено
@@ -1056,22 +1115,55 @@ async fn relay_manager(chat: PublicChat) {
     }
 }
 
-/// Один проход: выбирает ретранслятор и при необходимости (пере)подключается.
+/// Один проход выборов: выбирает ретранслятор и при необходимости
+/// (пере)подключается. Если выбранный кандидат недоступен, он уходит в паузу
+/// и тут же пробуется следующий — иначе один фальшивый анонс с минимальным ID
+/// (например, «000…0» без реального узла за ним) оставил бы весь чат без релея.
 async fn relay_pass(chat: &PublicChat) {
+    for _ in 0..MAX_RELAY_ATTEMPTS_PER_PASS {
+        if !relay_attempt(chat).await {
+            return;
+        }
+    }
+}
+
+/// Запоминает неудачное подключение к кандидату `id` (экспоненциальная пауза).
+async fn note_relay_failure(chat: &PublicChat, id: &str) {
+    let mut failures = chat.inner.relay_failures.lock().await;
+    let streak = failures.get(id).map(|(_, n)| n + 1).unwrap_or(1);
+    let delay = RELAY_RETRY_BASE
+        .saturating_mul(1u32 << (streak - 1).min(4))
+        .min(RELAY_RETRY_MAX);
+    failures.insert(id.to_string(), (Instant::now() + delay, streak));
+}
+
+/// Одна попытка выборов. `true` — выбранный кандидат оказался недоступен и
+/// поставлен на паузу: имеет смысл сразу выбрать следующего.
+async fn relay_attempt(chat: &PublicChat) -> bool {
     let peers = chat.inner.peer_list.all().await;
     if peers.is_empty() {
-        return;
+        return false;
     }
 
     let my_id = chat.inner.my_peer.id.as_str().to_string();
-    let real_peers: Vec<_> = peers.iter()
-        .filter(|p| p.id.as_str().len() == 64)
-        .collect();
+    let now = Instant::now();
+    let paused: HashSet<String> = {
+        let mut failures = chat.inner.relay_failures.lock().await;
+        // Ушедшие из peer_list кандидаты больше не нужны.
+        failures.retain(|id, _| peers.iter().any(|p| p.id.as_str() == id));
+        failures.iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
 
-    let elected = if real_peers.is_empty() {
+    let has_real = peers.iter().any(|p| p.id.as_str().len() == 64);
+    let elected = if !has_real {
         peers[0].id.as_str().to_string()
     } else {
-        let mut candidates: Vec<String> = real_peers.iter()
+        // Если все реальные кандидаты меньше нас на паузе — релеем становимся мы.
+        let mut candidates: Vec<String> = peers.iter()
+            .filter(|p| p.id.as_str().len() == 64 && !paused.contains(p.id.as_str()))
             .map(|p| p.id.as_str().to_string())
             .collect();
         candidates.push(my_id.clone());
@@ -1097,7 +1189,7 @@ async fn relay_pass(chat: &PublicChat) {
             Some(p) => p.clone(),
             None    => {
                 warn!("Elected relay {} not found in peer_list", &elected[..8.min(elected.len())]);
-                return;
+                return false;
             }
         };
         let relay_addr = peer.chat_addr();
@@ -1108,15 +1200,20 @@ async fn relay_pass(chat: &PublicChat) {
                 .unwrap_or(false);
             if alive {
                 debug!("Relay connection alive: {} ({})", &elected[..8.min(elected.len())], relay_addr);
-                return;
+                return false;
             }
             info!("Relay connection lost — reconnecting to {} ({})", &elected[..8.min(elected.len())], relay_addr);
         } else {
             info!("Elected new relay: id={}... addr={}", &elected[..8.min(elected.len())], relay_addr);
         }
 
-        match connect_to_relay(chat, peer).await {
+        let connected = match timeout(RELAY_HANDSHAKE_TIMEOUT, connect_to_relay(chat, peer)).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow::anyhow!("handshake timeout")),
+        };
+        match connected {
             Ok(tx) => {
+                chat.inner.relay_failures.lock().await.remove(&elected);
                 let cgen = chat.inner.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
                 *chat.inner.relay.write().await    = Some(relay_id);
                 *chat.inner.outbox_tx.lock().await = Some(tx.clone());
@@ -1144,9 +1241,16 @@ async fn relay_pass(chat: &PublicChat) {
             }
             Err(e) => {
                 warn!("Failed to connect to relay {} ({}): {}", &elected[..8.min(elected.len())], relay_addr, e);
+                // Stub-адреса (ручной --peer) пробуем как раньше, каждый проход;
+                // паузу получают только реальные ID — их можно подделать анонсом.
+                if elected.len() == 64 {
+                    note_relay_failure(chat, &elected).await;
+                    return true;
+                }
             }
         }
     }
+    false
 }
 
 async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<mpsc::Sender<ChatPacket>> {
@@ -1172,10 +1276,22 @@ async fn connect_to_relay(chat: &PublicChat, peer: PeerInfo) -> anyhow::Result<m
     // Читаем History (первый пакет от ретранслятора)
     match read_packet_rd(&mut rd).await? {
         ChatPacket::History { messages } => {
+            // Историю присылает релей — он может подложить сообщения «от»
+            // кого угодно. Принимаем только сообщения с верной подписью автора.
+            let total = messages.len();
             let mut h = chat.inner.history.lock().await;
-            for msg in messages {
+            let mut accepted = 0usize;
+            for mut msg in messages {
+                if !message_within_limits(&msg) || !chat.verify_message(&msg) {
+                    continue;
+                }
+                msg.from_name = void_core::sanitize::display_text(&msg.from_name, MAX_SENDER_NAME_CHARS);
                 if h.len() >= 100 { h.pop_front(); }
                 h.push_back(msg);
+                accepted += 1;
+            }
+            if accepted < total {
+                warn!("История от релея: отброшено {} сообщений с неверной подписью", total - accepted);
             }
             debug!("Received history from relay ({} messages)", h.len());
         }
@@ -1957,5 +2073,127 @@ mod tests {
 
         // Переопубликация позже надгробия проходит.
         assert!(chat.merge_site(mk("s3", 200)).await.is_some(), "новая публикация владельца проходит");
+    }
+
+    /// Фальшивый анонс узла с минимальным ID («000…0», за ним никого нет) не
+    /// должен оставлять сеть без релея: кандидат уходит на паузу, выбирается
+    /// следующий, и два реальных узла продолжают общаться.
+    #[tokio::test]
+    async fn unreachable_min_id_peer_does_not_kill_chat() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let dead_port = free_port(); // никто не слушает
+        let (a_kp, a_id) = keypair(1);
+        let (b_kp, b_id) = keypair(2);
+        let a_peer = test_peer("alice", a_id, a_port);
+        let b_peer = test_peer("bob", b_id, b_port);
+        let fake = test_peer("fake", NodeId("0".repeat(64)), dead_port);
+
+        let a_pl = PeerList::new();
+        let b_pl = PeerList::new();
+        a_pl.upsert(b_peer.clone()).await;
+        a_pl.upsert(fake.clone()).await;
+        b_pl.upsert(a_peer.clone()).await;
+        b_pl.upsert(fake).await;
+
+        let alice = start_public_chat(a_peer, a_pl, a_port, a_kp, None).await.unwrap();
+        let bob = start_public_chat(b_peer, b_pl, b_port, b_kp, None).await.unwrap();
+        let mut alice_rx = alice.subscribe();
+        let mut bob_rx = bob.subscribe();
+
+        let mut delivered = false;
+        for _ in 0..30 {
+            bob.send("global".into(), "from_bob".into()).await.unwrap();
+            if wait_for_text(&mut alice_rx, "from_bob", 1).await {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "фальшивый кандидат с минимальным ID заблокировал чат");
+        let mut back = false;
+        for _ in 0..10 {
+            alice.send("global".into(), "from_alice".into()).await.unwrap();
+            if wait_for_text(&mut bob_rx, "from_alice", 1).await {
+                back = true;
+                break;
+            }
+        }
+        assert!(back, "обратное направление не работает");
+    }
+
+    /// Релей присылает историю с поддельным сообщением — клиент принимает
+    /// только сообщения с верной подписью автора.
+    #[tokio::test]
+    async fn forged_history_from_relay_is_dropped() {
+        let relay_port = free_port();
+        let my_port = free_port();
+        let (author_kp, author_id) = keypair(3);
+        let author_chat = PublicChat::new(test_peer("author", author_id.clone(), 1), PeerList::new(), 1, author_kp, None);
+
+        let mut genuine = ChatMessage::new(author_id.clone(), "author".into(), "genuine".into(), "global".into(), 1);
+        author_chat.sign_message(&mut genuine);
+        let mut forged = genuine.clone();
+        forged.seq = 2;
+        forged.text = "forged".into();
+
+        // Злой релей: принимает Hello, шлёт историю и держит соединение.
+        let listener = TcpListener::bind(("127.0.0.1", relay_port)).await.unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _hello = read_packet(&mut stream).await.unwrap();
+            send_packet(&mut stream, &ChatPacket::History { messages: vec![genuine, forged] })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let (my_kp, my_id) = keypair(4);
+        let pl = PeerList::new();
+        pl.upsert(test_peer("relay", NodeId("0".repeat(64)), relay_port)).await;
+        let me = start_public_chat(test_peer("me", my_id, my_port), pl, my_port, my_kp, None).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let texts = loop {
+            let texts: Vec<String> = me.recent(10).await.into_iter().map(|m| m.text).collect();
+            if !texts.is_empty() || tokio::time::Instant::now() > deadline {
+                break texts;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(texts, vec!["genuine".to_string()], "поддельное сообщение из истории принято");
+    }
+
+    /// Подписанное, но гигантское сообщение отбрасывается; своё слишком
+    /// длинное сообщение не отправляется.
+    #[tokio::test]
+    async fn oversized_message_rejected() {
+        let (kp, id) = keypair(6);
+        let chat = PublicChat::new(test_peer("x", id.clone(), 1), PeerList::new(), 1, kp, None);
+        let mut rx = chat.subscribe();
+
+        let mut big = ChatMessage::new(id.clone(), "x".into(), "a".repeat(MAX_CHAT_TEXT_BYTES + 1), "global".into(), 1);
+        chat.sign_message(&mut big);
+        assert!(chat.verify_message(&big));
+        chat.handle_incoming(big).await;
+        assert!(rx.try_recv().is_err(), "сообщение сверх лимита не должно доходить до UI");
+
+        assert!(chat.send("global".into(), "a".repeat(MAX_CHAT_TEXT_BYTES + 1)).await.is_err());
+        assert!(chat.send("global".into(), "ok".into()).await.is_ok());
+    }
+
+    /// Анонс сайта с ненормализованным именем (уходит в URL → в обработчик ОС)
+    /// не принимается.
+    #[tokio::test]
+    async fn site_with_unsafe_name_rejected() {
+        let (kp, id) = keypair(7);
+        let chat = PublicChat::new(test_peer("x", id.clone(), 1), PeerList::new(), 1, kp, None);
+        let mk = |name: &str| SiteManifest {
+            site_id: "sid".into(), name: name.into(), owner: id.clone(),
+            entries: vec![], created_at: 1,
+        };
+        assert!(chat.merge_site(mk("x&calc")).await.is_none());
+        assert!(chat.merge_site(mk("My Site")).await.is_none());
+        assert!(chat.merge_site(mk("../blog")).await.is_none());
+        assert!(chat.merge_site(mk("my-site")).await.is_some());
     }
 }

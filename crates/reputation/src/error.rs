@@ -23,6 +23,12 @@ pub enum ReputationError {
 
     #[error("deserialization error: {0}")]
     Deserialize(String),
+
+    #[error("sender's reputation is too low to influence others")]
+    UntrustedSender,
+
+    #[error("sync snapshot is replayed, too frequent or has a bad timestamp")]
+    StaleSync,
 }
 
 impl From<DbError> for ReputationError {
