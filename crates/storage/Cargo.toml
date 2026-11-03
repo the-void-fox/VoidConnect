@@ -7,6 +7,7 @@ edition = "2024"
 void-core    = { path = "../core" }
 void-db      = { path = "../db" }
 void-network = { path = "../network" }
+void-crypto  = { path = "../crypto" }
 
 tokio        = { workspace = true }
 tracing      = { workspace = true }
@@ -22,4 +23,3 @@ tokio-util   = { workspace = true }
 
 [dev-dependencies]
 tempfile     = { workspace = true }
-void-crypto  = { path = "../crypto" }

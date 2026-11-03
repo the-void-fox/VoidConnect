@@ -23,9 +23,10 @@ use tracing::{error, info, warn};
 use void_core::identity::NodeId;
 use void_core::manifest::{ChunkMeta, FileManifest};
 use void_core::peer::PeerInfo;
-use void_core::sanitize::safe_file_name;
 use void_db::chunks as db_chunks;
 use void_db::DbPool;
+use void_crypto::keys::SigningKeypair;
+use void_crypto::sign::SignedMessage;
 use void_network::secure::NoiseIdentity;
 
 use crate::chunk_store::ChunkStore;
@@ -33,7 +34,7 @@ use crate::chunker::{split_file, assemble_file};
 use crate::error::StorageError;
 use crate::events::ChunkEvent;
 use crate::index::ChunkIndex;
-use crate::integrity::validate_manifest;
+use crate::integrity::{validate_manifest, verify_publisher};
 use crate::transfer::{fetch_chunk_from_peer, run_chunk_server};
 
 /// Параллельность при скачивании (одновременно N чанков)
@@ -47,6 +48,8 @@ pub struct StorageManager {
     my_id: NodeId,
     /// Noise-ключ для соединений с другими узлами (раздача и скачивание чанков).
     noise: NoiseIdentity,
+    /// Ключ подписи манифестов публикуемых файлов.
+    signing: Arc<SigningKeypair>,
     /// Опциональный канал событий о качестве чанков (для репутации).
     events: Option<mpsc::UnboundedSender<ChunkEvent>>,
     /// Счётчик отданных байт (чанки, разосланные пирам). Для статистики профиля.
@@ -60,8 +63,9 @@ impl StorageManager {
     pub async fn new(
         pool: DbPool,
         store: ChunkStore,
-        noise: NoiseIdentity,
+        signing: Arc<SigningKeypair>,
     ) -> Result<Self, StorageError> {
+        let noise = NoiseIdentity::new(&signing);
         let my_id = noise.node_id().clone();
         let index = ChunkIndex::new();
 
@@ -84,6 +88,7 @@ impl StorageManager {
             index,
             my_id,
             noise,
+            signing,
             events: None,
             bytes_uploaded: Arc::new(AtomicU64::new(0)),
             bytes_downloaded: Arc::new(AtomicU64::new(0)),
@@ -158,6 +163,18 @@ impl StorageManager {
             self.index.add_owner(&meta.hash, self.my_id.clone()).await;
         }
 
+        // Подписываем манифест как публикатор — если этот контент ещё не
+        // известен от другого публикатора (тот же file_id = те же байты).
+        if db_chunks::get_file_signature(&self.pool, &file_id).await?.is_none() {
+            if let Some(mut manifest) = self.file_manifest(&file_id).await? {
+                manifest.publisher = Some(self.my_id.clone());
+                let signed = SignedMessage::sign(manifest.signing_bytes(), &self.signing)
+                    .map_err(|e| StorageError::InvalidManifest(format!("подпись: {:?}", e)))?;
+                db_chunks::save_file_signature(&self.pool, &file_id, self.my_id.as_str(), &signed.signature)
+                    .await?;
+            }
+        }
+
         info!(
             "Published '{}': file_id={}, {} chunks",
             result.file_name,
@@ -186,6 +203,13 @@ impl StorageManager {
             })
             .collect();
 
+        // Подпись публикатора (своя или принятая из сети) — без неё манифест
+        // другие узлы не примут.
+        let (publisher, signature) = match db_chunks::get_file_signature(&self.pool, file_id).await? {
+            Some((p, s)) => (Some(NodeId(p)), Some(s)),
+            None => (None, None),
+        };
+
         // Объявляем себя владельцем: каждый узел, рассылающий манифест,
         // утверждает, что у него есть чанки (для публикатора — он один; для
         // скачавшего — он добавляется к уже известным сидерам через merge).
@@ -196,6 +220,8 @@ impl StorageManager {
             mime_type: file.mime_type,
             owners: vec![self.my_id.clone()],
             chunks: chunk_meta,
+            publisher,
+            signature,
         }))
     }
 
@@ -209,23 +235,26 @@ impl StorageManager {
     /// [`download_file`]: Self::download_file
     pub async fn handle_manifest(&self, manifest: &FileManifest) -> Result<(), StorageError> {
         validate_manifest(manifest)?;
-        // owner_key хранит исходного публикатора (для отображения); полный
-        // список сидеров живёт в chunk_owners.
-        let owner_key = manifest
-            .original_owner()
-            .map(|n| n.as_str().to_string())
-            .unwrap_or_default();
+        let publisher = verify_publisher(manifest)?;
+        // owner_key хранит исходного публикатора (подписавшего манифест, для
+        // отображения); полный список сидеров живёт в chunk_owners.
+        let owner_key = publisher.as_str().to_string();
         let file_record = void_db::chunks::FileRecord {
             file_id: manifest.file_id.clone(),
-            // Имя из чужого манифеста — только безопасное имя файла, не путь.
-            name: safe_file_name(&manifest.name),
+            // Имя храним как подписано (иначе пересланный сидером манифест не
+            // сойдётся с подписью). В путь и в UI оно идёт только через
+            // `safe_file_name` — в backend (скачивание) и на странице хранилища.
+            name: manifest.name.clone(),
             size_bytes: manifest.size_bytes,
             total_chunks: manifest.chunks.len() as i64,
-            owner_key,
+            owner_key: owner_key.clone(),
             mime_type: manifest.mime_type.clone(),
             created_at: chrono::Utc::now(),
         };
         db_chunks::insert_file(&self.pool, &file_record).await?;
+        if let Some(signature) = &manifest.signature {
+            db_chunks::save_file_signature(&self.pool, &manifest.file_id, &owner_key, signature).await?;
+        }
 
         // Хэши уже имеющихся локально чанков — их не перезаписываем в remote.
         let existing = db_chunks::get_chunks_for_file(&self.pool, &manifest.file_id).await?;
@@ -626,13 +655,13 @@ mod tests {
     use void_core::peer::Service;
     use void_db::{open, DbPool};
 
-    /// Noise-личность тестового узла: NodeId должен быть настоящим ключом.
-    fn ident(seed: u8) -> NoiseIdentity {
-        NoiseIdentity::new(&void_crypto::keys::SigningKeypair::from_seed(&[seed; 32]).unwrap())
+    /// Ключ тестового узла: NodeId должен быть настоящим (его проверяет Noise).
+    fn kp(seed: u8) -> Arc<SigningKeypair> {
+        Arc::new(SigningKeypair::from_seed(&[seed; 32]).unwrap())
     }
 
     fn node(seed: u8) -> NodeId {
-        ident(seed).node_id().clone()
+        NodeId::from_public_key_bytes(&kp(seed).public_bytes())
     }
 
     fn free_port() -> u16 {
@@ -643,7 +672,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
-        let mgr = StorageManager::new(pool.clone(), store, ident(seed)).await.unwrap();
+        let mgr = StorageManager::new(pool.clone(), store, kp(seed)).await.unwrap();
         (dir, pool, mgr)
     }
 

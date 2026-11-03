@@ -243,8 +243,40 @@ pub async fn delete_file(pool: &DbPool, file_id: &str) -> Result<Vec<String>> {
         .bind(file_id)
         .execute(pool)
         .await?;
+    sqlx::query("DELETE FROM file_signatures WHERE file_id = ?")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
 
     Ok(local)
+}
+
+/// Сохраняет подпись публикатора манифеста. Первая принятая подпись остаётся
+/// (`INSERT OR IGNORE`): тот же контент (`file_id`), опубликованный другим
+/// узлом позже, не перепишет уже известного публикатора.
+pub async fn save_file_signature(
+    pool: &DbPool,
+    file_id: &str,
+    publisher: &str,
+    signature: &str,
+) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO file_signatures (file_id, publisher, signature) VALUES (?, ?, ?)")
+        .bind(file_id)
+        .bind(publisher)
+        .bind(signature)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Подпись публикатора манифеста: `(publisher, signature)`, если известна.
+pub async fn get_file_signature(pool: &DbPool, file_id: &str) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT publisher, signature FROM file_signatures WHERE file_id = ?")
+            .bind(file_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
 }
 
 /// Процент скачанности файла (сколько чанков уже локально).

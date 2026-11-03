@@ -4,8 +4,10 @@
 //! Если хэш не совпадает — чанк отбрасывается, узел получает штраф.
 
 use sha2::{Digest, Sha256};
+use void_core::identity::NodeId;
 use void_core::manifest::FileManifest;
 use void_core::sanitize::is_hex64;
+use void_crypto::sign::SignedMessage;
 
 use crate::error::StorageError;
 
@@ -91,10 +93,26 @@ pub fn validate_manifest(m: &FileManifest) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Проверяет подпись публикатора манифеста и возвращает его NodeId. Без неё
+/// любой узел мог бы объявить файл «от имени» другого или переименовать его.
+pub fn verify_publisher(m: &FileManifest) -> Result<NodeId, StorageError> {
+    let (Some(publisher), Some(signature)) = (&m.publisher, &m.signature) else {
+        return Err(StorageError::InvalidManifest("манифест не подписан публикатором".into()));
+    };
+    let signed = SignedMessage {
+        payload: m.signing_bytes(),
+        signature: signature.clone(),
+        signer: publisher.as_str().to_string(),
+    };
+    signed
+        .verify()
+        .map_err(|_| StorageError::InvalidManifest("подпись публикатора неверна".into()))?;
+    Ok(publisher.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use void_core::identity::NodeId;
     use void_core::manifest::ChunkMeta;
 
     fn valid_manifest() -> FileManifest {
@@ -115,7 +133,28 @@ mod tests {
             mime_type: None,
             owners: vec![NodeId("b".repeat(64))],
             chunks,
+            publisher: None,
+            signature: None,
         }
+    }
+
+    #[test]
+    fn publisher_signature_checked() {
+        let kp = void_crypto::keys::SigningKeypair::from_seed(&[4u8; 32]).unwrap();
+        let mut m = valid_manifest();
+        assert!(verify_publisher(&m).is_err(), "без подписи");
+
+        m.publisher = Some(NodeId::from_public_key_bytes(&kp.public_bytes()));
+        m.signature = Some(SignedMessage::sign(m.signing_bytes(), &kp).unwrap().signature);
+        assert_eq!(verify_publisher(&m).unwrap(), m.publisher.clone().unwrap());
+
+        let mut renamed = m.clone();
+        renamed.name = "a.txt.exe".into();
+        assert!(verify_publisher(&renamed).is_err(), "переименование после подписи");
+
+        let mut foreign = m.clone();
+        foreign.publisher = Some(NodeId("c".repeat(64)));
+        assert!(verify_publisher(&foreign).is_err(), "чужой публикатор");
     }
 
     #[test]

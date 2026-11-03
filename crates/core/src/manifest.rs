@@ -33,6 +33,25 @@ pub struct FileManifest {
     pub owners: Vec<NodeId>,
     /// Чанки файла в порядке индексов.
     pub chunks: Vec<ChunkMeta>,
+    /// Публикатор, подписавший манифест (он же исходный владелец).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<NodeId>,
+    /// Подпись публикатора над [`FileManifest::signing_bytes`]: имя, размер,
+    /// тип, `file_id` и список чанков. Список сидеров `owners` НЕ подписан —
+    /// это подсказки, каждого проверит Noise-рукопожатие при скачивании.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Подписываемая часть манифеста (без сидеров и самой подписи).
+#[derive(Serialize)]
+struct SignedPart<'a> {
+    file_id: &'a str,
+    name: &'a str,
+    size_bytes: i64,
+    mime_type: &'a Option<String>,
+    publisher: &'a Option<NodeId>,
+    chunks: &'a [ChunkMeta],
 }
 
 impl FileManifest {
@@ -41,9 +60,24 @@ impl FileManifest {
         self.chunks.len() as i64
     }
 
-    /// Исходный публикатор файла (первый владелец), если известен.
+    /// Исходный публикатор файла: подписавший манифест, иначе первый владелец.
     pub fn original_owner(&self) -> Option<&NodeId> {
-        self.owners.first()
+        self.publisher.as_ref().or(self.owners.first())
+    }
+
+    /// Канонические байты для подписи публикатором.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let part = SignedPart {
+            file_id: &self.file_id,
+            name: &self.name,
+            size_bytes: self.size_bytes,
+            mime_type: &self.mime_type,
+            publisher: &self.publisher,
+            chunks: &self.chunks,
+        };
+        let mut out = b"void-connect/file-manifest/v1\n".to_vec();
+        out.extend_from_slice(&serde_json::to_vec(&part).expect("FileManifest сериализуется"));
+        out
     }
 
     /// Добавляет владельца, если его ещё нет. Возвращает `true`, если список
@@ -74,6 +108,8 @@ mod tests {
                 ChunkMeta { hash: "a".repeat(64), index: 0, size: 262_144 },
                 ChunkMeta { hash: "b".repeat(64), index: 1, size: 337_856 },
             ],
+            publisher: None,
+            signature: None,
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
@@ -94,10 +130,32 @@ mod tests {
             mime_type: None,
             owners: vec![a.clone()],
             chunks: vec![],
+            publisher: None,
+            signature: None,
         };
         assert_eq!(m.original_owner(), Some(&a));
         assert!(m.add_owner(b.clone()), "новый владелец → список изменился");
         assert!(!m.add_owner(b.clone()), "повторный владелец → без изменений");
         assert_eq!(m.owners, vec![a, b]);
+    }
+
+    #[test]
+    fn signing_bytes_cover_content_but_not_seeders() {
+        let mut m = FileManifest {
+            file_id: "f".into(),
+            name: "report.pdf".into(),
+            size_bytes: 1,
+            mime_type: None,
+            owners: vec![],
+            chunks: vec![ChunkMeta { hash: "a".repeat(64), index: 0, size: 1 }],
+            publisher: Some(NodeId::from_public_key_bytes(&[1u8; 32])),
+            signature: None,
+        };
+        let base = m.signing_bytes();
+        m.owners.push(NodeId::from_public_key_bytes(&[2u8; 32]));
+        m.signature = Some("ab".into());
+        assert_eq!(m.signing_bytes(), base, "сидеры и подпись не входят в подписываемое");
+        m.name = "report.pdf.exe".into();
+        assert_ne!(m.signing_bytes(), base, "переименование меняет подписываемое");
     }
 }
