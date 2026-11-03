@@ -20,6 +20,7 @@ pub mod server;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use void_core::dns::normalize_name;
 use void_core::identity::NodeId;
 use void_core::site::{SiteEntry, SiteManifest};
 use void_storage::StorageManager;
@@ -40,6 +41,11 @@ pub async fn publish_site(
     if !dir.is_dir() {
         return Err(WebError::Invalid(format!("не каталог: {}", dir.display())));
     }
+    // Имя сайта попадает в URL и в зону `.void` — только нормализованная метка
+    // `[a-z0-9-]`. Узлы отбрасывают анонсы с ненормализованным именем.
+    let name = normalize_name(name)
+        .ok_or_else(|| WebError::Invalid(format!("недопустимое имя сайта: {:?}", name)))?;
+    let name = name.as_str();
 
     let mut files = Vec::new();
     collect_files(dir, dir, &mut files)?;

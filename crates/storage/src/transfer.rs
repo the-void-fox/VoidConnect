@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use void_core::identity::NodeId;
+use void_core::sanitize::is_hex64;
 use void_network::conn_guard::ConnLimiter;
 
 use crate::chunk_store::ChunkStore;
@@ -162,11 +163,12 @@ async fn handle_connection(
     let request: ChunkRequest = timeout(REQUEST_READ_TIMEOUT, read_message(&mut stream))
         .await
         .map_err(|_| StorageError::Network("request read timed out".into()))??;
-    debug!(
-        "Request chunk {} from {}",
-        &request.chunk_hash[..8.min(request.chunk_hash.len())],
-        peer_addr
-    );
+    // Хэш из сети попадает в путь на диске — проверяем формат до любого использования.
+    if !is_hex64(&request.chunk_hash) {
+        debug!("Invalid chunk hash in request from {}", peer_addr);
+        return Err(StorageError::InvalidHash);
+    }
+    debug!("Request chunk {} from {}", &request.chunk_hash[..8], peer_addr);
 
     match store.get(&request.chunk_hash).await {
         Ok(data) => {

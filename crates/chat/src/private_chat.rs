@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 
 use void_core::identity::NodeId;
 use void_core::peer::PeerInfo;
+use void_core::sanitize::{display_text, is_hex64};
 use void_network::conn_guard::ConnLimiter;
 use void_crypto::encrypt::EncryptedMessage;
 use void_crypto::keys::EncryptionKeypair;
@@ -181,13 +182,19 @@ async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
     };
     let (peer_id, peer_name, their_enc_pub) = match hello {
         DmPacket::Hello { node_id, name, enc_pubkey } => {
+            // node_id дальше становится именем файла переписки (dm/<id>.json):
+            // «../keystore» перезаписал бы ключи. Реальный ID — только hex64.
+            if !is_hex64(node_id.as_str()) {
+                warn!("DM: invalid node_id in Hello from {}", addr);
+                return;
+            }
             let bytes: [u8; 32] = match hex::decode(&enc_pubkey)
                 .ok().and_then(|b| b.try_into().ok())
             {
                 Some(b) => b,
                 None => { warn!("DM: invalid enc_pubkey from {}", addr); return; }
             };
-            (node_id, name, bytes)
+            (node_id, display_text(&name, void_core::peer::MAX_PROFILE_NAME_CHARS), bytes)
         }
         _ => { warn!("DM: expected Hello from {}", addr); return; }
     };
@@ -723,5 +730,37 @@ mod tests {
         // Пакет неизвестного типа от будущей версии не должен ломать парсинг.
         let unknown: DmPacket = serde_json::from_str(r#"{"kind":"from_the_future"}"#).unwrap();
         assert!(matches!(unknown, DmPacket::Unknown));
+    }
+
+    /// Hello с node_id-путём («../keystore») отклоняется до любой обработки:
+    /// иначе переписка записалась бы поверх файла ключей.
+    #[tokio::test]
+    async fn dm_hello_with_path_like_node_id_rejected() {
+        let b_port = free_port();
+        let (bob, b_kp, _b_id) = start_node("bob", 2, b_port).await;
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        let evil_kp = EncryptionKeypair::generate();
+        let enc = EncryptedMessage::encrypt(b"pwned", &b_kp.public_bytes(), &evil_kp).unwrap();
+        let stream = TcpStream::connect(("127.0.0.1", b_port)).await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        write_dm_pkt(&mut wr, &DmPacket::Hello {
+            node_id:    NodeId("../keystore".into()),
+            name:       "evil".into(),
+            enc_pubkey: hex::encode(evil_kp.public_bytes()),
+        }).await.unwrap();
+        // Сервер закрывает соединение без ответного Hello.
+        assert!(read_dm_pkt(&mut rd).await.is_err(), "сервер не должен отвечать на такой Hello");
+        let _ = write_dm_pkt(&mut wr, &DmPacket::Message {
+            message_id:     "x".into(),
+            encrypted_blob: serde_json::to_string(&enc).unwrap(),
+            timestamp:      0,
+        }).await;
+
+        assert!(
+            timeout(Duration::from_millis(500), bob_rx.recv()).await.is_err(),
+            "DM от недопустимого node_id не должен доходить до UI"
+        );
     }
 }

@@ -8,6 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use void_core::identity::NodeId;
 use void_core::peer::PeerProfile;
+use void_core::sanitize::{is_risky_to_open, safe_file_name};
 use void_reputation::ReportReason;
 
 use crate::backend::{DownloadCmd, StorageFileInfo};
@@ -80,6 +81,8 @@ pub struct StoragePage {
     pub downloads_dir: Option<PathBuf>,
     /// Файл, ожидающий подтверждения удаления (индекс + вид удаления).
     pending_delete: Option<(usize, DeleteKind)>,
+    /// Файл-программа (или скрипт), ожидающий подтверждения открытия.
+    pending_open: Option<usize>,
     /// Профили узлов — для перевода ключа публикатора в читаемое имя.
     pub peer_profiles: Option<Arc<Mutex<HashMap<NodeId, PeerProfile>>>>,
     /// Наш ID — чтобы пометить свою «папку».
@@ -103,6 +106,7 @@ impl Default for StoragePage {
             downloading: HashSet::new(),
             downloads_dir: None,
             pending_delete: None,
+            pending_open: None,
             peer_profiles: None,
             my_id: None,
             my_name: String::new(),
@@ -171,7 +175,9 @@ impl StoragePage {
             let seeding_by_me = f.is_mine || f.progress >= 1.0;
             entries.push(FileEntry {
                 file_id:      f.file_id,
-                name:         f.name,
+                // Имя пришло из чужого манифеста: показываем и открываем только
+                // безопасную форму (без пути и символов, маскирующих расширение).
+                name:         safe_file_name(&f.name),
                 size:         human_size(f.size_bytes),
                 size_bytes:   f.size_bytes,
                 chunks:       done,
@@ -285,15 +291,21 @@ impl StoragePage {
     }
 
     /// Открывает скачанный файл системным приложением (кросс-платформенно).
-    fn open_file(&self, idx: usize) {
+    /// Программы и скрипты без `confirmed` не открываются — сначала диалог.
+    fn open_file(&mut self, idx: usize, confirmed: bool) {
         let Some(file) = self.files.get(idx) else { return };
         let Some(dir) = &self.downloads_dir else { return };
-        let path = dir.join(&file.name);
+        let path = dir.join(safe_file_name(&file.name));
         // Скачанные файлы лежат в <data_dir>/downloads/<name>. Свой раздаваемый
         // файл там может отсутствовать (раздаётся из чанк-стора) — тогда не пытаемся.
-        if path.exists() {
-            crate::sys_open::open_external(&path);
+        if !path.exists() {
+            return;
         }
+        if !confirmed && is_risky_to_open(&file.name) {
+            self.pending_open = Some(idx);
+            return;
+        }
+        crate::sys_open::open_external(&path);
     }
 
     /// Удаляет файл: «из сети» (только владелец, нет других сидеров) или «свою
@@ -448,7 +460,7 @@ impl StoragePage {
             match act {
                 RowAction::Download => self.start_download(idx),
                 RowAction::Pause    => self.pause_download(idx),
-                RowAction::Open     => self.open_file(idx),
+                RowAction::Open     => self.open_file(idx, false),
                 RowAction::Report   => self.report_target = Some(idx),
                 RowAction::Delete      => self.pending_delete = Some((idx, DeleteKind::Network)),
                 RowAction::RemoveLocal => self.pending_delete = Some((idx, DeleteKind::Local)),
@@ -511,6 +523,54 @@ impl StoragePage {
             }
             if close {
                 self.pending_delete = None;
+            }
+        }
+
+        // === Подтверждение открытия программы/скрипта ===
+        if let Some(idx) = self.pending_open {
+            let name = self.files.get(idx).map(|f| f.name.clone()).unwrap_or_default();
+            let mut close = false;
+            let mut confirm = false;
+            egui::Window::new("\u{F0026}  Открыть программу?")
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size([380.0, 0.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&name).strong());
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Это программа, скрипт или ярлык: открытие запустит код с правами вашей \
+                             учётной записи. Файл пришёл от другого узла сети — открывайте, только \
+                             если доверяете публикатору.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Отмена").clicked() {
+                            close = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let open = Button::new(RichText::new("Всё равно открыть").color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(180, 60, 50));
+                            if ui.add(open).clicked() {
+                                confirm = true;
+                            }
+                        });
+                    });
+                });
+            if confirm {
+                self.open_file(idx, true);
+                close = true;
+            }
+            if close {
+                self.pending_open = None;
             }
         }
 

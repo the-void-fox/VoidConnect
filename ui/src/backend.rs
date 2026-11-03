@@ -623,7 +623,7 @@ async fn backend_main(
             pool.clone(), score.clone(),
             sign_kp.clone(), my_peer.id.clone(),
         ));
-        let reports = ReportManager::new(pool, score.clone());
+        let reports = ReportManager::new(pool, score.clone(), my_peer.id.clone());
         Reputation { score, events, sync, reports, keypair: sign_kp.clone() }
     });
 
@@ -1155,20 +1155,21 @@ async fn backend_main(
             loop {
                 match rep_rx.recv().await {
                     Ok(RepGossip::Sync { from, signed }) => {
-                        match rep.sync.apply_signed_sync(&from, &signed).await {
-                            Ok(()) => {
-                                // Подпись уже проверена внутри. Вытаскиваем оценку НАС
-                                // этим узлом (apply_sync её намеренно игнорирует) — это и
-                                // есть «узнать свою репутацию у пира», без отдельного запроса.
-                                if let Ok(payload) = serde_json::from_slice::<
-                                    void_reputation::sync::SyncPayload,
-                                >(&signed.payload)
+                        // «Что пир думает о нас» — только для отображения в профиле,
+                        // поэтому достаточно проверки подписи и свежести: влиять на
+                        // чужие оценки (apply) может лишь доверенный отправитель.
+                        match SyncManager::verify_sync(&from, &signed) {
+                            Ok(payload) => {
+                                if let Some(e) = payload.entries.iter()
+                                    .find(|e| e.target_key == rep_my_key && e.score.is_finite())
                                 {
-                                    if let Some(e) =
-                                        payload.entries.iter().find(|e| e.target_key == rep_my_key)
-                                    {
-                                        rep_views.lock().unwrap().insert(from.clone(), e.score);
-                                    }
+                                    rep_views.lock().unwrap().insert(
+                                        from.clone(),
+                                        e.score.clamp(void_reputation::score::SCORE_MIN, void_reputation::score::SCORE_MAX),
+                                    );
+                                }
+                                if let Err(e) = rep.sync.apply_signed_sync(&from, &signed).await {
+                                    tracing::debug!("Sync репутации от {} не применён: {}", from, e);
                                 }
                             }
                             Err(e) => tracing::debug!("Отклонён sync репутации от {}: {}", from, e),
@@ -1779,7 +1780,9 @@ fn start_storage_tasks(
                     let flag = Arc::new(AtomicBool::new(false));
                     cancels.lock().unwrap().insert(file_id.clone(), Arc::clone(&flag));
 
-                    let dest  = downloads_dir.join(&name);
+                    // Имя из чужого манифеста: только безопасное имя файла, иначе
+                    // `join` с абсолютным путём или `../` вышел бы за пределы папки.
+                    let dest  = downloads_dir.join(void_core::sanitize::safe_file_name(&name));
                     let peers = dl_pl.all().await;
                     let mgr   = dl_mgr.clone();
                     let chat  = dl_chat.clone();

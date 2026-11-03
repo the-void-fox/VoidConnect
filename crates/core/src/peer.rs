@@ -1,6 +1,15 @@
 use crate::identity::NodeId;
+use crate::sanitize::{display_text, is_hex64, truncate_chars};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+
+/// Лимиты полей профиля, присланного по сети (см. [`PeerProfile::sanitize`]).
+pub const MAX_PROFILE_NAME_CHARS: usize = 64;
+pub const MAX_PROFILE_STATUS_CHARS: usize = 32;
+pub const MAX_PROFILE_DESCRIPTION_CHARS: usize = 1000;
+/// Лимит base64-строки аватара (~24 КБ) — профиль должен оставаться лёгким
+/// для рассылки по relay чата.
+pub const MAX_AVATAR_B64: usize = 24 * 1024;
 
 /// Сервисы, которые может предоставлять узел
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +78,22 @@ impl PeerProfile {
             enc_pubkey: None,
             is_bootstrap: false,
             avatar_png: None,
+        }
+    }
+
+    /// Приводит профиль, пришедший из сети, к безопасным границам: обрезает
+    /// текстовые поля, убирает управляющие и bidi-символы из имени и статуса
+    /// (подмена отображаемого имени), отбрасывает слишком большой аватар
+    /// (PNG-бомба) и ключ шифрования неверного формата.
+    pub fn sanitize(&mut self) {
+        self.name = display_text(&self.name, MAX_PROFILE_NAME_CHARS);
+        self.status = display_text(&self.status, MAX_PROFILE_STATUS_CHARS);
+        self.description = truncate_chars(&self.description, MAX_PROFILE_DESCRIPTION_CHARS);
+        if self.avatar_png.as_ref().is_some_and(|a| a.len() > MAX_AVATAR_B64) {
+            self.avatar_png = None;
+        }
+        if self.enc_pubkey.as_ref().is_some_and(|k| !is_hex64(k)) {
+            self.enc_pubkey = None;
         }
     }
 }
@@ -144,5 +169,32 @@ mod tests {
         prof2.enc_pubkey = Some("deadbeef".into());
         let back: PeerProfile = serde_json::from_str(&serde_json::to_string(&prof2).unwrap()).unwrap();
         assert_eq!(back.enc_pubkey.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn sanitize_enforces_profile_limits() {
+        let mut prof = PeerProfile::new(NodeId("x".into()), format!("Ali\u{202E}ce{}", "z".repeat(500)));
+        prof.status = "online\n\n\n".into();
+        prof.description = "d".repeat(5000);
+        prof.avatar_png = Some("A".repeat(MAX_AVATAR_B64 + 1));
+        prof.enc_pubkey = Some("../not-a-key".into());
+        prof.sanitize();
+
+        assert!(prof.name.starts_with("Alice"));
+        assert_eq!(prof.name.chars().count(), MAX_PROFILE_NAME_CHARS);
+        assert_eq!(prof.status, "online");
+        assert_eq!(prof.description.chars().count(), MAX_PROFILE_DESCRIPTION_CHARS);
+        assert!(prof.avatar_png.is_none(), "слишком большой аватар отбрасывается");
+        assert!(prof.enc_pubkey.is_none(), "ключ неверного формата отбрасывается");
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_profile() {
+        let mut prof = PeerProfile::new(NodeId("x".into()), "Боб".into());
+        prof.enc_pubkey = Some("ab".repeat(32));
+        prof.avatar_png = Some("iVBOR".into());
+        let before = prof.clone();
+        prof.sanitize();
+        assert_eq!(prof, before);
     }
 }

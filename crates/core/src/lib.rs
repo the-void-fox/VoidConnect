@@ -5,4 +5,5 @@ pub mod manifest;
 pub mod message;
 pub mod peer;
 pub mod profile;
+pub mod sanitize;
 pub mod site;

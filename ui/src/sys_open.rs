@@ -13,11 +13,18 @@ pub fn open_external<S: AsRef<OsStr>>(target: S) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        // `cmd /C start "" <target>`: пустые кавычки — это заголовок окна, иначе
-        // `start` трактует первый аргумент в кавычках как заголовок, а не как цель.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(target)
+        // НЕ через `cmd /C start`: cmd заново разбирает командную строку, и `&`,
+        // `|`, `^` в имени файла или сайта (оно приходит из сети) выполнились бы
+        // как команды. explorer.exe получает цель одним аргументом, без shell.
+        use std::os::windows::process::CommandExt;
+        let target = target.to_string_lossy();
+        // Кавычка внутри цели сломала бы границы аргумента. В путях Windows она
+        // запрещена, в наших URL её нет — такую цель просто не открываем.
+        if target.contains('"') {
+            return false;
+        }
+        std::process::Command::new("explorer")
+            .raw_arg(format!("\"{}\"", target))
             .spawn()
             .is_ok()
     }

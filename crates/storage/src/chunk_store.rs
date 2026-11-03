@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
+use void_core::sanitize::is_hex64;
+
 use crate::error::StorageError;
 use crate::integrity::verify_chunk;
 
@@ -24,7 +26,8 @@ impl ChunkStore {
         Ok(ChunkStore { base_dir })
     }
 
-    /// Путь к файлу чанка на диске.
+    /// Путь к файлу чанка на диске. `hash` должен быть проверен ([`is_hex64`]) —
+    /// публичные методы ниже делают это сами, т.к. хэш может прийти из сети.
     pub fn chunk_path(&self, hash: &str) -> PathBuf {
         let prefix = &hash[..2.min(hash.len())];
         self.base_dir.join(prefix).join(format!("{}.chunk", hash))
@@ -55,6 +58,9 @@ impl ChunkStore {
 
     /// Читает чанк с диска. Верифицирует хэш после чтения.
     pub async fn get(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        if !is_hex64(hash) {
+            return Err(StorageError::InvalidHash);
+        }
         let path = self.chunk_path(hash);
         if !path.exists() {
             return Err(StorageError::ChunkNotFound(hash.to_string()));
@@ -67,11 +73,14 @@ impl ChunkStore {
 
     /// Проверяет наличие чанка на диске (без чтения).
     pub fn has(&self, hash: &str) -> bool {
-        self.chunk_path(hash).exists()
+        is_hex64(hash) && self.chunk_path(hash).exists()
     }
 
     /// Удаляет чанк с диска.
     pub async fn delete(&self, hash: &str) -> Result<(), StorageError> {
+        if !is_hex64(hash) {
+            return Err(StorageError::InvalidHash);
+        }
         let path = self.chunk_path(hash);
         if path.exists() {
             tokio::fs::remove_file(&path).await?;
