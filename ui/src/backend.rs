@@ -638,11 +638,12 @@ async fn backend_main(
         },
         None => Vec::new(),
     };
+    let history_for_chat: Vec<ChatMessage> = loaded.clone();
     *chat_history_out.lock().unwrap() = Some(loaded);
 
     // Ограничитель частоты (флуд-защита). ОДИН экземпляр на оба потребителя:
-    // чат (дроп пакетов сверх лимита на релее) и репутация (авто-блок узлов с
-    // отрицательным score). Clone дешёвый — состояние (bucket map) общее.
+    // чат (дроп живых сообщений автора сверх лимита) и репутация (авто-блок узлов
+    // с отрицательным score). Clone дешёвый — состояние (bucket map) общее.
     let rate_limiter = RateLimiter::new();
 
     // Noise-ключ узла (привязан подписью к NodeId): им аутентифицируются все
@@ -802,6 +803,9 @@ async fn backend_main(
             loop { tokio::time::sleep(tokio::time::Duration::from_secs(60)).await; }
         }
     };
+    // История из БД: соседи догонят пропущенное через нас, а их копии уже
+    // показанных сообщений не всплывут в GUI повторно.
+    chat.preload_history(history_for_chat).await;
 
     // Начальный профиль с enc_pubkey
     let enc_pub_hex = hex::encode(enc_kp.public_bytes());
@@ -2255,15 +2259,16 @@ async fn persist_public_message(pool: &void_db::DbPool, msg: &ChatMessage) -> vo
     .await
 }
 
-/// Преобразует запись из БД в ChatMessage для GUI.
-/// seq не хранится (для отображения истории не нужен) → 0.
+/// Преобразует запись из БД в ChatMessage (для GUI и для истории чата).
 fn db_msg_to_chat(m: void_db::messages::PublicMessage) -> ChatMessage {
     ChatMessage {
         from:      NodeId(m.sender_key),
         from_name: m.sender_name,
         text:      m.content,
         timestamp: m.sent_at.timestamp(),
-        seq:       0,
+        // seq нужен для проверки подписи (история уходит соседям): он хранится
+        // в message_id = "{sender_key}:{seq}".
+        seq:       m.message_id.rsplit_once(':').and_then(|(_, s)| s.parse().ok()).unwrap_or(0),
         signature: if m.signature.is_empty() { None } else { Some(m.signature) },
         channel:   m.channel,
     }
