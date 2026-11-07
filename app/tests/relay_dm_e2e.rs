@@ -81,6 +81,16 @@ async fn dm_delivered_end_to_end_via_relay() {
     sleep(Duration::from_millis(300)).await; // даём B зарегистрироваться
 
     // 4. A открывает туннель к B и шлёт DM через relay (без прямого connect).
+    // Марку работы подбирает заранее: при открытом туннеле B не стал бы ждать.
+    let cmd = DmSendCmd {
+        to:               b_id.clone(),
+        to_dm_addr:       String::new(),
+        their_enc_pubkey: b_kp.public_bytes(),
+        plaintext:        "привет через relay 🔒".into(),
+        message_id:       "e2e1".into(),
+        stamp:            true,
+    };
+    assert!(alice.prepare_stamp(&cmd).await.is_some());
     let mut bob_rx = bob.subscribe();
     let stream = relay::open_tunnel(&relay_addr, &a_noise, &b_id)
         .await
@@ -88,13 +98,7 @@ async fn dm_delivered_end_to_end_via_relay() {
 
     alice
         .send_dm_over_stream(
-            DmSendCmd {
-                to:               b_id.clone(),
-                to_dm_addr:       String::new(),
-                their_enc_pubkey: b_kp.public_bytes(),
-                plaintext:        "привет через relay 🔒".into(),
-                message_id:       "e2e1".into(),
-            },
+            cmd,
             Box::new(stream),
         )
         .await
@@ -109,6 +113,7 @@ async fn dm_delivered_end_to_end_via_relay() {
     assert_eq!(dm.plaintext, "привет через relay 🔒");
     assert_eq!(dm.from, a_id, "отправитель — Alice");
     assert_eq!(dm.message_id, "e2e1");
+    assert!(dm.stamped, "марка работы дошла сквозь relay");
 }
 
 /// Если получатель не зарегистрирован на relay — открытие туннеля не проходит

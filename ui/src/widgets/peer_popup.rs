@@ -24,6 +24,8 @@ pub struct PeerPopupAction {
     pub report: Option<ReportReason>,
     /// Поручиться / отозвать.
     pub vouch: Option<VouchAction>,
+    /// `Some(true)` — заблокировать, `Some(false)` — разблокировать.
+    pub block: Option<bool>,
 }
 
 /// Подпись и цвет уровня доверия.
@@ -328,5 +330,24 @@ pub fn show_peer_profile(
         }
     });
 
-    PeerPopupAction { start_dm: clicked, report, vouch }
+    // Блокировка: личка и сообщения в чате от узла не показываются (локально).
+    let mut block = None;
+    if let (Some(view), Some(pid)) = (trust, peer_id) {
+        if !my_id.is_empty() && pid != my_id {
+            ui.add_space(4.0);
+            if view.blocked_by_me {
+                if ui.button("Разблокировать").clicked() {
+                    block = Some(false);
+                }
+            } else if ui.button("  \u{F00AD}  Заблокировать")
+                .on_hover_text("Его личные сообщения и сообщения в чате перестанут показываться. \
+                                Решение только ваше — в сеть оно не уходит.")
+                .clicked()
+            {
+                block = Some(true);
+            }
+        }
+    }
+
+    PeerPopupAction { start_dm: clicked, report, vouch, block }
 }

@@ -10,6 +10,7 @@ void-crypto    = { path = "../crypto" }
 void-discovery = { path = "../discovery" }
 void-network   = { path = "../network" }
 hex = { workspace = true }
+sha2 = { workspace = true }
 
 chrono = { workspace = true }
 tokio = { workspace = true }

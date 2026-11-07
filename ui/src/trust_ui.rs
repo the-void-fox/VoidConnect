@@ -1,5 +1,5 @@
 //! Сеть доверия для страниц GUI (чат, граф): уровень узла, имена поручителей,
-//! команды «поручиться / отозвать».
+//! команды «поручиться / отозвать / заблокировать».
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,8 @@ pub struct TrustUi {
     pub map: Arc<Mutex<TrustMap>>,
     /// Неопубликованные отметки «проверен».
     pub private: Arc<Mutex<HashSet<NodeId>>>,
+    /// Доступ к личке (в нём — заблокированные мной).
+    pub access: Arc<Mutex<crate::dm_access::DmAccess>>,
     pub tx: UnboundedSender<TrustCmd>,
 }
 
@@ -27,6 +29,8 @@ pub struct TrustView {
     pub via_names: Vec<String>,
     /// Отметка «проверен» есть, но только у нас (не опубликована).
     pub private_mark: bool,
+    /// Заблокирован мной.
+    pub blocked_by_me: bool,
 }
 
 impl TrustUi {
@@ -36,6 +40,7 @@ impl TrustUi {
             Err(_) => TrustMap::default().get(id),
         };
         let private_mark = self.private.lock().map(|p| p.contains(id)).unwrap_or(false);
+        let blocked_by_me = self.access.lock().map(|a| a.blocked.contains(id.as_str())).unwrap_or(false);
         let via_names = info
             .via
             .iter()
@@ -47,7 +52,7 @@ impl TrustUi {
                     .unwrap_or_else(|| format!("{}…", &v.as_str()[..8.min(v.as_str().len())]))
             })
             .collect();
-        TrustView { info, via_names, private_mark }
+        TrustView { info, via_names, private_mark, blocked_by_me }
     }
 
     pub fn send(&self, cmd: TrustCmd) {

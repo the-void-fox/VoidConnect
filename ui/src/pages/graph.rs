@@ -125,6 +125,7 @@ impl Graph {
         let mut start_dm_id: Option<NodeId> = None;
         let mut report_reason: Option<void_reputation::ReportReason> = None;
         let mut vouch_action: Option<crate::widgets::peer_popup::VouchAction> = None;
+        let mut block_action: Option<bool> = None;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -156,6 +157,9 @@ impl Graph {
                         if action.vouch.is_some() {
                             vouch_action = action.vouch; // не закрываем попап — видно смену бейджа
                         }
+                        if action.block.is_some() {
+                            block_action = action.block;
+                        }
                         if ui.button("Закрыть").clicked() {
                             close_popup = true;
                         }
@@ -171,6 +175,13 @@ impl Graph {
                 trust.send(match action {
                     VouchAction::Vouch  => crate::backend::TrustCmd::Vouch(sel_id.clone()),
                     VouchAction::Revoke => crate::backend::TrustCmd::Revoke(sel_id.clone()),
+                });
+            }
+            if let (Some(block), Some(trust)) = (block_action, &self.trust) {
+                trust.send(if block {
+                    crate::backend::TrustCmd::Block(sel_id.clone())
+                } else {
+                    crate::backend::TrustCmd::Unblock(sel_id.clone())
                 });
             }
         }

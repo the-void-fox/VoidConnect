@@ -50,6 +50,10 @@ pub enum DmPacket {
         /// JSON-сериализованный EncryptedMessage
         encrypted_blob: String,
         timestamp:      i64,
+        /// «Марка работы» ([`crate::dm_pow`]) — нужна, если получатель нас
+        /// не знает: без неё он отбросит сообщение.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pow:            Option<u64>,
     },
     Ping,
     Pong,
@@ -69,6 +73,8 @@ pub struct IncomingDm {
     pub timestamp:      i64,
     /// Оригинальный зашифрованный blob (для хранения на диске).
     pub encrypted_blob: String,
+    /// К сообщению приложена действующая марка работы (отправитель → мы).
+    pub stamped:        bool,
 }
 
 /// Команда из GUI: отправить личное сообщение пиру.
@@ -82,6 +88,9 @@ pub struct DmSendCmd {
     pub their_enc_pubkey: [u8; 32],
     pub plaintext:        String,
     pub message_id:       String,
+    /// Приложить марку работы (получатель нас, возможно, не знает). Марка
+    /// подбирается раз в день на собеседника (1–2 с CPU) и кэшируется.
+    pub stamp:            bool,
 }
 
 // ── Внутреннее состояние ──────────────────────────────────────────────────────
@@ -104,6 +113,8 @@ struct Inner {
     connections:   Mutex<HashMap<NodeId, PeerConn>>,
     /// Кэш enc_pubkey пиров из аутентифицированного Hello
     known_pubkeys: Mutex<HashMap<NodeId, ([u8; 32], String)>>,
+    /// Подобранные марки работы: получатель → (день UTC, nonce).
+    stamps:        Mutex<HashMap<NodeId, (i64, u64)>>,
 }
 
 // ── Handle ────────────────────────────────────────────────────────────────────
@@ -129,6 +140,7 @@ pub async fn start_private_chat(
             incoming_tx,
             connections:   Mutex::new(HashMap::new()),
             known_pubkeys: Mutex::new(HashMap::new()),
+            stamps:        Mutex::new(HashMap::new()),
         }),
     };
 
@@ -271,8 +283,30 @@ impl PrivateChatHandle {
         self.inner.known_pubkeys.lock().await.get(id).map(|(k, _)| *k)
     }
 
+    /// Марка работы для `cmd` (если она нужна): из кэша на сегодня или
+    /// подобранная заново в отдельном потоке. Звать ДО открытия соединения:
+    /// подбор занимает секунды, и открытое соединение собеседник закрыл бы по
+    /// таймауту рукопожатия. `send_dm` делает это сам.
+    pub async fn prepare_stamp(&self, cmd: &DmSendCmd) -> Option<u64> {
+        if !cmd.stamp {
+            return None;
+        }
+        let to = &cmd.to;
+        let today = crate::dm_pow::utc_day(chrono::Utc::now().timestamp());
+        if let Some((_, nonce)) = self.inner.stamps.lock().await.get(to).filter(|(day, _)| *day == today) {
+            return Some(*nonce);
+        }
+        let (from, to_id) = (self.inner.my_peer.id.clone(), to.clone());
+        let nonce = tokio::task::spawn_blocking(move || crate::dm_pow::mint(&from, &to_id, today))
+            .await
+            .ok()?;
+        self.inner.stamps.lock().await.insert(to.clone(), (today, nonce));
+        Some(nonce)
+    }
+
     /// Зашифровать и отправить личное сообщение пиру.
     pub async fn send_dm(&self, cmd: DmSendCmd) -> anyhow::Result<()> {
+        let pow = self.prepare_stamp(&cmd).await;
         // Пробуем существующее соединение (в т.ч. ранее поднятый relay-туннель).
         // Берём отправитель под локом и СРАЗУ освобождаем лок: держать его на время
         // await нельзя — cleanup соединения (`run_conn_tasks`) тоже берёт
@@ -284,7 +318,7 @@ impl PrivateChatHandle {
         if let Some(fwd_tx) = existing {
             // Соединение аутентифицировано — ключ из его Hello уже в кэше.
             let to_pub = self.known_pubkey(&cmd.to).await.unwrap_or(cmd.their_enc_pubkey);
-            let pkt = encrypt_message(&self.inner.my_enc_kp, &to_pub, &cmd.plaintext, cmd.message_id.clone())?;
+            let pkt = encrypt_message(&self.inner.my_enc_kp, &to_pub, &cmd.plaintext, cmd.message_id.clone(), pow)?;
             let (ack_tx, ack_rx) = oneshot::channel();
             // Ok из send() лишь подтверждает постановку в очередь; доставку
             // подтверждает ack из write-задачи (фактическая запись в сокет).
@@ -300,25 +334,27 @@ impl PrivateChatHandle {
 
         // Устанавливаем новое исходящее соединение (прямое)
         let stream = dial(&cmd.to_dm_addr).await?;
-        self.establish_outbound(Box::new(stream), cmd).await
+        self.establish_outbound(Box::new(stream), cmd, pow).await
     }
 
     /// Отправляет DM по УЖЕ установленному потоку (например, relay-туннелю), когда
     /// прямое соединение невозможно (symmetric NAT). Проводит то же рукопожатие,
-    /// что и прямой дозвон, но без `TcpStream::connect`.
+    /// что и прямой дозвон, но без `TcpStream::connect`. Марку работы готовьте
+    /// заранее ([`Self::prepare_stamp`]) — до открытия потока.
     pub async fn send_dm_over_stream(
         &self,
         cmd:    DmSendCmd,
         stream: BoxStream,
     ) -> anyhow::Result<()> {
-        self.establish_outbound(stream, cmd).await
+        let pow = self.prepare_stamp(&cmd).await;
+        self.establish_outbound(stream, cmd, pow).await
     }
 
     /// Общая часть исходящего соединения: Noise-рукопожатие с проверкой, что на
     /// том конце именно `cmd.to`, обмен Hello, шифрование первого сообщения
     /// ключом из аутентифицированного Hello и запуск задач соединения. Работает
     /// поверх любого потока — прямого TCP или relay-туннеля.
-    async fn establish_outbound(&self, stream: BoxStream, cmd: DmSendCmd) -> anyhow::Result<()> {
+    async fn establish_outbound(&self, stream: BoxStream, cmd: DmSendCmd, pow: Option<u64>) -> anyhow::Result<()> {
         use anyhow::anyhow;
 
         // Подменённый адрес (чужой узел, злой relay) обрывается здесь, до того
@@ -347,7 +383,7 @@ impl PrivateChatHandle {
             .insert(cmd.to.clone(), (confirmed_pub, peer_name.clone()));
 
         // Ключ берём из аутентифицированного Hello, а не из неподписанного профиля.
-        let first_pkt = encrypt_message(&self.inner.my_enc_kp, &confirmed_pub, &cmd.plaintext, cmd.message_id)?;
+        let first_pkt = encrypt_message(&self.inner.my_enc_kp, &confirmed_pub, &cmd.plaintext, cmd.message_id, pow)?;
         write_dm_pkt(&mut wr, &first_pkt).await?;
 
         let to = cmd.to;
@@ -371,6 +407,7 @@ fn encrypt_message(
     to_pub:     &[u8; 32],
     plaintext:  &str,
     message_id: String,
+    pow:        Option<u64>,
 ) -> anyhow::Result<DmPacket> {
     let enc = EncryptedMessage::encrypt(plaintext.as_bytes(), to_pub, my_kp)
         .map_err(|e| anyhow::anyhow!("DM encrypt: {:?}", e))?;
@@ -378,6 +415,7 @@ fn encrypt_message(
         message_id,
         encrypted_blob: serde_json::to_string(&enc)?,
         timestamp:      chrono::Utc::now().timestamp(),
+        pow,
     })
 }
 
@@ -414,8 +452,8 @@ async fn run_conn_tasks(
     let read_task = tokio::spawn(async move {
         loop {
             match read_dm_pkt(&mut rd).await {
-                Ok(DmPacket::Message { message_id, encrypted_blob, timestamp }) => {
-                    on_dm_message(&inner_r, &pid_r, &pname_r, &their_enc_pub, message_id, encrypted_blob, timestamp).await;
+                Ok(pkt @ DmPacket::Message { .. }) => {
+                    on_dm_message(&inner_r, &pid_r, &pname_r, &their_enc_pub, pkt).await;
                 }
                 Ok(DmPacket::Ping) | Ok(DmPacket::Pong)
                 | Ok(DmPacket::Hello { .. }) | Ok(DmPacket::Unknown) => {}
@@ -454,10 +492,12 @@ async fn on_dm_message(
     from:           &NodeId,
     from_name:      &str,
     their_enc_pub:  &[u8; 32],
-    message_id:     String,
-    encrypted_blob: String,
-    timestamp:      i64,
+    pkt:            DmPacket,
 ) {
+    let DmPacket::Message { message_id, encrypted_blob, timestamp, pow } = pkt else { return };
+    let stamped = pow.is_some_and(|n| {
+        crate::dm_pow::verify(from, &inner.my_peer.id, chrono::Utc::now().timestamp(), n)
+    });
     let enc: EncryptedMessage = match serde_json::from_str(&encrypted_blob) {
         Ok(e) => e,
         Err(e) => { warn!("DM: bad blob from {}: {}", from, e); return; }
@@ -481,6 +521,7 @@ async fn on_dm_message(
         plaintext,
         timestamp,
         encrypted_blob,
+        stamped,
     };
     let _ = inner.incoming_tx.send(dm);
 }
@@ -585,6 +626,7 @@ mod tests {
                 their_enc_pubkey: b_kp.public_bytes(),
                 plaintext:        "привет, Боб 🔒".into(),
                 message_id:       "m1".into(),
+                stamp:            false,
             })
             .await
             .expect("send_dm");
@@ -597,6 +639,41 @@ mod tests {
         assert_eq!(dm.plaintext, "привет, Боб 🔒");
         assert_eq!(dm.from, a_id, "from должен быть NodeId Алисы");
         assert_eq!(dm.message_id, "m1");
+    }
+
+    /// Марка работы: подбирается один раз и прикладывается ко всем сообщениям
+    /// дня; получатель видит её как действующую. Без запроса марки — нет.
+    #[tokio::test]
+    async fn dm_stamp_attached_and_verified() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (alice, _a_kp, a_id) = start_node("alice", 1, a_port).await;
+        let (bob, b_kp, b_id) = start_node("bob", 2, b_port).await;
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        let send = |id: &str, stamp: bool| DmSendCmd {
+            to:               b_id.clone(),
+            to_dm_addr:       format!("127.0.0.1:{}", b_port),
+            their_enc_pubkey: b_kp.public_bytes(),
+            plaintext:        id.into(),
+            message_id:       id.into(),
+            stamp,
+        };
+        alice.send_dm(send("s1", true)).await.expect("send s1");
+        let today = crate::dm_pow::utc_day(chrono::Utc::now().timestamp());
+        let cached = alice.inner.stamps.lock().await.get(&b_id).copied();
+        assert!(matches!(cached, Some((day, _)) if day == today), "марка закэширована на сегодня");
+        alice.send_dm(send("s2", true)).await.expect("send s2");
+        assert_eq!(alice.inner.stamps.lock().await.get(&b_id).copied(), cached, "вторая — та же марка");
+        alice.send_dm(send("plain", false)).await.expect("send plain");
+
+        for (id, stamped) in [("s1", true), ("s2", true), ("plain", false)] {
+            let dm = timeout(Duration::from_secs(5), bob_rx.recv()).await.unwrap().unwrap();
+            assert_eq!(dm.message_id, id);
+            assert_eq!(dm.from, a_id);
+            assert_eq!(dm.stamped, stamped, "{id}");
+        }
     }
 
     /// Двунаправленный обмен: Bob отвечает Alice, используя enc_pubkey,
@@ -620,6 +697,7 @@ mod tests {
                 their_enc_pubkey: b_kp.public_bytes(),
                 plaintext:        "ping".into(),
                 message_id:       "m1".into(),
+                stamp:            false,
             })
             .await
             .expect("send ping");
@@ -644,6 +722,7 @@ mod tests {
             their_enc_pubkey: a_pub,
             plaintext:        "pong".into(),
             message_id:       "m2".into(),
+            stamp:            false,
         })
         .await
         .expect("send pong");
@@ -675,6 +754,7 @@ mod tests {
                     their_enc_pubkey: b_kp.public_bytes(),
                     plaintext:        format!("msg-{i}"),
                     message_id:       format!("m{i}"),
+                    stamp:            false,
                 })
                 .await
                 .expect("send_dm");
@@ -723,6 +803,7 @@ mod tests {
                     their_enc_pubkey: b_kp.public_bytes(),
                     plaintext:        "через туннель".into(),
                     message_id:       "rm1".into(),
+                    stamp:            false,
                 },
                 Box::new(alice_side),
             )
@@ -782,6 +863,7 @@ mod tests {
                 message_id:     "x".into(),
                 encrypted_blob: serde_json::to_string(&enc).unwrap(),
                 timestamp:      0,
+                pow:            None,
             }).await;
         }
 
@@ -807,6 +889,7 @@ mod tests {
             their_enc_pubkey: [7u8; 32],
             plaintext:        "секрет".into(),
             message_id:       "x".into(),
+            stamp:            false,
         }).await;
         assert!(res.is_err(), "рукопожатие с самозванцем должно провалиться");
         assert!(

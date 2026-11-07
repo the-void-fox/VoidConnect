@@ -3,6 +3,7 @@ mod avatar;
 mod backend;
 mod boot;
 mod device_lock;
+mod dm_access;
 mod pages;
 mod profile_store;
 mod private_store;
