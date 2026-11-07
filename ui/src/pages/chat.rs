@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui::{Button, Frame, ScrollArea, TextEdit};
+use void_chat::trust_limits::NEWCOMERS_CHANNEL;
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
+use void_trust::TrustLevel;
 use crate::widgets::peer_popup::{status_colors, show_peer_profile};
 
 /// Каналы («доски») общего чата: (id, иконка Nerd Font, название).
 /// `id` хранится в каждом сообщении и в БД; глобальный канал — "global".
 pub const CHANNELS: &[(&str, &str, &str)] = &[
     ("global", "\u{F01E7}", "Глобальный"),
+    (NEWCOMERS_CHANNEL, "\u{F0014}", "Новички"),
     ("tech",   "\u{F061A}", "Технологии"),
     ("dev",    "\u{F0174}", "Разработка"),
     ("games",  "\u{F0EBF}", "Игры"),
@@ -38,6 +42,20 @@ pub struct ChatMessage {
     pub from_id: Option<NodeId>,
     /// Канал («доска»), к которому относится сообщение.
     pub channel: String,
+    /// Номер сообщения у автора (вместе с `from_id` — ключ сообщения).
+    pub seq:     u64,
+}
+
+/// Метка сообщения незнакомца.
+const NEWCOMER_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 70);
+
+/// Что нажато в строке сообщения.
+#[derive(Default)]
+struct MsgClick {
+    /// Имя автора → профиль.
+    author: Option<NodeId>,
+    /// «Показать» / «Свернуть» сообщение незнакомца.
+    toggle_fold: bool,
 }
 
 pub struct ChatPage {
@@ -70,6 +88,12 @@ pub struct ChatPage {
     pub trust: Option<crate::trust_ui::TrustUi>,
     /// Наш NodeId (hex) — для расчёта кода безопасности (safety number).
     pub my_id_hex: String,
+    /// Сворачивать сообщения незнакомцев (настройка).
+    pub fold_strangers: bool,
+    /// Развёрнутые вручную сообщения незнакомцев: (автор, seq).
+    expanded: HashSet<(NodeId, u64)>,
+    /// Сколько узлов поручились за нас (0 — показываем подсказку новичку).
+    pub my_vouchers: Option<Arc<AtomicUsize>>,
 }
 
 impl ChatPage {
@@ -97,6 +121,9 @@ impl ChatPage {
             pending_report:   None,
             trust:            None,
             my_id_hex:        String::new(),
+            fold_strangers:   false,
+            expanded:         HashSet::new(),
+            my_vouchers:      None,
         }
     }
 
@@ -168,6 +195,9 @@ impl Default for ChatPage {
             pending_report:   None,
             trust:            None,
             my_id_hex:        String::new(),
+            fold_strangers:   false,
+            expanded:         HashSet::new(),
+            my_vouchers:      None,
         }
     }
 }
@@ -275,6 +305,26 @@ impl ChatPage {
         ui.separator();
         ui.add_space(4.0);
 
+        let weak = ui.visuals().weak_text_color();
+        if self.current_channel == NEWCOMERS_CHANNEL {
+            ui.label(
+                egui::RichText::new(
+                    "Канал для знакомства: здесь пишут и те, за кого ещё никто не поручился.")
+                    .small().color(weak),
+            );
+            ui.add_space(4.0);
+        } else if self.my_vouchers.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0) {
+            ui.label(
+                egui::RichText::new(
+                    "\u{F02FC}  За вас ещё никто не поручился, поэтому другие узлы пропускают \
+                     ваши сообщения в этот канал не чаще раза в 30 секунд. В канале «Новички» \
+                     такого лимита нет. Чтобы его снять, сверьте код безопасности со знакомым \
+                     и попросите его поручиться за вас.")
+                    .small().color(NEWCOMER_COLOR),
+            );
+            ui.add_space(4.0);
+        }
+
         // Высоту области сообщений считаем здесь — после панели каналов, чтобы
         // учесть её фактическую высоту (она может переноситься на пару строк).
         let messages_h = (ui.available_height() - input_area_total_h).max(100.0);
@@ -284,6 +334,20 @@ impl ChatPage {
 
         // Collect click result outside scroll closure to avoid borrow conflict
         let mut clicked_id: Option<NodeId> = None;
+        let mut toggled: Option<(NodeId, u64)> = None;
+        // Незнакомцы среди авторов канала (метка «новичок»). Снимок доверия
+        // блокируем коротко: его же читает чат, решая о лимитах.
+        let newcomers: HashSet<NodeId> = self.trust.as_ref()
+            .and_then(|t| t.map.lock().ok())
+            .map(|map| {
+                self.messages.iter()
+                    .filter(|m| m.channel == self.current_channel && !m.is_me)
+                    .filter_map(|m| m.from_id.as_ref())
+                    .filter(|id| map.level(id) == TrustLevel::Stranger)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let scroll_out = ScrollArea::vertical()
             .id_source("chat_messages_scroll")
@@ -303,8 +367,18 @@ impl ChatPage {
                 }
 
                 for msg in self.messages.iter().filter(|m| m.channel == self.current_channel) {
-                    if let Some(id) = Self::render_message(ui, msg, &self.profiles, self.my_avatar.as_deref()) {
-                        clicked_id = Some(id);
+                    let newcomer = msg.from_id.as_ref().is_some_and(|id| newcomers.contains(id));
+                    let key = msg.from_id.clone().map(|id| (id, msg.seq));
+                    let fold = (newcomer && self.fold_strangers)
+                        .then(|| !key.as_ref().is_some_and(|k| self.expanded.contains(k)));
+                    let click = Self::render_message(
+                        ui, msg, &self.profiles, self.my_avatar.as_deref(), newcomer, fold,
+                    );
+                    if click.author.is_some() {
+                        clicked_id = click.author;
+                    }
+                    if click.toggle_fold {
+                        toggled = key;
                     }
                     ui.add_space(8.0);
                 }
@@ -316,6 +390,11 @@ impl ChatPage {
                 }
             });
 
+        if let Some(key) = toggled {
+            if !self.expanded.remove(&key) {
+                self.expanded.insert(key);
+            }
+        }
         // Apply click after scroll area finishes (avoids borrow conflict)
         if let Some(id) = clicked_id {
             self.selected = if self.selected.as_ref() == Some(&id) { None } else { Some(id) };
@@ -371,13 +450,17 @@ impl ChatPage {
         if should_send { self.send_message(); }
     }
 
+    /// `newcomer` — автор незнакомец (метка «новичок»); `fold` — сообщение
+    /// можно свернуть: `Some(true)` свёрнуто, `Some(false)` развёрнуто.
     fn render_message(
         ui: &mut egui::Ui,
         msg: &ChatMessage,
         profiles: &HashMap<NodeId, PeerProfile>,
         my_avatar: Option<&str>,
-    ) -> Option<NodeId> {
-        let mut clicked_id: Option<NodeId> = None;
+        newcomer: bool,
+        fold: Option<bool>,
+    ) -> MsgClick {
+        let mut click = MsgClick::default();
 
         // Resolve display name: profile name takes precedence
         let display_name = if let Some(id) = &msg.from_id {
@@ -447,7 +530,7 @@ impl ChatPage {
                                 .sense(egui::Sense::click())
                             );
                             if resp.clicked() {
-                                clicked_id = msg.from_id.clone();
+                                click.author = msg.from_id.clone();
                             }
                             if resp.hovered() {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -459,21 +542,49 @@ impl ChatPage {
                             );
                         }
 
+                        if newcomer {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("новичок").small().color(NEWCOMER_COLOR))
+                                .on_hover_text("Никто из вашей сети доверия не поручился за этот узел");
+                        }
+
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(&msg.time)
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                         );
+                        if fold == Some(false) {
+                            ui.add_space(8.0);
+                            let hide = egui::RichText::new("свернуть")
+                                .small()
+                                .color(ui.visuals().weak_text_color());
+                            if ui.add(egui::Label::new(hide).sense(egui::Sense::click())).clicked() {
+                                click.toggle_fold = true;
+                            }
+                        }
                     });
                     ui.add_space(4.0);
-                    ui.label(&msg.text);
+                    if fold == Some(true) {
+                        let show = egui::RichText::new("Сообщение незнакомца свёрнуто — показать")
+                            .italics()
+                            .color(ui.visuals().weak_text_color());
+                        let resp = ui.add(egui::Label::new(show).sense(egui::Sense::click()));
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            click.toggle_fold = true;
+                        }
+                    } else {
+                        ui.label(&msg.text);
+                    }
                 });
             });
             if !msg.is_me { ui.add_space(40.0); }
         });
 
-        clicked_id
+        click
     }
 
     fn send_message(&mut self) {
@@ -490,6 +601,7 @@ impl ChatPage {
             is_me:   true,
             from_id: None,
             channel: self.current_channel.clone(),
+            seq:     0,
         });
         self.input.clear();
         if self.was_at_bottom { self.scroll_to_bottom = true; }

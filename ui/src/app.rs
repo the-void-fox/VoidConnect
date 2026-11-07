@@ -105,6 +105,7 @@ impl VoidApp {
         let trust_prompt = !backend.private_verified.lock().unwrap().is_empty()
             && !crate::verify_store::migration_asked();
         chat.my_id_hex = backend.my_id_full.clone();
+        chat.my_vouchers = Some(std::sync::Arc::clone(&backend.my_vouchers));
 
         // Load saved profile values (description, status) for the profile page
         let saved = crate::profile_store::load_or_create();
@@ -172,6 +173,7 @@ impl VoidApp {
 
         let settings = crate::settings_store::load();
         let settings_bootstrap_input = settings.bootstrap_nodes.join("\n");
+        chat.fold_strangers = settings.fold_strangers;
 
         Self {
             current_page: Page::Chat,
@@ -312,6 +314,7 @@ impl VoidApp {
                     is_me,
                     from_id: Some(msg.from.clone()),
                     channel: msg.channel.clone(),
+                    seq:     msg.seq,
                 });
             }
             self.history_loaded = true;
@@ -340,6 +343,7 @@ impl VoidApp {
                 is_me:   false,
                 from_id: Some(msg.from.clone()),
                 channel: msg.channel.clone(),
+                seq:     msg.seq,
             });
         }
     }
@@ -627,6 +631,29 @@ impl VoidApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+                ui.label(egui::RichText::new("Чат").strong().size(15.0));
+                ui.add_space(8.0);
+                if ui
+                    .checkbox(&mut self.chat.fold_strangers, "Сворачивать сообщения незнакомцев")
+                    .changed()
+                {
+                    // Применяется сразу; сохраняем только это поле — несохранённые
+                    // правки сетевых настроек ниже на диск не попадают.
+                    self.settings.fold_strangers = self.chat.fold_strangers;
+                    let mut on_disk = crate::settings_store::load();
+                    on_disk.fold_strangers = self.chat.fold_strangers;
+                    let _ = crate::settings_store::save(&on_disk);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Сообщения тех, за кого никто из вашей сети доверия не поручился, \
+                         показываются свёрнутыми — их можно раскрыть по щелчку.")
+                        .small().color(ui.visuals().weak_text_color()),
+                );
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("Глобальная сеть").strong().size(15.0));
                 ui.add_space(8.0);
 
