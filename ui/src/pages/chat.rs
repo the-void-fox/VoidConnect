@@ -209,6 +209,7 @@ impl ChatPage {
         let mut start_dm_id: Option<NodeId> = None;
         let mut report_reason: Option<void_reputation::ReportReason> = None;
         let mut vouch_action: Option<crate::widgets::peer_popup::VouchAction> = None;
+        let mut block_action: Option<bool> = None;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -240,6 +241,9 @@ impl ChatPage {
                         if action.vouch.is_some() {
                             vouch_action = action.vouch; // не закрываем попап — видно смену бейджа
                         }
+                        if action.block.is_some() {
+                            block_action = action.block;
+                        }
                         if ui.button("Закрыть").clicked() {
                             close_popup = true;
                         }
@@ -255,6 +259,13 @@ impl ChatPage {
                 trust.send(match action {
                     VouchAction::Vouch  => crate::backend::TrustCmd::Vouch(sel_id.clone()),
                     VouchAction::Revoke => crate::backend::TrustCmd::Revoke(sel_id.clone()),
+                });
+            }
+            if let (Some(block), Some(trust)) = (block_action, &self.trust) {
+                trust.send(if block {
+                    crate::backend::TrustCmd::Block(sel_id.clone())
+                } else {
+                    crate::backend::TrustCmd::Unblock(sel_id.clone())
                 });
             }
         }
@@ -335,19 +346,20 @@ impl ChatPage {
         // Collect click result outside scroll closure to avoid borrow conflict
         let mut clicked_id: Option<NodeId> = None;
         let mut toggled: Option<(NodeId, u64)> = None;
-        // Незнакомцы среди авторов канала (метка «новичок»). Снимок доверия
-        // блокируем коротко: его же читает чат, решая о лимитах.
-        let newcomers: HashSet<NodeId> = self.trust.as_ref()
+        // Уровни авторов канала: незнакомцы — с меткой «новичок», заблокированные
+        // (мной или голосованием) не показываются. Снимок доверия блокируем
+        // коротко: его же читает чат, решая о лимитах.
+        let levels: HashMap<NodeId, TrustLevel> = self.trust.as_ref()
             .and_then(|t| t.map.lock().ok())
             .map(|map| {
                 self.messages.iter()
                     .filter(|m| m.channel == self.current_channel && !m.is_me)
                     .filter_map(|m| m.from_id.as_ref())
-                    .filter(|id| map.level(id) == TrustLevel::Stranger)
-                    .cloned()
+                    .map(|id| (id.clone(), map.level(id)))
                     .collect()
             })
             .unwrap_or_default();
+        let level_of = |m: &ChatMessage| m.from_id.as_ref().and_then(|id| levels.get(id)).copied();
 
         let scroll_out = ScrollArea::vertical()
             .id_source("chat_messages_scroll")
@@ -367,7 +379,10 @@ impl ChatPage {
                 }
 
                 for msg in self.messages.iter().filter(|m| m.channel == self.current_channel) {
-                    let newcomer = msg.from_id.as_ref().is_some_and(|id| newcomers.contains(id));
+                    if level_of(msg) == Some(TrustLevel::Blocked) {
+                        continue;
+                    }
+                    let newcomer = level_of(msg) == Some(TrustLevel::Stranger);
                     let key = msg.from_id.clone().map(|id| (id, msg.seq));
                     let fold = (newcomer && self.fold_strangers)
                         .then(|| !key.as_ref().is_some_and(|k| self.expanded.contains(k)));

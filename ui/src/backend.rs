@@ -212,6 +212,11 @@ pub enum TrustCmd {
     Revoke(NodeId),
     /// Опубликовать старые локальные отметки «проверен» как поручительства.
     PublishPrivate,
+    /// Принять запрос в личку: узел пишет во «Входящие» (не поручительство).
+    Allow(NodeId),
+    /// Заблокировать узел (в том числе «Отклонить» запрос в личку).
+    Block(NodeId),
+    Unblock(NodeId),
 }
 
 /// Сеть доверия: подпись своих поручительств, приём чужих (пересылаем дальше
@@ -231,6 +236,8 @@ struct TrustService {
     blocklist: Arc<Mutex<HashMap<NodeId, i64>>>,
     /// Сколько узлов поручились за нас (подсказка новичку в чате).
     my_vouchers: Arc<AtomicUsize>,
+    /// Доступ к личке: разрешённые, заблокированные мной, запросы.
+    access:    Arc<Mutex<crate::dm_access::DmAccess>>,
     /// Сигнал «граф изменился — пересчитать».
     dirty:     Arc<tokio::sync::Notify>,
 }
@@ -245,6 +252,9 @@ impl TrustService {
                     TrustCmd::Vouch(id)     => svc.set_vouch(&id, false).await,
                     TrustCmd::Revoke(id)    => svc.set_vouch(&id, true).await,
                     TrustCmd::PublishPrivate => svc.publish_private().await,
+                    TrustCmd::Allow(id)     => update_access(&svc.access, |a| a.allow(id.as_str())),
+                    TrustCmd::Block(id)     => update_access(&svc.access, |a| a.block(id.as_str())),
+                    TrustCmd::Unblock(id)   => update_access(&svc.access, |a| a.unblock(id.as_str())),
                 }
                 svc.recompute().await;
             }
@@ -380,10 +390,11 @@ impl TrustService {
         let settled = void_trust::store::settled(&self.pool, now).await.unwrap_or_default();
         let mine = vouches.iter().filter(|v| v.subject == self.my_id && !v.revoked).count();
         self.my_vouchers.store(mine, Ordering::Relaxed);
-        let blocked: HashSet<NodeId> = self.blocklist.lock().unwrap().iter()
+        let mut blocked: HashSet<NodeId> = self.blocklist.lock().unwrap().iter()
             .filter(|(_, until)| **until > now)
             .map(|(id, _)| id.clone())
             .collect();
+        blocked.extend(self.access.lock().unwrap().blocked.iter().cloned().map(NodeId));
         let private = self.private.lock().unwrap().clone();
         let reported = HashSet::new(); // жалобы с весом доверия — фаза 5
         let map = void_trust::compute(&void_trust::TrustInputs {
@@ -395,6 +406,16 @@ impl TrustService {
             private_verified: &private,
         });
         *self.snapshot.lock().unwrap() = map;
+    }
+}
+
+/// Меняет доступ к личке и сохраняет его на диск.
+fn update_access(access: &Mutex<crate::dm_access::DmAccess>, f: impl FnOnce(&mut crate::dm_access::DmAccess)) {
+    let mut a = access.lock().unwrap();
+    let before = a.clone();
+    f(&mut a);
+    if *a != before {
+        crate::dm_access::save(&a);
     }
 }
 
@@ -488,6 +509,8 @@ async fn try_deliver_dm(
     noise:     &NoiseIdentity,
     cmd:       &DmSendCmd,
 ) -> bool {
+    // Марку работы — до любых соединений: её подбор занимает секунды.
+    dm_h.prepare_stamp(cmd).await;
     // send_dm переиспользует уже поднятое соединение (в т.ч. relay-туннель),
     // иначе пытается прямой дозвон.
     if dm_h.send_dm(cmd.clone()).await.is_ok() {
@@ -608,6 +631,9 @@ pub struct BackendHandle {
     pub trust_tx: tokio::sync::mpsc::UnboundedSender<TrustCmd>,
     /// Сколько узлов поручились за нас (0 — для других узлов мы новичок).
     pub my_vouchers: Arc<AtomicUsize>,
+    /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
+    /// командами `TrustCmd::{Allow, Block, Unblock}`).
+    pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -721,6 +747,8 @@ pub fn start_backend(
     let (trust_tx, trust_rx) = tokio::sync::mpsc::unbounded_channel::<TrustCmd>();
     let my_vouchers = Arc::new(AtomicUsize::new(0));
     let my_vouchers_bg = Arc::clone(&my_vouchers);
+    let dm_access = Arc::new(Mutex::new(crate::dm_access::load()));
+    let dm_access_bg = Arc::clone(&dm_access);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -744,7 +772,7 @@ pub fn start_backend(
                 propose_rx, vote_cast_rx, proposals_bg,
                 blocklist_bg, voted_channels_bg, my_score_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg, my_reputation_bg,
-                trust_bg, private_bg, trust_rx, my_vouchers_bg,
+                trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg,
             ).await;
         });
     });
@@ -797,6 +825,7 @@ pub fn start_backend(
         private_verified,
         trust_tx,
         my_vouchers,
+        dm_access,
     }
 }
 
@@ -848,6 +877,7 @@ async fn backend_main(
     private_out: Arc<Mutex<HashSet<NodeId>>>,
     trust_rx: tokio::sync::mpsc::UnboundedReceiver<TrustCmd>,
     my_vouchers: Arc<AtomicUsize>,
+    dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1062,6 +1092,7 @@ async fn backend_main(
     dns.refresh().await;
 
     // ── Сеть доверия ──────────────────────────────────────────────────────────
+    let trust_snapshot = Arc::clone(&trust_out);
     // Без БД (поручительства хранятся в ней) команды GUI просто не исполняются.
     if let Some(pool) = db_pool.clone() {
         let trust = TrustService {
@@ -1073,6 +1104,7 @@ async fn backend_main(
             private:   private_out,
             blocklist: Arc::clone(&blocklist_out),
             my_vouchers,
+            access:    Arc::clone(&dm_access),
             dirty:     Arc::new(tokio::sync::Notify::new()),
         };
         // Лимиты чата по уровню доверия — после первого расчёта, иначе в первые
@@ -1140,14 +1172,17 @@ async fn backend_main(
     let inbox_task = Arc::clone(&inbox);
     let pool_for_save = db_pool.clone();
     let chat_blocklist = Arc::clone(&blocklist_out);
+    let chat_access = Arc::clone(&dm_access);
     let chat_my_id = my_peer.id.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    // Узлы, забаненные голосованием, не показываем и не сохраняем.
+                    // Узлы, забаненные голосованием или мной, не показываем и не сохраняем.
                     let now = chrono::Utc::now().timestamp();
-                    if is_banned(&chat_blocklist, &msg.from, now) {
+                    if is_banned(&chat_blocklist, &msg.from, now)
+                        || chat_access.lock().unwrap().blocked.contains(msg.from.as_str())
+                    {
                         continue;
                     }
                     // Наблюдение для уровня «освоившийся»: «живое» чужое сообщение.
@@ -1178,12 +1213,33 @@ async fn backend_main(
     let mut dm_rx_sub = dm_handle.subscribe();
     let dm_inbox_task = Arc::clone(&dm_inbox);
     let dm_blocklist = Arc::clone(&blocklist_out);
+    let dm_trust = Arc::clone(&trust_snapshot);
+    let dm_access_in = Arc::clone(&dm_access);
+    // Без БД сеть доверия не работает (и «Принять» тоже) — пускаем всех, как раньше.
+    let dm_gate = db_pool.is_some();
     tokio::spawn(async move {
         loop {
             match dm_rx_sub.recv().await {
                 Ok(msg) => {
                     // DM от забаненных голосованием узлов игнорируем.
                     if is_banned(&dm_blocklist, &msg.from, chrono::Utc::now().timestamp()) {
+                        continue;
+                    }
+                    // Незнакомцы — только в «Запросы» и только с маркой работы.
+                    let level = dm_trust.lock().unwrap().level(&msg.from);
+                    let route = if !dm_gate {
+                        crate::dm_access::Route::Inbox
+                    } else {
+                        let mut access = dm_access_in.lock().unwrap();
+                        let before = access.requests.get(msg.from.as_str()).copied();
+                        let route = access.route(msg.from.as_str(), level, msg.stamped);
+                        if access.requests.get(msg.from.as_str()).copied() != before {
+                            crate::dm_access::save(&access);
+                        }
+                        route
+                    };
+                    if route == crate::dm_access::Route::Drop {
+                        tracing::debug!("Личное сообщение от {} отброшено (нет марки / очередь запроса полна / блок)", msg.from);
                         continue;
                     }
                     let mut q = dm_inbox_task.lock().unwrap();
@@ -1229,6 +1285,7 @@ async fn backend_main(
     let dm_noise = noise.clone();
     let dm_status_loop = Arc::clone(&dm_status);
     let dm_peer_list = peer_list.clone();
+    let dm_access_out = Arc::clone(&dm_access);
     tokio::spawn(async move {
         let mut retry_q: VecDeque<PendingDm> = VecDeque::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(DM_RETRY_SECS));
@@ -1236,6 +1293,8 @@ async fn backend_main(
             tokio::select! {
                 maybe_cmd = dm_rx.recv() => {
                     let Some(cmd) = maybe_cmd else { break; }; // канал закрыт — выходим
+                    // Пишу сам — значит, жду ответа: он пойдёт во «Входящие».
+                    update_access(&dm_access_out, |a| a.allow(cmd.to.as_str()));
                     set_dm_status(&dm_status_loop, &cmd.message_id, DeliveryState::Sending);
                     if try_deliver_dm(&dm_h, &dm_relay_set, &dm_noise, &cmd).await {
                         set_dm_status(&dm_status_loop, &cmd.message_id, DeliveryState::Delivered);

@@ -99,6 +99,7 @@ impl VoidApp {
         let trust = crate::trust_ui::TrustUi {
             map:     std::sync::Arc::clone(&backend.trust),
             private: std::sync::Arc::clone(&backend.private_verified),
+            access:  std::sync::Arc::clone(&backend.dm_access),
             tx:      backend.trust_tx.clone(),
         };
         chat.trust = Some(trust.clone());
@@ -140,6 +141,8 @@ impl VoidApp {
         private.my_node_id = Some(backend.my_id_node.clone());
         private.my_name    = backend.my_name.clone();
         private.base_port  = backend.base_port;
+        private.access     = Some(std::sync::Arc::clone(&backend.dm_access));
+        private.trust_tx   = Some(backend.trust_tx.clone());
         // Загружаем историю с диска
         private.load_history_from_disk();
 
