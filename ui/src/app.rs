@@ -100,6 +100,10 @@ impl VoidApp {
             map:     std::sync::Arc::clone(&backend.trust),
             private: std::sync::Arc::clone(&backend.private_verified),
             access:  std::sync::Arc::clone(&backend.dm_access),
+            details: std::sync::Arc::clone(&backend.trust_details),
+            greeter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                crate::settings_store::load().greeter,
+            )),
             tx:      backend.trust_tx.clone(),
         };
         chat.trust = Some(trust.clone());
@@ -650,6 +654,24 @@ impl VoidApp {
                     egui::RichText::new(
                         "Сообщения тех, за кого никто из вашей сети доверия не поручился, \
                          показываются свёрнутыми — их можно раскрыть по щелчку.")
+                        .small().color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(6.0);
+                if ui.checkbox(&mut self.settings.greeter, "Я встречающий").changed() {
+                    if let Some(trust) = &self.chat.trust {
+                        trust.greeter.store(self.settings.greeter, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let mut on_disk = crate::settings_store::load();
+                    on_disk.greeter = self.settings.greeter;
+                    let _ = crate::settings_store::save(&on_disk);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "У новичков в канале «Новички» и в их профиле появится кнопка \
+                         «Поприветствовать». Это слабое публичное поручительство: «похож на \
+                         живого человека». Для вас новичок станет освоившимся, а ваши знакомые \
+                         дадут ему немного доверия через вас. Если он окажется ботом, ваши \
+                         поручительства потеряют вес.")
                         .small().color(ui.visuals().weak_text_color()),
                 );
 

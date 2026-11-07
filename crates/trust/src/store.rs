@@ -3,7 +3,7 @@
 //! Запросы рантаймовые (`sqlx::query`), без `query!`-макросов — офлайн-кэш
 //! sqlx не нужен.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use sqlx::Row;
 use void_core::identity::NodeId;
@@ -173,6 +173,27 @@ pub async fn settled(pool: &DbPool, now: i64) -> Result<HashSet<NodeId>, TrustEr
     Ok(rows.into_iter().map(NodeId).collect())
 }
 
+/// Что мой узел видел за узлом (для подсказки «когда освоится»).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Activity {
+    /// Когда впервые увидели (unix-секунды).
+    pub first_seen: i64,
+    /// В сколько разных дней он писал «живые» сообщения.
+    pub active_days: i64,
+}
+
+/// Все наблюдения.
+pub async fn activity(pool: &DbPool) -> Result<HashMap<NodeId, Activity>, TrustError> {
+    let rows: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT node_id, first_seen, active_days FROM peer_activity")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, first_seen, active_days)| (NodeId(id), Activity { first_seen, active_days }))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +282,10 @@ mod tests {
         let later = settled(&pool, t0 + 8 * day).await.unwrap();
         assert!(later.contains(&a));
         assert!(!later.contains(&b), "активность в один день не считается за три");
+
+        // Те же наблюдения — для подсказки «когда освоится».
+        let act = activity(&pool).await.unwrap();
+        assert_eq!(act[&a], Activity { first_seen: t0, active_days: 3 });
+        assert_eq!(act[&b].active_days, 1);
     }
 }

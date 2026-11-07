@@ -208,6 +208,9 @@ impl DnsService {
 pub enum TrustCmd {
     /// Поручиться за узел лично (код безопасности сверён). Публично.
     Vouch(NodeId),
+    /// Поприветствовать новичка (роль встречающего): слабое публичное
+    /// поручительство «похож на живого человека», вес ×0.3 от личного.
+    Greet(NodeId),
     /// Отозвать своё поручительство (или снять локальную отметку).
     Revoke(NodeId),
     /// Опубликовать старые локальные отметки «проверен» как поручительства.
@@ -217,6 +220,14 @@ pub enum TrustCmd {
     /// Заблокировать узел (в том числе «Отклонить» запрос в личку).
     Block(NodeId),
     Unblock(NodeId),
+}
+
+/// Подробности сети доверия для GUI: кого я поприветствовал и что мой узел
+/// видел за узлами (подсказка «когда освоится по поведению»).
+#[derive(Default, Clone)]
+pub struct TrustDetails {
+    pub greeted: HashSet<NodeId>,
+    pub activity: HashMap<NodeId, void_trust::store::Activity>,
 }
 
 /// Сеть доверия: подпись своих поручительств, приём чужих (пересылаем дальше
@@ -238,6 +249,8 @@ struct TrustService {
     my_vouchers: Arc<AtomicUsize>,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы.
     access:    Arc<Mutex<crate::dm_access::DmAccess>>,
+    /// Подробности для GUI (мои приветствия, наблюдения).
+    details:   Arc<Mutex<TrustDetails>>,
     /// Сигнал «граф изменился — пересчитать».
     dirty:     Arc<tokio::sync::Notify>,
 }
@@ -249,8 +262,9 @@ impl TrustService {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    TrustCmd::Vouch(id)     => svc.set_vouch(&id, false).await,
-                    TrustCmd::Revoke(id)    => svc.set_vouch(&id, true).await,
+                    TrustCmd::Vouch(id)     => svc.set_vouch(&id, void_trust::VouchKind::Personal, false).await,
+                    TrustCmd::Greet(id)     => svc.set_vouch(&id, void_trust::VouchKind::Greeter, false).await,
+                    TrustCmd::Revoke(id)    => svc.set_vouch(&id, void_trust::VouchKind::Personal, true).await,
                     TrustCmd::PublishPrivate => svc.publish_private().await,
                     TrustCmd::Allow(id)     => update_access(&svc.access, |a| a.allow(id.as_str())),
                     TrustCmd::Block(id)     => update_access(&svc.access, |a| a.block(id.as_str())),
@@ -306,23 +320,23 @@ impl TrustService {
         });
     }
 
-    /// Ставит (или отзывает) наше личное поручительство за `subject` и рассылает его.
-    async fn set_vouch(&self, subject: &NodeId, revoked: bool) {
+    /// Ставит (или отзывает) наше поручительство за `subject` и рассылает его.
+    /// Приветствие не понижает уже выданное личное поручительство; отзыв
+    /// снимает любое (вид берётся у действующего).
+    async fn set_vouch(&self, subject: &NodeId, kind: void_trust::VouchKind, revoked: bool) {
         if *subject == self.my_id || !void_core::sanitize::is_hex64(subject.as_str()) {
             return;
         }
         // Отметка больше не «только у меня»: она опубликована либо снята.
         self.forget_private(subject);
         let prev = void_trust::store::get_vouch(&self.pool, &self.my_id, subject).await.ok().flatten();
-        if revoked && prev.as_ref().is_none_or(|p| p.revoked) {
-            return; // отзывать нечего
-        }
+        let Some(kind) = next_vouch_kind(prev.as_ref(), kind, revoked) else { return };
         let updated_at = chrono::Utc::now().timestamp_millis()
             .max(prev.map(|p| p.updated_at + 1).unwrap_or(0));
         let vouch = void_trust::Vouch {
             voucher: self.my_id.clone(),
             subject: subject.clone(),
-            kind: void_trust::VouchKind::Personal,
+            kind,
             updated_at,
             revoked,
         };
@@ -344,7 +358,7 @@ impl TrustService {
     async fn publish_private(&self) {
         let ids: Vec<NodeId> = self.private.lock().unwrap().iter().cloned().collect();
         for id in ids {
-            self.set_vouch(&id, false).await;
+            self.set_vouch(&id, void_trust::VouchKind::Personal, false).await;
         }
     }
 
@@ -390,6 +404,12 @@ impl TrustService {
         let settled = void_trust::store::settled(&self.pool, now).await.unwrap_or_default();
         let mine = vouches.iter().filter(|v| v.subject == self.my_id && !v.revoked).count();
         self.my_vouchers.store(mine, Ordering::Relaxed);
+        let greeted = vouches.iter()
+            .filter(|v| v.voucher == self.my_id && !v.revoked && v.kind == void_trust::VouchKind::Greeter)
+            .map(|v| v.subject.clone())
+            .collect();
+        let activity = void_trust::store::activity(&self.pool).await.unwrap_or_default();
+        *self.details.lock().unwrap() = TrustDetails { greeted, activity };
         let mut blocked: HashSet<NodeId> = self.blocklist.lock().unwrap().iter()
             .filter(|(_, until)| **until > now)
             .map(|(id, _)| id.clone())
@@ -424,6 +444,23 @@ impl TrustService {
             .into_iter()
             .map(|(target, reporter)| (NodeId(target), NodeId(reporter)))
             .collect()
+    }
+}
+
+/// Какой вид записать в нашу новую версию поручительства (`None` — ничего не
+/// менять): отзывать нечего — пропуск; приветствие не понижает уже выданное
+/// (личное или приветствие); отзыв сохраняет вид действующего.
+fn next_vouch_kind(
+    prev: Option<&void_trust::Vouch>,
+    kind: void_trust::VouchKind,
+    revoked: bool,
+) -> Option<void_trust::VouchKind> {
+    let active = prev.filter(|p| !p.revoked).map(|p| p.kind);
+    match (revoked, active) {
+        (true, None) => None,
+        (true, Some(current)) => Some(current),
+        (false, Some(_)) if kind == void_trust::VouchKind::Greeter => None,
+        (false, _) => Some(kind),
     }
 }
 
@@ -643,6 +680,8 @@ pub struct BackendHandle {
     pub trust_tx: tokio::sync::mpsc::UnboundedSender<TrustCmd>,
     /// Сколько узлов поручились за нас (0 — для других узлов мы новичок).
     pub my_vouchers: Arc<AtomicUsize>,
+    /// Мои приветствия и наблюдения за узлами (для профиля узла).
+    pub trust_details: Arc<Mutex<TrustDetails>>,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
     /// командами `TrustCmd::{Allow, Block, Unblock}`).
     pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
@@ -756,6 +795,8 @@ pub fn start_backend(
     let my_vouchers_bg = Arc::clone(&my_vouchers);
     let dm_access = Arc::new(Mutex::new(crate::dm_access::load()));
     let dm_access_bg = Arc::clone(&dm_access);
+    let trust_details: Arc<Mutex<TrustDetails>> = Arc::new(Mutex::new(TrustDetails::default()));
+    let trust_details_bg = Arc::clone(&trust_details);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -779,7 +820,7 @@ pub fn start_backend(
                 propose_rx, vote_cast_rx, proposals_bg,
                 blocklist_bg, voted_channels_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg,
-                trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg,
+                trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg, trust_details_bg,
             ).await;
         });
     });
@@ -831,6 +872,7 @@ pub fn start_backend(
         trust_tx,
         my_vouchers,
         dm_access,
+        trust_details,
     }
 }
 
@@ -881,6 +923,7 @@ async fn backend_main(
     trust_rx: tokio::sync::mpsc::UnboundedReceiver<TrustCmd>,
     my_vouchers: Arc<AtomicUsize>,
     dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
+    trust_details: Arc<Mutex<TrustDetails>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1107,6 +1150,7 @@ async fn backend_main(
             blocklist: Arc::clone(&blocklist_out),
             my_vouchers,
             access:    Arc::clone(&dm_access),
+            details:   trust_details,
             dirty:     Arc::clone(&trust_dirty),
         };
         // Лимиты чата по уровню доверия — после первого расчёта, иначе в первые
@@ -2597,5 +2641,19 @@ mod tests {
         assert!(proposer_trusted(&t, &n(0), n(0).as_str()), "своё предложение");
         assert!(proposer_trusted(&t, &n(0), n(2).as_str()), "через знакомых");
         assert!(!proposer_trusted(&t, &n(0), n(9).as_str()), "незнакомец — спам");
+    }
+
+    #[test]
+    fn greeting_never_downgrades_and_revoke_keeps_kind() {
+        use void_trust::VouchKind::{Greeter, Personal};
+        let rec = |kind, revoked| void_trust::Vouch {
+            voucher: n(0), subject: n(1), kind, updated_at: 1, revoked,
+        };
+        assert_eq!(next_vouch_kind(None, Greeter, false), Some(Greeter));
+        assert_eq!(next_vouch_kind(Some(&rec(Personal, false)), Greeter, false), None, "не понижаем");
+        assert_eq!(next_vouch_kind(Some(&rec(Greeter, false)), Personal, false), Some(Personal), "повышаем");
+        assert_eq!(next_vouch_kind(Some(&rec(Greeter, false)), Personal, true), Some(Greeter), "отзыв приветствия");
+        assert_eq!(next_vouch_kind(Some(&rec(Personal, true)), Personal, true), None, "отзывать нечего");
+        assert_eq!(next_vouch_kind(Some(&rec(Personal, true)), Greeter, false), Some(Greeter), "после отзыва — можно");
     }
 }

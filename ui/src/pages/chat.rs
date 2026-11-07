@@ -51,6 +51,19 @@ const NEWCOMER_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 70);
 /// Метка сообщения узла под жалобами.
 const REPORTED_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 120, 60);
 
+/// Как показать сообщение (по доверию к автору).
+#[derive(Default, Clone, Copy)]
+struct MsgMarks {
+    /// Автор незнакомец — метка «новичок».
+    newcomer: bool,
+    /// Под жалобами моей сети — метка и сворачивание.
+    reported: bool,
+    /// Показать «поприветствовать» (я встречающий, канал «Новички»).
+    greet: bool,
+    /// Можно свернуть: `Some(true)` свёрнуто, `Some(false)` развёрнуто.
+    fold: Option<bool>,
+}
+
 /// Что нажато в строке сообщения.
 #[derive(Default)]
 struct MsgClick {
@@ -58,6 +71,8 @@ struct MsgClick {
     author: Option<NodeId>,
     /// «Показать» / «Свернуть» сообщение незнакомца.
     toggle_fold: bool,
+    /// «Поприветствовать» автора.
+    greet: bool,
 }
 
 pub struct ChatPage {
@@ -261,6 +276,7 @@ impl ChatPage {
                 trust.send(match action {
                     VouchAction::Vouch  => crate::backend::TrustCmd::Vouch(sel_id.clone()),
                     VouchAction::Revoke => crate::backend::TrustCmd::Revoke(sel_id.clone()),
+                    VouchAction::Greet  => crate::backend::TrustCmd::Greet(sel_id.clone()),
                 });
             }
             if let (Some(block), Some(trust)) = (block_action, &self.trust) {
@@ -348,6 +364,9 @@ impl ChatPage {
         // Collect click result outside scroll closure to avoid borrow conflict
         let mut clicked_id: Option<NodeId> = None;
         let mut toggled: Option<(NodeId, u64)> = None;
+        let mut greet: Option<NodeId> = None;
+        let greeter = self.current_channel == NEWCOMERS_CHANNEL
+            && self.trust.as_ref().is_some_and(|t| t.is_greeter());
         // Уровни авторов канала: незнакомцы — с меткой «новичок», заблокированные
         // (мной или голосованием) не показываются. Снимок доверия блокируем
         // коротко: его же читает чат, решая о лимитах.
@@ -391,11 +410,17 @@ impl ChatPage {
                     }
                     let newcomer = level_of(msg) == Some(TrustLevel::Stranger);
                     let key = msg.from_id.clone().map(|id| (id, msg.seq));
-                    let fold = ((newcomer && self.fold_strangers) || reported(msg))
-                        .then(|| !key.as_ref().is_some_and(|k| self.expanded.contains(k)));
-                    let click = Self::render_message(
-                        ui, msg, &self.profiles, self.my_avatar.as_deref(), newcomer, reported(msg), fold,
-                    );
+                    let marks = MsgMarks {
+                        newcomer,
+                        reported: reported(msg),
+                        greet: greeter && newcomer && !reported(msg),
+                        fold: ((newcomer && self.fold_strangers) || reported(msg))
+                            .then(|| !key.as_ref().is_some_and(|k| self.expanded.contains(k))),
+                    };
+                    let click = Self::render_message(ui, msg, &self.profiles, self.my_avatar.as_deref(), marks);
+                    if click.greet {
+                        greet = msg.from_id.clone();
+                    }
                     if click.author.is_some() {
                         clicked_id = click.author;
                     }
@@ -412,6 +437,9 @@ impl ChatPage {
                 }
             });
 
+        if let (Some(id), Some(trust)) = (greet, &self.trust) {
+            trust.send(crate::backend::TrustCmd::Greet(id));
+        }
         if let Some(key) = toggled {
             if !self.expanded.remove(&key) {
                 self.expanded.insert(key);
@@ -472,18 +500,14 @@ impl ChatPage {
         if should_send { self.send_message(); }
     }
 
-    /// `newcomer` — автор незнакомец (метка «новичок»), `reported` — под
-    /// жалобами моей сети; `fold` — сообщение можно свернуть: `Some(true)`
-    /// свёрнуто, `Some(false)` развёрнуто.
     fn render_message(
         ui: &mut egui::Ui,
         msg: &ChatMessage,
         profiles: &HashMap<NodeId, PeerProfile>,
         my_avatar: Option<&str>,
-        newcomer: bool,
-        reported: bool,
-        fold: Option<bool>,
+        marks: MsgMarks,
     ) -> MsgClick {
+        let MsgMarks { newcomer, reported, greet, fold } = marks;
         let mut click = MsgClick::default();
 
         // Resolve display name: profile name takes precedence
@@ -582,6 +606,18 @@ impl ChatPage {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                         );
+                        if greet {
+                            ui.add_space(8.0);
+                            let hi = egui::RichText::new("\u{F1821} поприветствовать")
+                                .small()
+                                .color(ui.visuals().hyperlink_color);
+                            let resp = ui.add(egui::Label::new(hi).sense(egui::Sense::click()))
+                                .on_hover_text("Слабое публичное поручительство: «похож на живого \
+                                                человека». Для вас он станет освоившимся.");
+                            if resp.clicked() {
+                                click.greet = true;
+                            }
+                        }
                         if fold == Some(false) {
                             ui.add_space(8.0);
                             let hide = egui::RichText::new("свернуть")

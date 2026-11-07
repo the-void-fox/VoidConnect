@@ -175,6 +175,7 @@ impl Graph {
                 trust.send(match action {
                     VouchAction::Vouch  => crate::backend::TrustCmd::Vouch(sel_id.clone()),
                     VouchAction::Revoke => crate::backend::TrustCmd::Revoke(sel_id.clone()),
+                    VouchAction::Greet  => crate::backend::TrustCmd::Greet(sel_id.clone()),
                 });
             }
             if let (Some(block), Some(trust)) = (block_action, &self.trust) {

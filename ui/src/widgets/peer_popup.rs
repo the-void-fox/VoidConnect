@@ -11,8 +11,10 @@ use crate::trust_ui::TrustView;
 pub enum VouchAction {
     /// Поручиться лично (код безопасности совпал) — или опубликовать старую отметку.
     Vouch,
-    /// Отозвать поручительство (или снять локальную отметку).
+    /// Отозвать поручительство или приветствие (или снять локальную отметку).
     Revoke,
+    /// Поприветствовать новичка (роль встречающего).
+    Greet,
 }
 
 /// Действие, выбранное пользователем в попапе профиля узла.
@@ -26,6 +28,49 @@ pub struct PeerPopupAction {
     pub vouch: Option<VouchAction>,
     /// `Some(true)` — заблокировать, `Some(false)` — разблокировать.
     pub block: Option<bool>,
+}
+
+/// Наблюдения за незнакомцем («когда освоится») и кнопки встречающего.
+fn show_newcomer_section(ui: &mut egui::Ui, view: &TrustView) -> Option<VouchAction> {
+    use void_trust::store::{SETTLE_ACTIVE_DAYS, SETTLE_SECS};
+    let level = view.info.level;
+    let stranger = level == TrustLevel::Stranger && !view.info.reported;
+    let can_greet = view.greeter_mode && !view.greeted_by_me && (stranger || level == TrustLevel::Settled);
+    if !stranger && !can_greet && !view.greeted_by_me {
+        return None;
+    }
+    let weak = ui.visuals().weak_text_color();
+    let mut action = None;
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    if stranger {
+        let text = match view.activity {
+            Some(a) => {
+                let days = ((chrono::Utc::now().timestamp() - a.first_seen) / 86_400).max(0);
+                format!(
+                    "Освоится по поведению: ваш узел видит его {} дн. из {}, писал в {} дн. из {}.",
+                    days.min(SETTLE_SECS / 86_400), SETTLE_SECS / 86_400,
+                    a.active_days.min(SETTLE_ACTIVE_DAYS), SETTLE_ACTIVE_DAYS,
+                )
+            }
+            None => "Ваш узел ещё не видел его в сети.".to_string(),
+        };
+        ui.label(egui::RichText::new(text).small().color(weak));
+    }
+    if can_greet {
+        if ui.button("\u{F1821}  Поприветствовать")
+            .on_hover_text("Слабое публичное поручительство: «похож на живого человека». \
+                            Для вас он станет освоившимся; если окажется ботом — ваши \
+                            поручительства потеряют вес.")
+            .clicked()
+        {
+            action = Some(VouchAction::Greet);
+        }
+    } else if view.greeted_by_me && ui.button("Отменить приветствие").clicked() {
+        action = Some(VouchAction::Revoke);
+    }
+    action
 }
 
 /// Подпись и цвет уровня доверия.
@@ -43,7 +88,18 @@ fn trust_badge(view: &TrustView) -> (String, egui::Color32) {
             }
             (format!("󰡉  Через знакомых: {names}"), egui::Color32::from_rgb(120, 170, 220))
         }
-        TrustLevel::Settled => ("Освоившийся".into(), egui::Color32::from_rgb(170, 160, 120)),
+        TrustLevel::Settled => {
+            let why = if view.greeted_by_me {
+                " · вы поприветствовали".to_string()
+            } else if view.info.settled {
+                " · по поведению".to_string()
+            } else if !view.via_names.is_empty() {
+                format!(" · через {}", view.via_names.join(", "))
+            } else {
+                String::new()
+            };
+            (format!("Освоившийся{why}"), egui::Color32::from_rgb(170, 160, 120))
+        }
         TrustLevel::Stranger if view.info.reported => {
             ("󰀦  Незнакомец · под жалобами".into(), egui::Color32::from_rgb(220, 140, 60))
         }
@@ -234,6 +290,15 @@ pub fn show_peer_profile(
                     }
                 }
             });
+        }
+    }
+
+    // Новичок: когда освоится по поведению; приветствие встречающего.
+    if let (Some(view), Some(pid)) = (trust, peer_id) {
+        if !my_id.is_empty() && pid != my_id {
+            if let Some(greet) = show_newcomer_section(ui, view) {
+                vouch = Some(greet);
+            }
         }
     }
 
