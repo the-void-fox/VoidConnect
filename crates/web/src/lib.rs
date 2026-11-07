@@ -241,11 +241,17 @@ mod tests {
         write_sample_site(site_dir.path());
         let manifest = publish_site(&mgr_a, site_dir.path(), "remote", &kp(10)).await.unwrap();
 
-        // chunk-сервер A.
+        // chunk-сервер A. Ждём, пока он реально начнёт принимать соединения:
+        // под нагрузкой полного прогона фиксированной паузы бывало мало.
         let a_port = free_port();
         let srv = mgr_a.clone();
         tokio::spawn(async move { let _ = srv.start_server(a_port).await; });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", a_port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // B узнаёт о файлах сайта ТОЛЬКО из манифестов (никаких локальных чанков).
         let (_db, mgr_b) = storage(11).await;
@@ -275,8 +281,16 @@ mod tests {
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Первый запрос → докачка у A → страница отдаётся.
-        let body = http_get(addr, "/remote.void").await;
+        // Первый запрос → докачка у A → страница отдаётся. Несколько попыток —
+        // на случай медленного старта серверов; сломанная докачка не пройдёт ни одну.
+        let mut body = String::new();
+        for _ in 0..5 {
+            body = http_get(addr, "/remote.void").await;
+            if body.contains("<h1>Hello Void</h1>") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
         assert!(body.contains("<h1>Hello Void</h1>"),
             "ожидался докачанный index чужого сайта, получено: {body}");
 

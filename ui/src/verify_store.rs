@@ -1,8 +1,10 @@
-//! verify_store.rs — локальный список проверенных контактов.
+//! verify_store.rs — неопубликованные отметки «проверен».
 //!
-//! Хранит NodeId (hex) узлов, чей код безопасности (safety number) пользователь
-//! сверил вне сети. Чисто локальная пометка доверия: в сеть не уходит, на других
-//! узлах не видна. JSON рядом с профилем.
+//! До сети доверия отметка «проверен» была чисто локальной и хранилась здесь.
+//! Теперь «проверен» — это публичное поручительство (`void-trust`, в БД), а в
+//! этом файле остаются только старые отметки, которые пользователь решил не
+//! публиковать: для его узла они по-прежнему значат «проверен лично».
+//! JSON рядом с профилем.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -22,4 +24,17 @@ pub fn save_verified(set: &HashSet<String>) {
     if let Ok(json) = serde_json::to_string_pretty(set) {
         let _ = std::fs::write(verified_path(), json);
     }
+}
+
+fn asked_path() -> PathBuf {
+    crate::profile_store::profile_dir().join("trust_migration_asked")
+}
+
+/// Спрашивали ли уже, публиковать ли старые отметки (вопрос задаётся один раз).
+pub fn migration_asked() -> bool {
+    asked_path().exists()
+}
+
+pub fn mark_migration_asked() {
+    let _ = std::fs::write(asked_path(), b"1");
 }

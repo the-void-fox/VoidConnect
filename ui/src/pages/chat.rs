@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui::{Button, Frame, ScrollArea, TextEdit};
@@ -66,8 +66,8 @@ pub struct ChatPage {
     pub voted_channels: Option<Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>>,
     /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
     pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
-    /// Локальный список проверенных контактов (NodeId hex) — общий с graph/app.
-    pub verified: Option<Arc<Mutex<HashSet<String>>>>,
+    /// Сеть доверия: уровни узлов и команды «поручиться/отозвать».
+    pub trust: Option<crate::trust_ui::TrustUi>,
     /// Наш NodeId (hex) — для расчёта кода безопасности (safety number).
     pub my_id_hex: String,
 }
@@ -95,7 +95,7 @@ impl ChatPage {
             blocklist:        None,
             voted_channels:   None,
             pending_report:   None,
-            verified:         None,
+            trust:            None,
             my_id_hex:        String::new(),
         }
     }
@@ -125,25 +125,6 @@ impl ChatPage {
         self.blocklist.as_ref()
             .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
             .is_some_and(|until| until > now)
-    }
-
-    /// Проверен ли контакт (safety number сверён вручную).
-    fn is_verified(&self, id: &NodeId) -> bool {
-        self.verified.as_ref()
-            .and_then(|m| m.lock().ok().map(|set| set.contains(id.as_str())))
-            .unwrap_or(false)
-    }
-
-    /// Переключает отметку «проверен» и сохраняет на диск.
-    fn toggle_verified(&mut self, id: &NodeId) {
-        if let Some(shared) = &self.verified {
-            if let Ok(mut set) = shared.lock() {
-                if !set.remove(id.as_str()) {
-                    set.insert(id.as_str().to_string());
-                }
-                crate::verify_store::save_verified(&set);
-            }
-        }
     }
 
     /// Полный список каналов: встроенные + добавленные голосованием (дедуп по id).
@@ -185,7 +166,7 @@ impl Default for ChatPage {
             blocklist:        None,
             voted_channels:   None,
             pending_report:   None,
-            verified:         None,
+            trust:            None,
             my_id_hex:        String::new(),
         }
     }
@@ -197,7 +178,7 @@ impl ChatPage {
         let mut close_popup = false;
         let mut start_dm_id: Option<NodeId> = None;
         let mut report_reason: Option<void_reputation::ReportReason> = None;
-        let mut do_toggle_verify = false;
+        let mut vouch_action: Option<crate::widgets::peer_popup::VouchAction> = None;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -212,10 +193,10 @@ impl ChatPage {
                         let rep = self.peer_score(&sel_id);
                         let reports = self.peer_reports(&sel_id);
                         let banned = self.is_banned(&sel_id);
-                        let verified = self.is_verified(&sel_id);
+                        let trust = self.trust.as_ref().map(|t| t.view(&sel_id, &self.profiles));
                         let action = show_peer_profile(
                             ui, peer.as_ref(), profile.as_ref(), rep, &reports, banned,
-                            &self.my_id_hex, verified,
+                            &self.my_id_hex, trust.as_ref(),
                         );
                         ui.add_space(6.0);
                         if action.start_dm {
@@ -226,8 +207,8 @@ impl ChatPage {
                             report_reason = Some(reason);
                             close_popup = true;
                         }
-                        if action.toggle_verify {
-                            do_toggle_verify = true; // не закрываем попап — видно смену бейджа
+                        if action.vouch.is_some() {
+                            vouch_action = action.vouch; // не закрываем попап — видно смену бейджа
                         }
                         if ui.button("Закрыть").clicked() {
                             close_popup = true;
@@ -239,8 +220,12 @@ impl ChatPage {
             if let Some(reason) = report_reason {
                 self.pending_report = Some((sel_id.clone(), reason));
             }
-            if do_toggle_verify {
-                self.toggle_verified(&sel_id);
+            if let (Some(action), Some(trust)) = (vouch_action, &self.trust) {
+                use crate::widgets::peer_popup::VouchAction;
+                trust.send(match action {
+                    VouchAction::Vouch  => crate::backend::TrustCmd::Vouch(sel_id.clone()),
+                    VouchAction::Revoke => crate::backend::TrustCmd::Revoke(sel_id.clone()),
+                });
             }
         }
         if close_popup { self.selected = None; }

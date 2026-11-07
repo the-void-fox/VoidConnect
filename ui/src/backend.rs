@@ -202,6 +202,197 @@ impl DnsService {
     }
 }
 
+/// Команда GUI → backend для сети доверия.
+#[derive(Clone, Debug)]
+pub enum TrustCmd {
+    /// Поручиться за узел лично (код безопасности сверён). Публично.
+    Vouch(NodeId),
+    /// Отозвать своё поручительство (или снять локальную отметку).
+    Revoke(NodeId),
+    /// Опубликовать старые локальные отметки «проверен» как поручительства.
+    PublishPrivate,
+}
+
+/// Сеть доверия: подпись своих поручительств, приём чужих (пересылаем дальше
+/// только то, что изменило нашу базу), передача графа новым связям, пересчёт
+/// доверия и наблюдения для уровня «освоившийся». Клонируется дёшево.
+#[derive(Clone)]
+struct TrustService {
+    pool:      void_db::DbPool,
+    chat:      ChatHandle,
+    keypair:   Arc<SigningKeypair>,
+    my_id:     NodeId,
+    /// Снимок доверия для GUI и остальных подсистем.
+    snapshot:  Arc<Mutex<void_trust::TrustMap>>,
+    /// Неопубликованные отметки «проверен» (см. `verify_store`).
+    private:   Arc<Mutex<HashSet<NodeId>>>,
+    /// Баны голосованием (NodeId → ts истечения) — для расчёта это «заблокированные».
+    blocklist: Arc<Mutex<HashMap<NodeId, i64>>>,
+    /// Сигнал «граф изменился — пересчитать».
+    dirty:     Arc<tokio::sync::Notify>,
+}
+
+impl TrustService {
+    fn start(self, peer_list: PeerList, mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<TrustCmd>) {
+        // Команды GUI: свои действия пересчитываем сразу (бейдж меняется без задержки).
+        let svc = self.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    TrustCmd::Vouch(id)     => svc.set_vouch(&id, false).await,
+                    TrustCmd::Revoke(id)    => svc.set_vouch(&id, true).await,
+                    TrustCmd::PublishPrivate => svc.publish_private().await,
+                }
+                svc.recompute().await;
+            }
+        });
+
+        // Входящие поручительства.
+        let svc = self.clone();
+        let mut vouch_rx = self.chat.subscribe_vouches();
+        tokio::spawn(async move {
+            loop {
+                match vouch_rx.recv().await {
+                    Ok(g) => svc.apply_incoming(g).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Поручительства: пропущено {} (переполнение)", n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Новая связь: передаём соседу граф — так новичок узнаёт поручительства,
+        // даже не связанный напрямую с поручителями.
+        let svc = self.clone();
+        let mut link_rx = self.chat.subscribe_links();
+        tokio::spawn(async move {
+            loop {
+                match link_rx.recv().await {
+                    Ok(peer) => svc.sync_to(&peer).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Пересчёт: после изменений графа (с задержкой, чтобы собрать пачку) и раз
+        // в минуту; раз в минуту же отмечаем, кого видим в сети.
+        let svc = self;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => svc.note_online(&peer_list).await,
+                    _ = svc.dirty.notified() => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+                svc.recompute().await;
+            }
+        });
+    }
+
+    /// Ставит (или отзывает) наше личное поручительство за `subject` и рассылает его.
+    async fn set_vouch(&self, subject: &NodeId, revoked: bool) {
+        if *subject == self.my_id || !void_core::sanitize::is_hex64(subject.as_str()) {
+            return;
+        }
+        // Отметка больше не «только у меня»: она опубликована либо снята.
+        self.forget_private(subject);
+        let prev = void_trust::store::get_vouch(&self.pool, &self.my_id, subject).await.ok().flatten();
+        if revoked && prev.as_ref().is_none_or(|p| p.revoked) {
+            return; // отзывать нечего
+        }
+        let updated_at = chrono::Utc::now().timestamp_millis()
+            .max(prev.map(|p| p.updated_at + 1).unwrap_or(0));
+        let vouch = void_trust::Vouch {
+            voucher: self.my_id.clone(),
+            subject: subject.clone(),
+            kind: void_trust::VouchKind::Personal,
+            updated_at,
+            revoked,
+        };
+        let signed = match vouch.sign(&self.keypair) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("Поручительство не подписано: {}", e); return; }
+        };
+        match void_trust::store::apply_signed(&self.pool, &signed).await {
+            Ok(Some(_)) => {
+                tracing::info!("{} поручительство за {}", if revoked { "Отозвано" } else { "Выдано" }, subject);
+                self.chat.relay_vouch(signed, None).await;
+            }
+            Ok(None) => tracing::warn!("Поручительство за {} не сохранено (лимит)", subject),
+            Err(e) => tracing::warn!("Поручительство за {}: {}", subject, e),
+        }
+    }
+
+    /// Публикует старые локальные отметки «проверен».
+    async fn publish_private(&self) {
+        let ids: Vec<NodeId> = self.private.lock().unwrap().iter().cloned().collect();
+        for id in ids {
+            self.set_vouch(&id, false).await;
+        }
+    }
+
+    fn forget_private(&self, id: &NodeId) {
+        let mut private = self.private.lock().unwrap();
+        if private.remove(id) {
+            crate::verify_store::save_verified(&private.iter().map(|n| n.as_str().to_string()).collect());
+        }
+    }
+
+    /// Чужое поручительство: в базу, и дальше — только если что-то изменилось.
+    async fn apply_incoming(&self, g: void_chat::public_chat::VouchGossip) {
+        match void_trust::store::apply_signed(&self.pool, &g.signed).await {
+            Ok(Some(_)) => {
+                self.chat.relay_vouch(g.signed, Some(&g.from)).await;
+                self.dirty.notify_one();
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("Поручительство от {} отклонено: {}", g.from, e),
+        }
+    }
+
+    async fn sync_to(&self, peer: &NodeId) {
+        match void_trust::store::signed_vouches(&self.pool).await {
+            Ok(all) if !all.is_empty() => self.chat.push_vouches(peer, all).await,
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Граф доверия не прочитан: {}", e),
+        }
+    }
+
+    async fn note_online(&self, peer_list: &PeerList) {
+        let now = chrono::Utc::now().timestamp();
+        for p in peer_list.all().await {
+            if void_core::sanitize::is_hex64(p.id.as_str()) {
+                let _ = void_trust::store::note_seen(&self.pool, &p.id, now).await;
+            }
+        }
+    }
+
+    async fn recompute(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let vouches = void_trust::store::load_vouches(&self.pool).await.unwrap_or_default();
+        let settled = void_trust::store::settled(&self.pool, now).await.unwrap_or_default();
+        let blocked: HashSet<NodeId> = self.blocklist.lock().unwrap().iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let private = self.private.lock().unwrap().clone();
+        let reported = HashSet::new(); // жалобы с весом доверия — фаза 5
+        let map = void_trust::compute(&void_trust::TrustInputs {
+            me: &self.my_id,
+            vouches: &vouches,
+            blocked: &blocked,
+            reported: &reported,
+            settled: &settled,
+            private_verified: &private,
+        });
+        *self.snapshot.lock().unwrap() = map;
+    }
+}
+
 /// Команда GUI → backend для зеркалирования (кэширования) чужого сайта.
 #[derive(Clone, Debug)]
 pub enum MirrorCmd {
@@ -394,6 +585,12 @@ pub struct BackendHandle {
     /// сообщивших пиров. `None` — данных нет (нет пиров или gossip ещё не пришёл).
     /// Обновляется периодически из входящего reputation-gossip, НЕ по запросу из UI.
     pub my_reputation: Arc<Mutex<Option<(f64, usize)>>>,
+    /// Снимок доверия к узлам (сеть доверия, от лица нашего узла).
+    pub trust: Arc<Mutex<void_trust::TrustMap>>,
+    /// Неопубликованные отметки «проверен» (старые локальные).
+    pub private_verified: Arc<Mutex<HashSet<NodeId>>>,
+    /// Команды сети доверия: поручиться / отозвать / опубликовать старые отметки.
+    pub trust_tx: tokio::sync::mpsc::UnboundedSender<TrustCmd>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -498,6 +695,13 @@ pub fn start_backend(
     // Наша репутация глазами пиров (заполняется из входящего gossip).
     let my_reputation: Arc<Mutex<Option<(f64, usize)>>> = Arc::new(Mutex::new(None));
     let my_reputation_bg = Arc::clone(&my_reputation);
+    let trust: Arc<Mutex<void_trust::TrustMap>> = Arc::new(Mutex::new(void_trust::TrustMap::default()));
+    let trust_bg = Arc::clone(&trust);
+    let private_verified: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(
+        crate::verify_store::load_verified().into_iter().map(NodeId).collect(),
+    ));
+    let private_bg = Arc::clone(&private_verified);
+    let (trust_tx, trust_rx) = tokio::sync::mpsc::unbounded_channel::<TrustCmd>();
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -521,6 +725,7 @@ pub fn start_backend(
                 propose_rx, vote_cast_rx, proposals_bg,
                 blocklist_bg, voted_channels_bg, my_score_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg, my_reputation_bg,
+                trust_bg, private_bg, trust_rx,
             ).await;
         });
     });
@@ -569,6 +774,9 @@ pub fn start_backend(
         bytes_uploaded,
         bytes_downloaded,
         my_reputation,
+        trust,
+        private_verified,
+        trust_tx,
     }
 }
 
@@ -616,6 +824,9 @@ async fn backend_main(
     bytes_uploaded: Arc<AtomicU64>,
     bytes_downloaded: Arc<AtomicU64>,
     my_reputation_out: Arc<Mutex<Option<(f64, usize)>>>,
+    trust_out: Arc<Mutex<void_trust::TrustMap>>,
+    private_out: Arc<Mutex<HashSet<NodeId>>>,
+    trust_rx: tokio::sync::mpsc::UnboundedReceiver<TrustCmd>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -793,6 +1004,7 @@ async fn backend_main(
     let vote_kp = sign_kp.clone();
     let site_kp = sign_kp.clone();
     let storage_kp = sign_kp.clone(); // подпись манифестов публикуемых файлов
+    let trust_kp = sign_kp.clone();   // подпись поручительств
     let chat = match start_public_chat(
         my_peer.clone(), peer_list.clone(), my_peer.chat_port, sign_kp,
         Some(rate_limiter.clone()),
@@ -827,6 +1039,22 @@ async fn backend_main(
     };
     dns.load().await;
     dns.refresh().await;
+
+    // ── Сеть доверия ──────────────────────────────────────────────────────────
+    // Без БД (поручительства хранятся в ней) команды GUI просто не исполняются.
+    if let Some(pool) = db_pool.clone() {
+        TrustService {
+            pool,
+            chat:      chat.clone(),
+            keypair:   trust_kp,
+            my_id:     my_peer.id.clone(),
+            snapshot:  trust_out,
+            private:   private_out,
+            blocklist: Arc::clone(&blocklist_out),
+            dirty:     Arc::new(tokio::sync::Notify::new()),
+        }
+        .start(peer_list.clone(), trust_rx);
+    }
     // Задача: входящие DNS-записи из сети → проверяем подпись и применяем.
     {
         let dns_in = dns.clone();
@@ -885,13 +1113,21 @@ async fn backend_main(
     let inbox_task = Arc::clone(&inbox);
     let pool_for_save = db_pool.clone();
     let chat_blocklist = Arc::clone(&blocklist_out);
+    let chat_my_id = my_peer.id.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(msg) => {
                     // Узлы, забаненные голосованием, не показываем и не сохраняем.
-                    if is_banned(&chat_blocklist, &msg.from, chrono::Utc::now().timestamp()) {
+                    let now = chrono::Utc::now().timestamp();
+                    if is_banned(&chat_blocklist, &msg.from, now) {
                         continue;
+                    }
+                    // Наблюдение для уровня «освоившийся»: «живое» чужое сообщение.
+                    if let Some(pool) = &pool_for_save {
+                        if msg.from != chat_my_id && (now - msg.timestamp).abs() <= 120 {
+                            let _ = void_trust::store::note_live_message(pool, &msg.from, now).await;
+                        }
                     }
                     // Сохраняем в БД (best-effort, дедуп по message_id внутри INSERT OR IGNORE)
                     if let Some(pool) = &pool_for_save {

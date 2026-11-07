@@ -4998,6 +4998,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -5005,8 +5006,10 @@ dependencies = [
  "void-chat",
  "void-core",
  "void-crypto",
+ "void-db",
  "void-discovery",
  "void-network",
+ "void-trust",
 ]
 
 [[package]]
@@ -5187,6 +5190,7 @@ dependencies = [
  "void-network",
  "void-reputation",
  "void-storage",
+ "void-trust",
  "void-vote",
  "void-web",
 ]

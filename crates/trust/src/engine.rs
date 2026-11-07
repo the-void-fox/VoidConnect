@@ -87,6 +87,9 @@ pub struct TrustInputs<'a> {
     pub reported: &'a HashSet<NodeId>,
     /// Освоившиеся «по поведению» (мой узел видел их активными достаточно долго).
     pub settled: &'a HashSet<NodeId>,
+    /// Мои неопубликованные отметки «проверен» (старые локальные отметки, которые
+    /// пользователь решил не публиковать): для меня — как личное поручительство.
+    pub private_verified: &'a HashSet<NodeId>,
 }
 
 /// Результат расчёта: доверие ко всем узлам, о которых что-то известно.
@@ -178,19 +181,23 @@ pub fn compute(inputs: &TrustInputs) -> TrustMap {
     // Слой 1: мои поручительства. Личное — полное доверие; моё приветствие
     // новичка — уровень «освоившийся» (это моё же слабое решение).
     let mut frontier: Vec<NodeId> = Vec::new();
-    for (subject, kind) in edges.get(me).into_iter().flatten() {
+    let private = inputs.private_verified.iter().map(|s| (s, VouchKind::Personal));
+    for (subject, kind) in edges.get(me).into_iter().flatten().copied().chain(private) {
         if excluded(subject) {
+            continue;
+        }
+        if subject == me || verified.contains(subject) {
             continue;
         }
         match kind {
             VouchKind::Personal => {
-                trust.insert((*subject).clone(), 1.0);
-                depth_of.insert((*subject).clone(), 1);
-                verified.insert((*subject).clone());
-                frontier.push((*subject).clone());
+                trust.insert(subject.clone(), 1.0);
+                depth_of.insert(subject.clone(), 1);
+                verified.insert(subject.clone());
+                frontier.push(subject.clone());
             }
             VouchKind::Greeter => {
-                greeted_by_me.insert((*subject).clone());
+                greeted_by_me.insert(subject.clone());
             }
         }
     }
@@ -274,6 +281,10 @@ mod tests {
     }
 
     fn run_with(vouches: &[Vouch], blocked: &[u32], reported: &[u32], settled: &[u32]) -> TrustMap {
+        run_full(vouches, blocked, reported, settled, &[])
+    }
+
+    fn run_full(vouches: &[Vouch], blocked: &[u32], reported: &[u32], settled: &[u32], private: &[u32]) -> TrustMap {
         let set = |xs: &[u32]| xs.iter().map(|i| n(*i)).collect::<HashSet<_>>();
         compute(&TrustInputs {
             me: &n(0),
@@ -281,6 +292,7 @@ mod tests {
             blocked: &set(blocked),
             reported: &set(reported),
             settled: &set(settled),
+            private_verified: &set(private),
         })
     }
 
@@ -434,5 +446,14 @@ mod tests {
         let t = m.get(&n(100)).weight;
         assert!(approx(t, 0.5 * GREETER_WEIGHT / 10.0));
         assert_eq!(m.level(&n(100)), TrustLevel::Settled);
+    }
+
+    /// Неопубликованная отметка «проверен» работает для меня как личное
+    /// поручительство (и доверие от неё течёт дальше по графу).
+    #[test]
+    fn private_mark_counts_as_personal_for_me() {
+        let m = run_full(&[v(1, 2)], &[], &[], &[], &[1]);
+        assert_eq!(m.level(&n(1)), TrustLevel::Verified);
+        assert!(approx(m.get(&n(2)).weight, 0.5));
     }
 }

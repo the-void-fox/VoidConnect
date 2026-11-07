@@ -23,6 +23,7 @@ void-storage   = { path = "../crates/storage" }
 void-reputation = { path = "../crates/reputation" }
 void-vote      = { path = "../crates/vote" }
 void-web       = { path = "../crates/web" }
+void-trust     = { path = "../crates/trust" }
 
 tokio              = { workspace = true }
 tracing            = { workspace = true }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use eframe::egui;
 use void_core::identity::NodeId;
@@ -25,8 +25,8 @@ pub struct Graph {
     pub blocklist: Option<Arc<Mutex<HashMap<NodeId, i64>>>>,
     /// Сигнал в VoidApp: пожаловаться на узел (target, причина).
     pub pending_report: Option<(NodeId, void_reputation::ReportReason)>,
-    /// Локальный список проверенных контактов (NodeId hex) — общий с chat/app.
-    pub verified: Option<Arc<Mutex<HashSet<String>>>>,
+    /// Сеть доверия: уровни узлов и команды «поручиться/отозвать».
+    pub trust: Option<crate::trust_ui::TrustUi>,
 }
 
 impl Graph {
@@ -36,7 +36,7 @@ impl Graph {
             peers: Vec::new(), profiles: HashMap::new(), avatar_tex: HashMap::new(),
             selected: None, pending_dm: None, reputation: None,
             reports: None, blocklist: None, pending_report: None,
-            verified: None,
+            trust: None,
         }
     }
 
@@ -59,25 +59,6 @@ impl Graph {
         self.blocklist.as_ref()
             .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
             .is_some_and(|until| until > now)
-    }
-
-    /// Проверен ли контакт (safety number сверён вручную).
-    fn is_verified(&self, id: &NodeId) -> bool {
-        self.verified.as_ref()
-            .and_then(|m| m.lock().ok().map(|set| set.contains(id.as_str())))
-            .unwrap_or(false)
-    }
-
-    /// Переключает отметку «проверен» и сохраняет на диск.
-    fn toggle_verified(&mut self, id: &NodeId) {
-        if let Some(shared) = &self.verified {
-            if let Ok(mut set) = shared.lock() {
-                if !set.remove(id.as_str()) {
-                    set.insert(id.as_str().to_string());
-                }
-                crate::verify_store::save_verified(&set);
-            }
-        }
     }
 
     pub fn update_peers(&mut self, peers: Vec<PeerInfo>, profiles: HashMap<NodeId, PeerProfile>) {
@@ -143,7 +124,7 @@ impl Graph {
         let mut close_popup = false;
         let mut start_dm_id: Option<NodeId> = None;
         let mut report_reason: Option<void_reputation::ReportReason> = None;
-        let mut do_toggle_verify = false;
+        let mut vouch_action: Option<crate::widgets::peer_popup::VouchAction> = None;
         if let Some(sel_id) = self.selected.clone() {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
@@ -158,10 +139,10 @@ impl Graph {
                         let rep = self.peer_score(&sel_id);
                         let reports = self.peer_reports(&sel_id);
                         let banned = self.is_banned(&sel_id);
-                        let verified = self.is_verified(&sel_id);
+                        let trust = self.trust.as_ref().map(|t| t.view(&sel_id, &self.profiles));
                         let action = show_peer_profile(
                             ui, Some(&peer), profile.as_ref(), rep, &reports, banned,
-                            self.my_id.as_str(), verified,
+                            self.my_id.as_str(), trust.as_ref(),
                         );
                         ui.add_space(6.0);
                         if action.start_dm {
@@ -172,8 +153,8 @@ impl Graph {
                             report_reason = Some(reason);
                             close_popup = true;
                         }
-                        if action.toggle_verify {
-                            do_toggle_verify = true;
+                        if action.vouch.is_some() {
+                            vouch_action = action.vouch; // не закрываем попап — видно смену бейджа
                         }
                         if ui.button("Закрыть").clicked() {
                             close_popup = true;
@@ -185,8 +166,12 @@ impl Graph {
             if let Some(reason) = report_reason {
                 self.pending_report = Some((sel_id.clone(), reason));
             }
-            if do_toggle_verify {
-                self.toggle_verified(&sel_id);
+            if let (Some(action), Some(trust)) = (vouch_action, &self.trust) {
+                use crate::widgets::peer_popup::VouchAction;
+                trust.send(match action {
+                    VouchAction::Vouch  => crate::backend::TrustCmd::Vouch(sel_id.clone()),
+                    VouchAction::Revoke => crate::backend::TrustCmd::Revoke(sel_id.clone()),
+                });
             }
         }
         if close_popup { self.selected = None; }
@@ -223,14 +208,14 @@ impl Graph {
 
             painter.line_segment(
                 [center, pos],
-                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 120, 180, 120)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(100, 120, 180, 120)),
             );
 
             let profile = self.profiles.get(&peer.id);
             let (fill, stroke_col) = status_colors(profile.map(|p| p.status.as_str()));
 
             let is_selected = self.selected.as_ref() == Some(&peer.id);
-            let stroke_w = if is_selected { 2.5 } else { 1.0 };
+            let stroke_w: f32 = if is_selected { 2.5 } else { 1.0 };
 
             let circle_rect = egui::Rect::from_center_size(pos, egui::Vec2::splat(36.0));
             let resp = ui.allocate_rect(circle_rect, egui::Sense::click());
@@ -250,7 +235,7 @@ impl Graph {
             painter.circle_stroke(pos, 18.0, egui::Stroke::new(stroke_w, stroke_col));
 
             if resp.hovered() {
-                painter.circle_stroke(pos, 20.0, egui::Stroke::new(1.0,
+                painter.circle_stroke(pos, 20.0, egui::Stroke::new(1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)));
             }
             if resp.clicked() {
@@ -277,7 +262,7 @@ impl Graph {
                 self.my_name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or("?".into()),
                 egui::FontId::proportional(18.0), egui::Color32::WHITE);
         }
-        painter.circle_stroke(center, 24.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 140, 255)));
+        painter.circle_stroke(center, 24.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 140, 255)));
         painter.text(center + egui::Vec2::new(0.0, 32.0), egui::Align2::CENTER_CENTER,
             &format!("{} (я)", self.my_name),
             egui::FontId::proportional(11.0), egui::Color32::from_gray(200));

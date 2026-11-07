@@ -8,6 +8,7 @@ mod profile_store;
 mod private_store;
 mod settings_store;
 mod sys_open;
+mod trust_ui;
 mod verify_store;
 mod vote_service;
 mod widgets;
