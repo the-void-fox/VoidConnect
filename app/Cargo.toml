@@ -28,4 +28,7 @@ void-network   = { path = "../crates/network" }
 void-crypto    = { path = "../crates/crypto" }
 void-chat      = { path = "../crates/chat" }
 void-discovery = { path = "../crates/discovery" }
+void-trust     = { path = "../crates/trust" }
+void-db        = { path = "../crates/db" }
 tokio          = { workspace = true }
+tempfile       = { workspace = true }

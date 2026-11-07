@@ -119,6 +119,10 @@ pub enum ChatPacket {
     /// Дайджест для anti-entropy: `(proposal_id, votes_hash)` по открытым
     /// предложениям. Получатель до-рассылает то, чего у отправителя нет.
     VoteDigest { items: Vec<(String, String)> },
+    /// Подписанное поручительство (voucher = signed.signer). Чат его не
+    /// пересылает сам: дальше его отправляет backend, если запись изменила его
+    /// базу — иначе на каждой новой связи весь граф заново обходил бы сеть.
+    Vouch { signed: SignedMessage },
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -175,6 +179,14 @@ pub enum VoteGossip {
     /// Дайджест соседа `(proposal_id, votes_hash)` — backend сравнит со своим
     /// и до-рассылает недостающее (anti-entropy union).
     Digest(Vec<(String, String)>),
+}
+
+/// Входящее поручительство и сосед, от которого оно пришло (backend решает,
+/// пересылать ли его дальше, и не отправляет его обратно источнику).
+#[derive(Debug, Clone)]
+pub struct VouchGossip {
+    pub signed: SignedMessage,
+    pub from: NodeId,
 }
 
 // ─── Состояние ───────────────────────────────────────────────────────────────
@@ -237,6 +249,10 @@ struct PublicChatInner {
     dns_tx:      broadcast::Sender<SignedMessage>,
     /// Входящие предложения/голоса → backend (он проверяет подпись и считает)
     vote_tx:     broadcast::Sender<VoteGossip>,
+    /// Входящие поручительства → backend (он проверяет и решает о пересылке)
+    vouch_tx:    broadcast::Sender<VouchGossip>,
+    /// Новая связь с соседом → backend (передать ему свои данные, например граф доверия)
+    link_tx:     broadcast::Sender<NodeId>,
     /// Ограничитель частоты пакетов (флуд-защита на релее). None = выключен.
     rate_limiter: Option<RateLimiter>,
     /// Сигнал backend'у: узел превысил лимит (→ спам-страйк репутации).
@@ -268,6 +284,8 @@ impl PublicChat {
         let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (vote_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
+        let (vouch_tx, _)    = broadcast::channel(4 * BROADCAST_BUFFER);
+        let (link_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (spam_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let noise = NoiseIdentity::new(&signing_kp);
         PublicChat {
@@ -290,6 +308,8 @@ impl PublicChat {
                 rep_tx,
                 dns_tx,
                 vote_tx,
+                vouch_tx,
+                link_tx,
                 rate_limiter,
                 spam_tx,
                 link_seq:    AtomicU64::new(0),
@@ -742,6 +762,35 @@ impl PublicChat {
         let _ = self.inner.dns_tx.send(signed.clone());
         self.forward(ChatPacket::DnsAnnounce { signed }, src).await;
     }
+
+    // ─── Сеть доверия (поручительства) ────────────────────────────────────────
+
+    /// Входящее поручительство: дубликаты гасим, остальное отдаём backend'у.
+    async fn handle_vouch(&self, signed: SignedMessage, from: &NodeId) {
+        if !self.first_seen_gossip(&signed).await || signed.verify().is_err() {
+            return;
+        }
+        let _ = self.inner.vouch_tx.send(VouchGossip { signed, from: from.clone() });
+    }
+
+    /// Рассылает поручительство соседям, кроме `except` (своё — `None`).
+    pub async fn relay_vouch(&self, signed: SignedMessage, except: Option<&NodeId>) {
+        self.first_seen_gossip(&signed).await;
+        self.forward(ChatPacket::Vouch { signed }, except).await;
+    }
+
+    /// Отправляет поручительства одному соседу (например, при новой связи).
+    /// Через очередь связи с ожиданием места — граф может быть большим.
+    pub async fn push_vouches(&self, peer: &NodeId, vouches: Vec<SignedMessage>) {
+        let Some(tx) = self.inner.links.lock().await.get(peer).map(|l| l.tx.clone()) else { return };
+        tokio::spawn(async move {
+            for signed in vouches {
+                if tx.send(ChatPacket::Vouch { signed }).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 }
 
 // ─── Запуск ──────────────────────────────────────────────────────────────────
@@ -902,6 +951,7 @@ async fn run_link(
         "Связь с {} ({}) установлена ({})",
         name, short(&peer_id), if initiated_by_me { "исходящая" } else { "входящая" }
     );
+    let _ = chat.inner.link_tx.send(peer_id.clone());
 
     let (mut rd, mut wr) = tokio::io::split(stream);
 
@@ -1040,6 +1090,7 @@ async fn read_loop<R: AsyncReadExt + Unpin>(
             ChatPacket::VoteDigest { items } => {
                 chat.handle_vote_gossip(VoteGossip::Digest(items), src).await
             }
+            ChatPacket::Vouch { signed } => chat.handle_vouch(signed, &peer).await,
             ChatPacket::Ping => {
                 let _ = tx.try_send(ChatPacket::Pong);
             }
@@ -1165,7 +1216,8 @@ fn gossip_signature(pkt: &ChatPacket) -> Option<&SignedMessage> {
         | ChatPacket::DnsAnnounce { signed }
         | ChatPacket::ProposalAnnounce { signed }
         | ChatPacket::VoteAnnounce { signed }
-        | ChatPacket::SiteRevoke { signed } => Some(signed),
+        | ChatPacket::SiteRevoke { signed }
+        | ChatPacket::Vouch { signed } => Some(signed),
         _ => None,
     }
 }
@@ -1487,6 +1539,16 @@ impl ChatHandle {
     pub async fn announce_proposal(&self, signed: SignedMessage) { self.chat.announce_proposal(signed).await }
     pub async fn announce_vote(&self, signed: SignedMessage) { self.chat.announce_vote(signed).await }
     pub async fn announce_vote_digest(&self, items: Vec<(String, String)>) { self.chat.announce_vote_digest(items).await }
+    /// Входящие поручительства (с соседом-источником).
+    pub fn subscribe_vouches(&self) -> broadcast::Receiver<VouchGossip> { self.chat.inner.vouch_tx.subscribe() }
+    /// Новые связи с соседями.
+    pub fn subscribe_links(&self) -> broadcast::Receiver<NodeId> { self.chat.inner.link_tx.subscribe() }
+    pub async fn relay_vouch(&self, signed: SignedMessage, except: Option<&NodeId>) {
+        self.chat.relay_vouch(signed, except).await
+    }
+    pub async fn push_vouches(&self, peer: &NodeId, vouches: Vec<SignedMessage>) {
+        self.chat.push_vouches(peer, vouches).await
+    }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -2557,5 +2619,38 @@ mod tests {
         let mut dns_c = node_c.subscribe_dns();
         let got = timeout(Duration::from_secs(10), dns_c.recv()).await;
         assert!(matches!(got, Ok(Ok(ref s)) if s.signature == signed.signature), "новичок не узнал имя: {got:?}");
+    }
+
+    /// Новая связь сигналит backend'у; поручительство доходит до соседа с
+    /// указанием источника; push_vouches отправляет записи конкретному соседу.
+    #[tokio::test]
+    async fn vouches_reach_neighbor_with_source() {
+        let (ka, a) = mesh_peer(1);
+        let (kb, b) = mesh_peer(2);
+        let node_b = start_mesh_node(kb, &b, &[]).await;
+        let mut links_b = node_b.subscribe_links();
+        let mut vouches_b = node_b.subscribe_vouches();
+        let node_a = start_mesh_node(ka.clone(), &a, &[&b]).await;
+
+        let linked = timeout(Duration::from_secs(10), links_b.recv()).await;
+        assert!(matches!(linked, Ok(Ok(ref id)) if *id == a.id), "B узнал о связи с A: {linked:?}");
+        // У A связь регистрируется чуть позже (он дочитывает Hello от B).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while node_a.link_count().await == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "у A нет связи");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let rec1 = SignedMessage::sign(b"vouch-1".to_vec(), &ka).unwrap();
+        node_a.relay_vouch(rec1.clone(), None).await;
+        let got = timeout(Duration::from_secs(5), vouches_b.recv()).await.unwrap().unwrap();
+        assert_eq!(got.signed.signature, rec1.signature);
+        assert_eq!(got.from, a.id, "источник — сосед A");
+
+        let rec2 = SignedMessage::sign(b"vouch-2".to_vec(), &ka).unwrap();
+        node_a.push_vouches(&b.id, vec![rec2.clone(), rec1.clone()]).await;
+        let got = timeout(Duration::from_secs(5), vouches_b.recv()).await.unwrap().unwrap();
+        assert_eq!(got.signed.signature, rec2.signature, "дубликат rec1 погашен, rec2 дошёл");
+        assert!(timeout(Duration::from_millis(300), vouches_b.recv()).await.is_err());
     }
 }

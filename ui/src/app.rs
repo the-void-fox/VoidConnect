@@ -80,6 +80,8 @@ pub struct VoidApp {
     pw_confirm:       String,
     /// Результат последней операции с паролем: (это_ошибка, текст).
     pw_msg:           Option<(bool, String)>,
+    /// Один раз спросить, публиковать ли старые локальные отметки «проверен».
+    trust_prompt:     bool,
 }
 
 impl VoidApp {
@@ -93,9 +95,15 @@ impl VoidApp {
         chat.reports = Some(std::sync::Arc::clone(&backend.reports));
         chat.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
         chat.voted_channels = Some(std::sync::Arc::clone(&backend.voted_channels));
-        // Локальный список проверенных контактов (общий для chat и graph).
-        let verified = std::sync::Arc::new(std::sync::Mutex::new(crate::verify_store::load_verified()));
-        chat.verified = Some(std::sync::Arc::clone(&verified));
+        // Сеть доверия (общая для chat и graph).
+        let trust = crate::trust_ui::TrustUi {
+            map:     std::sync::Arc::clone(&backend.trust),
+            private: std::sync::Arc::clone(&backend.private_verified),
+            tx:      backend.trust_tx.clone(),
+        };
+        chat.trust = Some(trust.clone());
+        let trust_prompt = !backend.private_verified.lock().unwrap().is_empty()
+            && !crate::verify_store::migration_asked();
         chat.my_id_hex = backend.my_id_full.clone();
 
         // Load saved profile values (description, status) for the profile page
@@ -121,7 +129,7 @@ impl VoidApp {
         graph.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
         graph.reports = Some(std::sync::Arc::clone(&backend.reports));
         graph.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
-        graph.verified = Some(std::sync::Arc::clone(&verified));
+        graph.trust = Some(trust);
 
         // Инициализируем страницу личных сообщений
         let mut private = PrivatePage::default();
@@ -181,6 +189,7 @@ impl VoidApp {
             pw_new: String::new(),
             pw_confirm: String::new(),
             pw_msg: None,
+            trust_prompt,
             show_settings: false,
             show_about: false,
             show_docs: false,
@@ -544,6 +553,7 @@ impl VoidApp {
     // ── Окна из меню ──────────────────────────────────────────────────────────
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        self.show_trust_prompt(ctx);
         self.show_settings_window(ctx);
         self.show_about_window(ctx);
         self.show_docs_window(ctx);
@@ -551,6 +561,62 @@ impl VoidApp {
 
     /// Окно настроек: публичный режим, bootstrap-узлы, базовый порт.
     /// Значения сохраняются в settings.json и применяются при следующем запуске.
+    /// Один раз после обновления: раньше отметки «проверен» были только
+    /// локальными, теперь «проверен» — публичное поручительство. Спрашиваем,
+    /// публиковать ли старые отметки; если нет — они остаются только у нас.
+    fn show_trust_prompt(&mut self, ctx: &egui::Context) {
+        if !self.trust_prompt {
+            return;
+        }
+        let count = self.backend.private_verified.lock().unwrap().len();
+        let mut answer: Option<bool> = None;
+        egui::Window::new("Проверенные контакты")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([400.0, 0.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("У вас {count} контакт(ов), отмеченных проверенными."));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Теперь отметка «проверен» — это публичное поручительство: его видят \
+                         другие узлы, и ваше доверие к контакту помогает доверию к нему у ваших \
+                         знакомых (сеть доверия). Раньше отметки были видны только вам.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Если не публиковать, отметки продолжат работать только для вас; \
+                         опубликовать любую можно позже в профиле контакта.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Оставить только у меня").clicked() {
+                        answer = Some(false);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Опубликовать").clicked() {
+                            answer = Some(true);
+                        }
+                    });
+                });
+            });
+        if let Some(publish) = answer {
+            if publish {
+                let _ = self.backend.trust_tx.send(crate::backend::TrustCmd::PublishPrivate);
+            }
+            crate::verify_store::mark_migration_asked();
+            self.trust_prompt = false;
+        }
+    }
+
     fn show_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         egui::Window::new("\u{F0493}  Настройки")
