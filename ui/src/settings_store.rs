@@ -23,6 +23,8 @@ pub struct Settings {
     pub base_port: u16,
     /// Сворачивать в чате сообщения незнакомцев (их всё равно можно раскрыть).
     pub fold_strangers: bool,
+    /// Роль встречающего: кнопка «Поприветствовать» у незнакомцев.
+    pub greeter: bool,
 }
 
 impl Default for Settings {
@@ -32,6 +34,7 @@ impl Default for Settings {
             bootstrap_nodes: Vec::new(),
             base_port:       DEFAULT_BASE_PORT,
             fold_strangers:  false,
+            greeter:         false,
         }
     }
 }

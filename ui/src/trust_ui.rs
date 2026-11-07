@@ -2,14 +2,16 @@
 //! команды «поручиться / отозвать / заблокировать».
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 use void_core::identity::NodeId;
 use void_core::peer::PeerProfile;
+use void_trust::store::Activity;
 use void_trust::{TrustInfo, TrustMap};
 
-use crate::backend::TrustCmd;
+use crate::backend::{TrustCmd, TrustDetails};
 
 /// Доступ к снимку доверия backend (общий для страниц).
 #[derive(Clone)]
@@ -19,6 +21,10 @@ pub struct TrustUi {
     pub private: Arc<Mutex<HashSet<NodeId>>>,
     /// Доступ к личке (в нём — заблокированные мной).
     pub access: Arc<Mutex<crate::dm_access::DmAccess>>,
+    /// Мои приветствия и наблюдения за узлами.
+    pub details: Arc<Mutex<TrustDetails>>,
+    /// Включена роль встречающего (настройка).
+    pub greeter: Arc<AtomicBool>,
     pub tx: UnboundedSender<TrustCmd>,
 }
 
@@ -31,6 +37,12 @@ pub struct TrustView {
     pub private_mark: bool,
     /// Заблокирован мной.
     pub blocked_by_me: bool,
+    /// Я его поприветствовал (как встречающий).
+    pub greeted_by_me: bool,
+    /// Что мой узел видел за ним (для «когда освоится»).
+    pub activity: Option<Activity>,
+    /// Включена роль встречающего — показывать «Поприветствовать».
+    pub greeter_mode: bool,
 }
 
 impl TrustUi {
@@ -52,7 +64,17 @@ impl TrustUi {
                     .unwrap_or_else(|| format!("{}…", &v.as_str()[..8.min(v.as_str().len())]))
             })
             .collect();
-        TrustView { info, via_names, private_mark, blocked_by_me }
+        let (greeted_by_me, activity) = self.details.lock()
+            .map(|d| (d.greeted.contains(id), d.activity.get(id).copied()))
+            .unwrap_or_default();
+        TrustView {
+            info, via_names, private_mark, blocked_by_me, greeted_by_me, activity,
+            greeter_mode: self.is_greeter(),
+        }
+    }
+
+    pub fn is_greeter(&self) -> bool {
+        self.greeter.load(Ordering::Relaxed)
     }
 
     pub fn send(&self, cmd: TrustCmd) {
