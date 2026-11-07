@@ -319,6 +319,27 @@ pub async fn add_report(
     Ok(id)
 }
 
+/// Есть ли уже жалоба с этой подписью (повтор по сети не дублируем).
+pub async fn report_exists(pool: &DbPool, signature: &str) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reputation_reports WHERE signature = ?")
+        .bind(signature)
+        .fetch_one(pool)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Пары (цель, заявитель) жалоб, полученных не раньше `since` (ISO-8601, как
+/// `created_at`). Несколько жалоб одного заявителя на одну цель — одна пара.
+pub async fn recent_report_pairs(pool: &DbPool, since: &str) -> Result<Vec<(String, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT target_key, reporter_key FROM reputation_reports WHERE created_at >= ?",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Одна жалоба на узел (для отображения списка в UI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportRow {

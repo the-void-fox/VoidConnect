@@ -19,6 +19,6 @@ pub mod error;
 pub mod store;
 pub mod types;
 
-pub use engine::{compute, TrustInfo, TrustInputs, TrustLevel, TrustMap};
+pub use engine::{compute, reported, TrustInfo, TrustInputs, TrustLevel, TrustMap};
 pub use error::TrustError;
 pub use types::{Vouch, VouchKind};

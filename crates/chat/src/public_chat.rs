@@ -108,8 +108,6 @@ pub enum ChatPacket {
     /// Подписанное надгробие сайта: владелец удалил сайт (payload = SiteRevocation,
     /// signer = owner). Получатели стирают сайт и подавляют его воскрешение.
     SiteRevoke { signed: SignedMessage },
-    /// Подписанный снимок репутации от узла `from` (gossip по сети).
-    ReputationSync { from: NodeId, signed: SignedMessage },
     /// Подписанная жалоба на узел (reporter = signed.signer).
     ReputationReport { signed: SignedMessage },
     /// Подписанная DNS-запись зоны `.void` (owner = signed.signer).
@@ -158,16 +156,6 @@ impl ChatMessage {
             timestamp: Utc::now().timestamp(), seq, signature: None,
         }
     }
-}
-
-/// Входящее событие репутации, переданное backend'у (он трактует подпись/payload).
-/// Чат сам в репутацию не лезет — лишь переносит подписанные пакеты.
-#[derive(Debug, Clone)]
-pub enum RepGossip {
-    /// Снимок оценок от узла `from`.
-    Sync { from: NodeId, signed: SignedMessage },
-    /// Жалоба (reporter = signed.signer).
-    Report { signed: SignedMessage },
 }
 
 /// Входящее событие голосований, переданное backend'у (он проверяет подпись и
@@ -245,8 +233,8 @@ struct PublicChatInner {
     site_tombstones: Mutex<HashMap<String, (SiteRevocation, SignedMessage)>>,
     /// Уведомление backend об удалении сайта (он стирает кэш-файлы/реестр)
     site_revoke_tx:  broadcast::Sender<SiteRevocation>,
-    /// Входящие пакеты репутации (sync/жалобы) → backend
-    rep_tx:      broadcast::Sender<RepGossip>,
+    /// Входящие жалобы → backend (он проверяет и считает их вес)
+    report_tx:   broadcast::Sender<SignedMessage>,
     /// Входящие подписанные DNS-записи → backend (он проверяет/применяет)
     dns_tx:      broadcast::Sender<SignedMessage>,
     /// Входящие предложения/голоса → backend (он проверяет подпись и считает)
@@ -288,7 +276,7 @@ impl PublicChat {
         let (manifest_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (site_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (site_revoke_tx, _) = broadcast::channel(BROADCAST_BUFFER);
-        let (rep_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
+        let (report_tx, _)   = broadcast::channel(BROADCAST_BUFFER);
         let (dns_tx, _)      = broadcast::channel(BROADCAST_BUFFER);
         let (vote_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (vouch_tx, _)    = broadcast::channel(4 * BROADCAST_BUFFER);
@@ -312,7 +300,7 @@ impl PublicChat {
                 site_tx,
                 site_tombstones: Mutex::new(HashMap::new()),
                 site_revoke_tx,
-                rep_tx,
+                report_tx,
                 dns_tx,
                 vote_tx,
                 vouch_tx,
@@ -702,16 +690,11 @@ impl PublicChat {
         self.forward(ChatPacket::SiteRevoke { signed }, src).await;
     }
 
-    // ─── Репутация (gossip) ───────────────────────────────────────────────────
+    // ─── Жалобы (gossip) ──────────────────────────────────────────────────────
 
-    /// Подписка backend на входящие пакеты репутации (sync/жалобы).
-    pub fn subscribe_reputation(&self) -> broadcast::Receiver<RepGossip> {
-        self.inner.rep_tx.subscribe()
-    }
-
-    /// Рассылает наш снимок репутации сети.
-    pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
-        self.broadcast_gossip_packet(ChatPacket::ReputationSync { from, signed }).await;
+    /// Подписка backend на входящие жалобы (reporter = signed.signer).
+    pub fn subscribe_reports(&self) -> broadcast::Receiver<SignedMessage> {
+        self.inner.report_tx.subscribe()
     }
 
     /// Рассылает нашу жалобу на узел.
@@ -719,7 +702,7 @@ impl PublicChat {
         self.broadcast_gossip_packet(ChatPacket::ReputationReport { signed }).await;
     }
 
-    /// Рассылает наш подписанный пакет соседям (репутация/голосования). Свои
+    /// Рассылает наш подписанный пакет соседям (жалобы/голосования). Свои
     /// пакеты помечаем виденными — эхо из сети не обработаем повторно.
     async fn broadcast_gossip_packet(&self, pkt: ChatPacket) {
         if let Some(signed) = gossip_signature(&pkt) {
@@ -728,21 +711,19 @@ impl PublicChat {
         self.forward(pkt, None).await;
     }
 
-    /// Обрабатывает входящий пакет репутации: отдаёт backend'у и пересылает
-    /// соседям, кроме источника. Подпись проверяет backend; чат лишь переносит
-    /// (и гасит повторы по подписи).
-    async fn handle_reputation(&self, gossip: RepGossip, src: Option<&NodeId>) {
-        let pkt = match gossip.clone() {
-            RepGossip::Sync { from, signed } => ChatPacket::ReputationSync { from, signed },
-            RepGossip::Report { signed } => ChatPacket::ReputationReport { signed },
-        };
-        if let Some(signed) = gossip_signature(&pkt) {
-            if !self.first_seen_gossip(signed).await {
-                return;
-            }
+    /// Обрабатывает входящую жалобу: отдаёт backend'у и пересылает соседям,
+    /// кроме источника. Смысл жалобы и её вес — в backend; чат гасит повторы
+    /// по подписи и держит лимит частоты по уровню доверия заявителя.
+    async fn handle_report(&self, signed: SignedMessage, src: Option<&NodeId>) {
+        if !self.first_seen_gossip(&signed).await {
+            return;
         }
-        let _ = self.inner.rep_tx.send(gossip);
-        self.forward(pkt, src).await;
+        if src.is_some() && !self.admit_signed(&signed, Kind::Report) {
+            self.unsee_gossip(&signed).await;
+            return;
+        }
+        let _ = self.inner.report_tx.send(signed.clone());
+        self.forward(ChatPacket::ReputationReport { signed }, src).await;
     }
 
     // ─── Голосования (void-vote) ──────────────────────────────────────────────
@@ -1138,12 +1119,7 @@ async fn read_loop<R: AsyncReadExt + Unpin>(
             ChatPacket::FileAnnounce(manifest) => chat.handle_file_announce(manifest, src).await,
             ChatPacket::SiteAnnounce(manifest) => chat.handle_site_announce(manifest, src).await,
             ChatPacket::SiteRevoke { signed } => chat.handle_site_revoke(signed, src).await,
-            ChatPacket::ReputationSync { from, signed } => {
-                chat.handle_reputation(RepGossip::Sync { from, signed }, src).await
-            }
-            ChatPacket::ReputationReport { signed } => {
-                chat.handle_reputation(RepGossip::Report { signed }, src).await
-            }
+            ChatPacket::ReputationReport { signed } => chat.handle_report(signed, src).await,
             ChatPacket::DnsAnnounce { signed } => chat.handle_dns(signed, src).await,
             ChatPacket::ProposalAnnounce { signed } => {
                 chat.handle_vote_gossip(VoteGossip::Proposal(signed), src).await
@@ -1275,8 +1251,7 @@ impl PublicChat {
 /// Подписанное содержимое пакета рассылки (для дедупа по подписи).
 fn gossip_signature(pkt: &ChatPacket) -> Option<&SignedMessage> {
     match pkt {
-        ChatPacket::ReputationSync { signed, .. }
-        | ChatPacket::ReputationReport { signed }
+        ChatPacket::ReputationReport { signed }
         | ChatPacket::DnsAnnounce { signed }
         | ChatPacket::ProposalAnnounce { signed }
         | ChatPacket::VoteAnnounce { signed }
@@ -1606,10 +1581,7 @@ impl ChatHandle {
     pub async fn get_sites(&self) -> Vec<SiteManifest> { self.chat.get_sites().await }
     pub async fn announce_site_revoke(&self, signed: SignedMessage) { self.chat.announce_site_revoke(signed).await }
     pub fn subscribe_site_revokes(&self) -> broadcast::Receiver<SiteRevocation> { self.chat.subscribe_site_revokes() }
-    pub fn subscribe_reputation(&self) -> broadcast::Receiver<RepGossip> { self.chat.subscribe_reputation() }
-    pub async fn broadcast_reputation_sync(&self, from: NodeId, signed: SignedMessage) {
-        self.chat.broadcast_reputation_sync(from, signed).await
-    }
+    pub fn subscribe_reports(&self) -> broadcast::Receiver<SignedMessage> { self.chat.subscribe_reports() }
     pub async fn broadcast_report(&self, signed: SignedMessage) { self.chat.broadcast_report(signed).await }
     pub async fn announce_dns(&self, signed: SignedMessage) { self.chat.announce_dns(signed).await }
     pub fn subscribe_dns(&self) -> broadcast::Receiver<SignedMessage> { self.chat.subscribe_dns() }

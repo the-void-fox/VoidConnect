@@ -31,10 +31,8 @@ pub struct ProposalView {
     /// Момент закрытия окна (created_at + 3 суток).
     pub closes_at: i64,
     pub open: bool,
-    pub yes: usize,
-    pub no: usize,
-    pub eligible: usize,
-    pub high: usize,
+    /// Подсчёт по весам доверия (в наших глазах).
+    pub tally: void_vote::Tally,
     pub outcome: Outcome,
     /// Мой голос по предложению (`Some(true/false)`), если голосовал.
     pub my_vote: Option<bool>,

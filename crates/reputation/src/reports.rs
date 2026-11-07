@@ -1,11 +1,12 @@
 /// reports.rs — система жалоб.
 ///
-/// Любой узел может подать жалобу на другой.
-/// Жалоба подписывается приватным ключом заявителя.
-/// При накоплении N уникальных жалоб — автоматический штраф репутации.
+/// Любой узел может подать жалобу на другой. Жалоба подписывается ключом
+/// заявителя и расходится по сети. Здесь — только приём и хранение: вес жалобы
+/// (доверие к заявителю, своя = 1) и порог «под жалобами» (сумма ≥ 1 за 30
+/// дней) считает сеть доверия в backend, а не репутация.
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use void_core::identity::NodeId;
 use void_crypto::sign::SignedMessage;
@@ -13,15 +14,15 @@ use void_crypto::keys::SigningKeypair;
 use void_db::{peers as db_peers, DbPool};
 
 use crate::error::ReputationError;
-use crate::score::{ScoreManager, MIN_TRUSTED_SCORE};
+use crate::score::ScoreManager;
 
 // ─── Константы ───────────────────────────────────────────────────────────────
 
-/// Сколько уникальных жалоб нужно для автоматического штрафа.
-const REPORTS_THRESHOLD: i64 = 3;
+/// Жалобы старше этого срока не учитываются (и не принимаются).
+pub const REPORT_MAX_AGE_SECS: i64 = 30 * 24 * 3600;
 
-/// Штраф за превышение порога жалоб.
-const REPORT_PENALTY: f64 = -5.0;
+/// Допуск на расхождение часов: жалоба «из будущего» дальше — отбрасывается.
+const REPORT_MAX_SKEW_SECS: i64 = 3600;
 
 // ─── Причины жалоб ────────────────────────────────────────────────────────────
 
@@ -80,28 +81,14 @@ impl ReportPayload {
 pub struct ReportManager {
     pool: DbPool,
     score_manager: ScoreManager,
-    /// Наш ID: свои жалобы учитываем всегда, чужие — только от доверенных узлов.
-    my_id: NodeId,
 }
 
 impl ReportManager {
-    pub fn new(pool: DbPool, score_manager: ScoreManager, my_id: NodeId) -> Self {
-        Self { pool, score_manager, my_id }
+    pub fn new(pool: DbPool, score_manager: ScoreManager) -> Self {
+        Self { pool, score_manager }
     }
 
-    // ─── Создание жалобы (на стороне репортера) ───────────────────────────────
-
     /// Создаёт подписанную жалобу. Вызывается на стороне заявителя.
-    ///
-    /// # Пример
-    /// ```ignore
-    /// let signed = manager.create_report(
-    ///     &target_id,
-    ///     ReportReason::Spam,
-    ///     &my_keypair,
-    /// ).await?;
-    /// // затем signed сериализуется и отправляется через Router
-    /// ```
     pub fn create_report(
         target_id: &NodeId,
         reason: ReportReason,
@@ -112,50 +99,34 @@ impl ReportManager {
         SignedMessage::sign(bytes, keypair).map_err(ReputationError::from)
     }
 
-    // ─── Приём жалобы (на принимающей стороне) ────────────────────────────────
-
-    /// Принимает жалобу от другого узла, верифицирует подпись и сохраняет.
+    /// Принимает жалобу, проверяет подпись, срок и сохраняет. `Ok(false)` —
+    /// такая жалоба уже есть (повтор по сети).
     ///
-    /// `reporter_id` — NodeId отправителя (из Router event), должен совпадать
-    /// с `signed.signer` для защиты от спуфинга.
+    /// `reporter_id` должен совпадать с `signed.signer` — защита от спуфинга.
+    /// Чьи жалобы вообще принимать (по доверию к заявителю), решает вызывающий.
     pub async fn receive_report(
         &self,
         signed: SignedMessage,
         reporter_id: &NodeId,
-    ) -> Result<(), ReputationError> {
-        // 1. Верифицируем подпись
+    ) -> Result<bool, ReputationError> {
         signed.verify().map_err(ReputationError::from)?;
-
-        // 2. Проверяем что reporter_id совпадает с подписантом
-        //    (нельзя отправить жалобу от имени чужого ключа)
         if signed.signer != reporter_id.as_str() {
-            warn!(
-                "Report signer mismatch: signed.signer={}, reporter={}",
-                signed.signer, reporter_id
-            );
             return Err(ReputationError::SignerMismatch);
         }
-
-        // 3. Десериализуем payload
         let payload: ReportPayload = serde_json::from_slice(&signed.payload)
             .map_err(|e| ReputationError::Deserialize(e.to_string()))?;
-
-        // 4. Нельзя пожаловаться на себя
         if payload.target_key == reporter_id.as_str() {
             return Err(ReputationError::SelfReport);
         }
-
-        // 4.1 Чужая жалоба учитывается, только если жалующийся уже заслужил
-        //     доверие у нас — иначе три свежих ключа штрафовали бы кого угодно.
-        if *reporter_id != self.my_id
-            && !(self.score_manager.score(reporter_id).await >= MIN_TRUSTED_SCORE)
-        {
-            return Err(ReputationError::UntrustedSender);
+        let now = chrono::Utc::now().timestamp();
+        if payload.timestamp < now - REPORT_MAX_AGE_SECS || payload.timestamp > now + REPORT_MAX_SKEW_SECS {
+            return Err(ReputationError::StaleReport);
+        }
+        if db_peers::report_exists(&self.pool, &signed.signature).await? {
+            return Ok(false);
         }
 
-        // 5. Сохраняем жалобу в БД. Сначала гарантируем наличие узла-цели —
-        //    reputation_reports.target_key ссылается на peers (FK), а строка
-        //    репутации нужна для последующего штрафа.
+        // reputation_reports.target_key ссылается на peers (FK) — строка нужна.
         let target_id = NodeId(payload.target_key.clone());
         let _ = self.score_manager.init(&target_id).await;
         db_peers::add_report(
@@ -168,59 +139,15 @@ impl ReportManager {
         .await
         .map_err(ReputationError::from)?;
 
-        info!(
-            "Report received: {} reported {} for {}",
-            reporter_id, target_id, payload.reason
-        );
-
-        // 6. Проверяем порог — если накопилось N жалоб, применяем штраф
-        self.maybe_apply_report_penalty(&target_id).await?;
-
-        Ok(())
+        info!("Report received: {} reported {} for {}", reporter_id, target_id, payload.reason);
+        Ok(true)
     }
-
-    // ─── Чтение ──────────────────────────────────────────────────────────────
 
     /// Количество уникальных жалоб на узел.
     pub async fn report_count(&self, peer_id: &NodeId) -> Result<i64, ReputationError> {
         db_peers::count_reports(&self.pool, peer_id.as_str())
             .await
             .map_err(ReputationError::from)
-    }
-
-    // ─── Внутреннее ──────────────────────────────────────────────────────────
-
-    /// Применяет штраф если число жалоб достигло порога.
-    async fn maybe_apply_report_penalty(&self, target_id: &NodeId) -> Result<(), ReputationError> {
-        let count = self.report_count(target_id).await?;
-
-        // Штраф применяется кратно порогу:
-        // 3 жалобы → первый штраф, 6 жалоб → второй, и т.д.
-        if count > 0 && count % REPORTS_THRESHOLD == 0 {
-            warn!(
-                "Reputation: {} has {} reports, applying penalty {}",
-                target_id, count, REPORT_PENALTY
-            );
-
-            use void_db::peers::ReputationDelta;
-            let _ = db_peers::init_reputation(&self.pool, target_id.as_str()).await;
-            db_peers::apply_reputation_delta(
-                &self.pool,
-                target_id.as_str(),
-                ReputationDelta {
-                    // Фиксируем через spam_strikes т.к. это ближайший сематически
-                    // подходящий счётчик; штраф на score уже применится через формулу в БД.
-                    // Здесь используем прямой подход — передаём в bootstrap_bonus отрицательное
-                    // значение, т.к. оно напрямую суммируется со score.
-                    bootstrap_bonus: REPORT_PENALTY,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(ReputationError::from)?;
-        }
-
-        Ok(())
     }
 }
 
@@ -238,70 +165,52 @@ mod tests {
         (kp, id)
     }
 
-    /// Три уникальные жалобы достигают порога и снижают репутацию цели;
-    /// подмена подписанта отклоняется.
-    #[tokio::test]
-    async fn three_unique_reports_apply_penalty() {
+    async fn manager() -> (tempfile::TempDir, ReportManager, ScoreManager) {
         let dir = tempfile::tempdir().unwrap();
         let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
         let score = ScoreManager::new(pool.clone());
-        let mgr = ReportManager::new(pool, score.clone(), NodeId::from_public_key_bytes(&[100u8; 32]));
+        (dir, ReportManager::new(pool, score.clone()), score)
+    }
 
+    /// Жалобы сохраняются, повтор не дублируется, репутацию они не трогают
+    /// (их вес считает сеть доверия).
+    #[tokio::test]
+    async fn reports_stored_once_without_score_penalty() {
+        let (_dir, mgr, score) = manager().await;
         let target = NodeId::from_public_key_bytes(&[200u8; 32]);
-        let before = score.score(&target).await;
-
         for seed in 1..=3u8 {
             let (kp, rid) = reporter(seed);
-            score.record_bootstrap_assist(&rid, 5.0).await; // доверенный жалующийся
             let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
-            mgr.receive_report(signed, &rid).await.unwrap();
+            assert!(mgr.receive_report(signed.clone(), &rid).await.unwrap());
+            assert!(!mgr.receive_report(signed, &rid).await.unwrap(), "повтор по сети");
         }
-
         assert_eq!(mgr.report_count(&target).await.unwrap(), 3);
-        let after = score.score(&target).await;
-        assert!(after < before, "после 3 жалоб репутация падает (before={before}, after={after})");
+        assert_eq!(score.score(&target).await, 0.0);
     }
 
-    /// Жалоба с подписантом, не совпадающим с reporter_id, отклоняется.
+    /// Подмена подписанта и жалоба на себя отклоняются.
     #[tokio::test]
-    async fn report_signer_mismatch_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
-        let score = ScoreManager::new(pool.clone());
-        let mgr = ReportManager::new(pool, score, NodeId::from_public_key_bytes(&[100u8; 32]));
-
+    async fn signer_mismatch_and_self_report_rejected() {
+        let (_dir, mgr, _) = manager().await;
         let target = NodeId::from_public_key_bytes(&[200u8; 32]);
-        let (kp, _real) = reporter(1);
+        let (kp, real) = reporter(1);
         let (_kp2, other) = reporter(2);
         let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
-
-        // reporter_id (other) ≠ подписант (real) → отклонение.
-        let res = mgr.receive_report(signed, &other).await;
-        assert!(matches!(res, Err(ReputationError::SignerMismatch)));
+        assert!(matches!(mgr.receive_report(signed, &other).await, Err(ReputationError::SignerMismatch)));
+        let selfie = ReportManager::create_report(&real, ReportReason::Spam, &kp).unwrap();
+        assert!(matches!(mgr.receive_report(selfie, &real).await, Err(ReputationError::SelfReport)));
     }
 
-    /// Жалобы от свежих ключей не принимаются и не штрафуют цель; своя
-    /// жалоба принимается всегда.
+    /// Жалоба старше 30 дней или «из будущего» не принимается.
     #[tokio::test]
-    async fn untrusted_reports_ignored_own_report_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = open(&dir.path().join("db.sqlite")).await.unwrap();
-        let score = ScoreManager::new(pool.clone());
-        let (my_kp, my_id) = reporter(50);
-        let mgr = ReportManager::new(pool, score.clone(), my_id.clone());
-        let target = NodeId::from_public_key_bytes(&[200u8; 32]);
-
-        for seed in 1..=6u8 {
-            let (kp, rid) = reporter(seed);
-            let signed = ReportManager::create_report(&target, ReportReason::Spam, &kp).unwrap();
-            let res = mgr.receive_report(signed, &rid).await;
-            assert!(matches!(res, Err(ReputationError::UntrustedSender)));
+    async fn stale_reports_rejected() {
+        let (_dir, mgr, _) = manager().await;
+        let (kp, rid) = reporter(1);
+        let now = chrono::Utc::now().timestamp();
+        for ts in [now - REPORT_MAX_AGE_SECS - 10, now + 2 * REPORT_MAX_SKEW_SECS] {
+            let payload = ReportPayload { target_key: "aa".repeat(32), reason: ReportReason::Spam, timestamp: ts };
+            let signed = SignedMessage::sign(payload.to_bytes(), &kp).unwrap();
+            assert!(matches!(mgr.receive_report(signed, &rid).await, Err(ReputationError::StaleReport)));
         }
-        assert_eq!(mgr.report_count(&target).await.unwrap(), 0);
-        assert_eq!(score.score(&target).await, 0.0);
-
-        let own = ReportManager::create_report(&target, ReportReason::Spam, &my_kp).unwrap();
-        mgr.receive_report(own, &my_id).await.unwrap();
-        assert_eq!(mgr.report_count(&target).await.unwrap(), 1);
     }
 }

@@ -37,6 +37,8 @@ pub const SETTLED_WEIGHT: f64 = 0.02;
 pub const SETTLED_POOL: f64 = 1.0;
 /// Множитель вклада поручителя за каждого «плохого» подопечного.
 pub const ACCOUNTABILITY: f64 = 0.5;
+/// Сумма весов жалоб, с которой узел — «под жалобами» (моя жалоба = 1).
+pub const REPORTED_THRESHOLD: f64 = 1.0;
 /// Сколько поручителей показывать в «через знакомых: …».
 const VIA_SHOWN: usize = 3;
 
@@ -259,6 +261,41 @@ pub fn compute(inputs: &TrustInputs) -> TrustMap {
     TrustMap { map }
 }
 
+/// Узлы «под жалобами»: сумма весов заявителей ≥ [`REPORTED_THRESHOLD`] и
+/// среди заявителей есть доверенный (`t ≥ TRUSTED_THRESHOLD`) — или жалоба моя.
+/// Вес заявителя — доверие к нему в `map` (освоившиеся — из общего пула на
+/// каждую цель), моя жалоба весит 1. `reports` — пары (цель, заявитель) за срок
+/// учёта; повторы пары не добавляют веса.
+///
+/// Без требования доверенного заявителя пул освоившихся (до 1) один достигал бы
+/// порога: полсотни ботов, неделю «отсидевшихся» на глазах узла, ставили бы под
+/// жалобы кого угодно — и его поручительства переставали бы учитываться.
+///
+/// `map` считается без учёта жалоб (иначе круг: жалобы меняют доверие к
+/// заявителям), затем расчёт повторяется с найденными целями.
+pub fn reported(map: &TrustMap, me: &NodeId, reports: &[(NodeId, NodeId)]) -> HashSet<NodeId> {
+    let mut by_target: HashMap<&NodeId, HashSet<&NodeId>> = HashMap::new();
+    for (target, reporter) in reports {
+        if target != reporter {
+            by_target.entry(target).or_default().insert(reporter);
+        }
+    }
+    by_target
+        .into_iter()
+        .filter(|(_, reporters)| {
+            if reporters.contains(me) {
+                return true;
+            }
+            let trusted = reporters
+                .iter()
+                .any(|r| matches!(map.level(r), TrustLevel::Trusted | TrustLevel::Verified));
+            let weight: f64 = map.weights(reporters.iter().copied()).values().sum();
+            trusted && weight + 1e-9 >= REPORTED_THRESHOLD
+        })
+        .map(|(target, _)| target.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +492,36 @@ mod tests {
         let m = run_full(&[v(1, 2)], &[], &[], &[], &[1]);
         assert_eq!(m.level(&n(1)), TrustLevel::Verified);
         assert!(approx(m.get(&n(2)).weight, 0.5));
+    }
+
+    #[test]
+    fn reports_weighted_by_trust_in_reporter() {
+        // Я лично проверил 1 и 2; 2 поручился за 3 (t = 0.5).
+        let map = run(&[v(0, 1), v(0, 2), v(2, 3)]);
+        let rep = |t: u32, r: u32| (n(t), n(r));
+        // Жалоба лично проверенного — вес 1: цель 10 под жалобами.
+        // Жалоба через знакомых (0.5) — мало для цели 11; две такие — достаточно.
+        // Тысяча незнакомцев — ноль для цели 12. Моя жалоба — 1 для цели 13.
+        let mut reports = vec![rep(10, 1), rep(11, 3), rep(11, 3)];
+        reports.extend((100..1100).map(|b| rep(12, b)));
+        reports.push(rep(13, 0));
+        let bad = reported(&map, &n(0), &reports);
+        assert_eq!(bad, [n(10), n(13)].into_iter().collect());
+
+        let more = [rep(11, 3), rep(11, 2)];
+        assert!(reported(&map, &n(0), &more).contains(&n(11)), "0.5 + 1.0 ≥ 1");
+    }
+
+    #[test]
+    fn settled_reporters_alone_cannot_report() {
+        // 200 освоившихся «по поведению»: их пул (≤ 1) — ровно порог, но без
+        // доверенного заявителя цель не «под жалобами».
+        let settled: Vec<u32> = (100..300).collect();
+        let map = run_with(&[v(0, 1), v(1, 2)], &[], &[], &settled);
+        let mut reports: Vec<(NodeId, NodeId)> = (100..300).map(|b| (n(10), n(b))).collect();
+        assert!(reported(&map, &n(0), &reports).is_empty());
+        // С ними один доверенный через знакомых (t = 0.5): 0.5 + пул ≥ 1.
+        reports.push((n(10), n(2)));
+        assert!(reported(&map, &n(0), &reports).contains(&n(10)));
     }
 }

@@ -14,11 +14,8 @@ pub struct ProfilePage {
     /// Реальные счётчики трафика за сессию (в байтах).
     pub upload_bytes:    u64,
     pub download_bytes:  u64,
-    /// Наша репутация глазами пиров: (средний балл, число сообщивших пиров).
-    /// `None` — данных пока нет. Источник — `backend.my_reputation` (gossip).
-    pub my_reputation:   Option<(f64, usize)>,
-    /// Есть ли сейчас подключённые пиры (для текста про репутацию).
-    pub has_peers:       bool,
+    /// Сколько узлов поручились за нас (сеть доверия).
+    pub my_vouchers:     usize,
     pub my_ip:           String,
     pub base_port:       u16,
     /// Запущены ли мы в публичном (bootstrap) режиме.
@@ -51,8 +48,7 @@ impl Default for ProfilePage {
             uptime:          std::time::Duration::ZERO,
             upload_bytes:    0,
             download_bytes:  0,
-            my_reputation:   None,
-            has_peers:       false,
+            my_vouchers:     0,
             my_ip:           "?".to_string(),
             base_port:       7700,
             bootstrap:         false,
@@ -245,41 +241,36 @@ impl ProfilePage {
         ui.separator();
         ui.add_space(12.0);
 
-        // ── Репутация (по оценкам других узлов) ─────────────────────────────
-        ui.label(egui::RichText::new("Репутация").strong());
+        // ── Сеть доверия: сколько узлов за нас поручились ───────────────────
+        ui.label(egui::RichText::new("Сеть доверия").strong());
         ui.add_space(6.0);
-        match self.my_reputation {
-            Some((score, n)) => {
-                let rep_color = if score > 60.0 {
-                    egui::Color32::from_rgb(80, 200, 80)
-                } else if score > 25.0 {
-                    egui::Color32::from_rgb(220, 180, 40)
-                } else {
-                    egui::Color32::from_rgb(220, 120, 80)
-                };
-                ui.label(egui::RichText::new(format!("{:.1}", score)).size(20.0).strong().color(rep_color));
-                ui.label(
-                    egui::RichText::new(format!(
-                        "󰔟  по оценкам {} {} · поле уточняется, возможна задержка",
-                        n,
-                        if n == 1 { "пира" } else { "пиров" },
-                    ))
+        if self.my_vouchers > 0 {
+            ui.label(
+                egui::RichText::new(format!("\u{F0849}  За вас поручились: {}", self.my_vouchers))
+                    .size(16.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(80, 190, 110)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Их знакомые видят вас как «через знакомых»: без лимитов новичка, \
+                     с весом в голосованиях.")
                     .small()
                     .color(ui.visuals().weak_text_color()),
-                );
-            }
-            None if self.has_peers => {
-                ui.label(
-                    egui::RichText::new("󰔟  Уточняется… ждём оценок от пиров")
-                        .color(ui.visuals().weak_text_color()),
-                );
-            }
-            None => {
-                ui.label(
-                    egui::RichText::new("Невозможно узнать свою репутацию — нет подключённых пиров")
-                        .color(egui::Color32::from_rgb(220, 160, 70)),
-                );
-            }
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("За вас ещё никто не поручился")
+                    .color(egui::Color32::from_rgb(220, 160, 70)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Для других узлов вы пока новичок: сообщения в общих каналах — раз в \
+                     30 секунд, личка — через «Запросы». Сверьте код безопасности со знакомым \
+                     (его профиль → «Проверка контакта»), и пусть он поручится за вас.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
         }
 
         ui.add_space(16.0);

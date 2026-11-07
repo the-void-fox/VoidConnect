@@ -48,6 +48,8 @@ pub struct ChatMessage {
 
 /// Метка сообщения незнакомца.
 const NEWCOMER_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 70);
+/// Метка сообщения узла под жалобами.
+const REPORTED_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 120, 60);
 
 /// Что нажато в строке сообщения.
 #[derive(Default)]
@@ -349,17 +351,22 @@ impl ChatPage {
         // Уровни авторов канала: незнакомцы — с меткой «новичок», заблокированные
         // (мной или голосованием) не показываются. Снимок доверия блокируем
         // коротко: его же читает чат, решая о лимитах.
-        let levels: HashMap<NodeId, TrustLevel> = self.trust.as_ref()
+        // Под жалобами моей сети — свёрнуты всегда, независимо от настройки.
+        let levels: HashMap<NodeId, (TrustLevel, bool)> = self.trust.as_ref()
             .and_then(|t| t.map.lock().ok())
             .map(|map| {
                 self.messages.iter()
                     .filter(|m| m.channel == self.current_channel && !m.is_me)
                     .filter_map(|m| m.from_id.as_ref())
-                    .map(|id| (id.clone(), map.level(id)))
+                    .map(|id| {
+                        let info = map.get(id);
+                        (id.clone(), (info.level, info.reported))
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        let level_of = |m: &ChatMessage| m.from_id.as_ref().and_then(|id| levels.get(id)).copied();
+        let level_of = |m: &ChatMessage| m.from_id.as_ref().and_then(|id| levels.get(id)).map(|l| l.0);
+        let reported = |m: &ChatMessage| m.from_id.as_ref().and_then(|id| levels.get(id)).is_some_and(|l| l.1);
 
         let scroll_out = ScrollArea::vertical()
             .id_source("chat_messages_scroll")
@@ -384,10 +391,10 @@ impl ChatPage {
                     }
                     let newcomer = level_of(msg) == Some(TrustLevel::Stranger);
                     let key = msg.from_id.clone().map(|id| (id, msg.seq));
-                    let fold = (newcomer && self.fold_strangers)
+                    let fold = ((newcomer && self.fold_strangers) || reported(msg))
                         .then(|| !key.as_ref().is_some_and(|k| self.expanded.contains(k)));
                     let click = Self::render_message(
-                        ui, msg, &self.profiles, self.my_avatar.as_deref(), newcomer, fold,
+                        ui, msg, &self.profiles, self.my_avatar.as_deref(), newcomer, reported(msg), fold,
                     );
                     if click.author.is_some() {
                         clicked_id = click.author;
@@ -465,14 +472,16 @@ impl ChatPage {
         if should_send { self.send_message(); }
     }
 
-    /// `newcomer` — автор незнакомец (метка «новичок»); `fold` — сообщение
-    /// можно свернуть: `Some(true)` свёрнуто, `Some(false)` развёрнуто.
+    /// `newcomer` — автор незнакомец (метка «новичок»), `reported` — под
+    /// жалобами моей сети; `fold` — сообщение можно свернуть: `Some(true)`
+    /// свёрнуто, `Some(false)` развёрнуто.
     fn render_message(
         ui: &mut egui::Ui,
         msg: &ChatMessage,
         profiles: &HashMap<NodeId, PeerProfile>,
         my_avatar: Option<&str>,
         newcomer: bool,
+        reported: bool,
         fold: Option<bool>,
     ) -> MsgClick {
         let mut click = MsgClick::default();
@@ -557,7 +566,11 @@ impl ChatPage {
                             );
                         }
 
-                        if newcomer {
+                        if reported {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("под жалобами").small().color(REPORTED_COLOR))
+                                .on_hover_text("На этот узел пожаловались вы или те, кому вы доверяете");
+                        } else if newcomer {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("новичок").small().color(NEWCOMER_COLOR))
                                 .on_hover_text("Никто из вашей сети доверия не поручился за этот узел");
@@ -581,7 +594,8 @@ impl ChatPage {
                     });
                     ui.add_space(4.0);
                     if fold == Some(true) {
-                        let show = egui::RichText::new("Сообщение незнакомца свёрнуто — показать")
+                        let what = if reported { "Сообщение узла под жалобами" } else { "Сообщение незнакомца" };
+                        let show = egui::RichText::new(format!("{what} свёрнуто — показать"))
                             .italics()
                             .color(ui.visuals().weak_text_color());
                         let resp = ui.add(egui::Label::new(show).sense(egui::Sense::click()));
