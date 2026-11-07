@@ -3,13 +3,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use void_core::dns::{DnsKind, DnsRecord};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
 use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip, VoteGossip};
+use void_chat::trust_limits::AuthorTier;
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd, PrivateChatHandle};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
 use void_crypto::sign::SignedMessage;
@@ -228,6 +229,8 @@ struct TrustService {
     private:   Arc<Mutex<HashSet<NodeId>>>,
     /// Баны голосованием (NodeId → ts истечения) — для расчёта это «заблокированные».
     blocklist: Arc<Mutex<HashMap<NodeId, i64>>>,
+    /// Сколько узлов поручились за нас (подсказка новичку в чате).
+    my_vouchers: Arc<AtomicUsize>,
     /// Сигнал «граф изменился — пересчитать».
     dirty:     Arc<tokio::sync::Notify>,
 }
@@ -375,6 +378,8 @@ impl TrustService {
         let now = chrono::Utc::now().timestamp();
         let vouches = void_trust::store::load_vouches(&self.pool).await.unwrap_or_default();
         let settled = void_trust::store::settled(&self.pool, now).await.unwrap_or_default();
+        let mine = vouches.iter().filter(|v| v.subject == self.my_id && !v.revoked).count();
+        self.my_vouchers.store(mine, Ordering::Relaxed);
         let blocked: HashSet<NodeId> = self.blocklist.lock().unwrap().iter()
             .filter(|(_, until)| **until > now)
             .map(|(id, _)| id.clone())
@@ -390,6 +395,16 @@ impl TrustService {
             private_verified: &private,
         });
         *self.snapshot.lock().unwrap() = map;
+    }
+}
+
+/// Уровень автора для лимитов чата — по снимку сети доверия.
+fn author_tier(snapshot: &Mutex<void_trust::TrustMap>, id: &NodeId) -> AuthorTier {
+    use void_trust::TrustLevel::*;
+    match snapshot.lock().map(|m| m.level(id)).unwrap_or(Stranger) {
+        Verified | Trusted => AuthorTier::Trusted,
+        Settled => AuthorTier::Settled,
+        Stranger | Blocked => AuthorTier::Stranger,
     }
 }
 
@@ -591,6 +606,8 @@ pub struct BackendHandle {
     pub private_verified: Arc<Mutex<HashSet<NodeId>>>,
     /// Команды сети доверия: поручиться / отозвать / опубликовать старые отметки.
     pub trust_tx: tokio::sync::mpsc::UnboundedSender<TrustCmd>,
+    /// Сколько узлов поручились за нас (0 — для других узлов мы новичок).
+    pub my_vouchers: Arc<AtomicUsize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -702,6 +719,8 @@ pub fn start_backend(
     ));
     let private_bg = Arc::clone(&private_verified);
     let (trust_tx, trust_rx) = tokio::sync::mpsc::unbounded_channel::<TrustCmd>();
+    let my_vouchers = Arc::new(AtomicUsize::new(0));
+    let my_vouchers_bg = Arc::clone(&my_vouchers);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -725,7 +744,7 @@ pub fn start_backend(
                 propose_rx, vote_cast_rx, proposals_bg,
                 blocklist_bg, voted_channels_bg, my_score_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg, my_reputation_bg,
-                trust_bg, private_bg, trust_rx,
+                trust_bg, private_bg, trust_rx, my_vouchers_bg,
             ).await;
         });
     });
@@ -777,6 +796,7 @@ pub fn start_backend(
         trust,
         private_verified,
         trust_tx,
+        my_vouchers,
     }
 }
 
@@ -827,6 +847,7 @@ async fn backend_main(
     trust_out: Arc<Mutex<void_trust::TrustMap>>,
     private_out: Arc<Mutex<HashSet<NodeId>>>,
     trust_rx: tokio::sync::mpsc::UnboundedReceiver<TrustCmd>,
+    my_vouchers: Arc<AtomicUsize>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1043,7 +1064,7 @@ async fn backend_main(
     // ── Сеть доверия ──────────────────────────────────────────────────────────
     // Без БД (поручительства хранятся в ней) команды GUI просто не исполняются.
     if let Some(pool) = db_pool.clone() {
-        TrustService {
+        let trust = TrustService {
             pool,
             chat:      chat.clone(),
             keypair:   trust_kp,
@@ -1051,9 +1072,15 @@ async fn backend_main(
             snapshot:  trust_out,
             private:   private_out,
             blocklist: Arc::clone(&blocklist_out),
+            my_vouchers,
             dirty:     Arc::new(tokio::sync::Notify::new()),
-        }
-        .start(peer_list.clone(), trust_rx);
+        };
+        // Лимиты чата по уровню доверия — после первого расчёта, иначе в первые
+        // секунды все авторы были бы незнакомцами (до этого чат их не ограничивает).
+        trust.recompute().await;
+        let snapshot = Arc::clone(&trust.snapshot);
+        chat.set_author_tiers(Arc::new(move |id: &NodeId| author_tier(&snapshot, id)));
+        trust.start(peer_list.clone(), trust_rx);
     }
     // Задача: входящие DNS-записи из сети → проверяем подпись и применяем.
     {

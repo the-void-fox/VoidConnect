@@ -44,6 +44,8 @@ use void_network::rate_limit::RateLimiter;
 use void_network::conn_guard::ConnLimiter;
 use void_network::secure::{self, Channel, NoiseIdentity};
 
+use crate::trust_limits::{AuthorTier, Kind, TierFn, TierLimits};
+
 /// Потолок размера одного пакета на проводе. Поднят до 16 МиБ, чтобы вмещать
 /// манифесты крупных файлов (список хэшей чанков): при 256 КБ/чанк это
 /// ~176 000 чанков ≈ 43 ГБ файл. Текстовые сообщения/профили на порядки меньше.
@@ -257,6 +259,11 @@ struct PublicChatInner {
     rate_limiter: Option<RateLimiter>,
     /// Сигнал backend'у: узел превысил лимит (→ спам-страйк репутации).
     spam_tx:     broadcast::Sender<NodeId>,
+    /// Уровень автора по сети доверия (ставит backend). Пока не задан — все
+    /// авторы считаются доверенными (как до сети доверия).
+    tiers:       std::sync::OnceLock<TierFn>,
+    /// Лимиты незнакомцев и освоившихся.
+    tier_limits: TierLimits,
     /// Номер для очередной связи — чтобы закрытие старой связи не удалило новую.
     link_seq:    AtomicU64,
     /// Недоступные узлы: id → (не звонить до, число неудач подряд).
@@ -312,6 +319,8 @@ impl PublicChat {
                 link_tx,
                 rate_limiter,
                 spam_tx,
+                tiers:       std::sync::OnceLock::new(),
+                tier_limits: TierLimits::default(),
                 link_seq:    AtomicU64::new(0),
                 dial_failures: Mutex::new(HashMap::new()),
                 seen_gossip:       Mutex::new(HashSet::new()),
@@ -343,6 +352,31 @@ impl PublicChat {
         true
     }
 
+    /// Задаёт уровень авторов по сети доверия (один раз; повторный вызов
+    /// игнорируется — функция сама читает свежий снимок).
+    pub fn set_author_tiers(&self, tiers: TierFn) {
+        let _ = self.inner.tiers.set(tiers);
+    }
+
+    fn author_tier(&self, author: &NodeId) -> AuthorTier {
+        self.inner.tiers.get().map_or(AuthorTier::Trusted, |f| f(author))
+    }
+
+    /// Лимит по уровню доверия автора: `true` — пропустить. Вызывать только
+    /// после проверки подписи автора — иначе чужим ID можно выжечь его бюджет.
+    fn admit(&self, author: &NodeId, kind: Kind) -> bool {
+        self.inner.tier_limits.admit(author, self.author_tier(author), kind)
+    }
+
+    /// То же для подписанного пакета рассылки (автор = подписант).
+    fn admit_signed(&self, signed: &SignedMessage, kind: Kind) -> bool {
+        let author = NodeId(signed.signer.clone());
+        if self.author_tier(&author) == AuthorTier::Trusted {
+            return true;
+        }
+        signed.verify().is_ok() && self.admit(&author, kind)
+    }
+
     /// Отправляет пакет всем соседям, кроме `except` (того, от кого он пришёл).
     async fn forward(&self, pkt: ChatPacket, except: Option<&NodeId>) {
         let links = self.inner.links.lock().await;
@@ -368,6 +402,12 @@ impl PublicChat {
             }
         }
         true
+    }
+
+    /// Забывает подпись пакета, отброшенного по лимиту: копия, пришедшая
+    /// позже (когда бюджет автора восстановится), обработается заново.
+    async fn unsee_gossip(&self, signed: &SignedMessage) {
+        self.inner.seen_gossip.lock().await.remove(&signed.signature);
     }
 
     /// Запоминает DNS-запись для передачи новым связям (последняя версия по
@@ -424,6 +464,12 @@ impl PublicChat {
         true
     }
 
+    /// Снимает отметку «видено» с сообщения, отброшенного по лимиту.
+    async fn unmark_seen(&self, msg: &ChatMessage) {
+        let key = (msg.from.as_str().to_string(), msg.seq);
+        self.inner.seen.lock().await.remove(&key);
+    }
+
     pub async fn recent(&self, n: usize) -> Vec<ChatMessage> {
         let h = self.inner.history.lock().await;
         h.iter().rev().take(n).cloned().collect::<Vec<_>>().into_iter().rev().collect()
@@ -470,15 +516,16 @@ impl PublicChat {
         // Сливаем с уже известным (мы могли знать других сидеров) и рассылаем
         // объединённый вариант. Даже если ничего нового не добавилось, шлём
         // нашу версию — получатели дедуплицируют сами.
-        let merged = self.merge_manifest(manifest.clone()).await.unwrap_or(manifest);
+        let merged = self.merge_manifest(manifest.clone(), None).await.unwrap_or(manifest);
         self.forward(ChatPacket::FileAnnounce(merged), None).await;
     }
 
     /// Объединяет входящий манифест с уже известным по `file_id`: добавляет
     /// новых сидеров. Возвращает обновлённый манифест, если появилась новая
     /// информация (новый файл или новый владелец), иначе `None` (дедуп — это
-    /// гасит петли форвардинга).
-    async fn merge_manifest(&self, incoming: FileManifest) -> Option<FileManifest> {
+    /// гасит петли форвардинга). Новый файл из сети (`src`) проходит лимит
+    /// публикаций по уровню доверия публикатора.
+    async fn merge_manifest(&self, incoming: FileManifest, src: Option<&NodeId>) -> Option<FileManifest> {
         let mut map = self.inner.manifests.lock().await;
         match map.get_mut(&incoming.file_id) {
             Some(existing) => {
@@ -498,6 +545,12 @@ impl PublicChat {
                 if !verify_file_manifest(&incoming) {
                     warn!("Отброшен манифест файла {} без верной подписи публикатора", incoming.file_id);
                     return None;
+                }
+                if src.is_some() {
+                    let publisher = incoming.publisher.as_ref()?;
+                    if !self.admit(publisher, Kind::Publish) {
+                        return None;
+                    }
                 }
                 map.insert(incoming.file_id.clone(), incoming.clone());
                 Some(incoming)
@@ -531,7 +584,8 @@ impl PublicChat {
     /// Объединяет входящий (из сети) манифест сайта с известным по имени.
     /// Возвращает `Some`, если это новый сайт или более свежая версия того же
     /// владельца (по `created_at`), иначе `None` (дедуп / отказ в перехвате).
-    async fn merge_site(&self, incoming: SiteManifest) -> Option<SiteManifest> {
+    /// Новая версия из сети проходит лимит публикаций по уровню владельца.
+    async fn merge_site(&self, incoming: SiteManifest, src: Option<&NodeId>) -> Option<SiteManifest> {
         // Имя сайта попадает в URL, который UI отдаёт системе на открытие:
         // принимаем только нормализованную метку `[a-z0-9-]` (как при публикации).
         if !is_normalized_site_name(&incoming.name) {
@@ -569,6 +623,7 @@ impl PublicChat {
             }
             // Более старая версия того же владельца — игнорируем.
             Some(existing) if existing.created_at > incoming.created_at => None,
+            _ if src.is_some() && !self.admit(&incoming.owner, Kind::Publish) => None,
             _ => {
                 map.insert(incoming.name.clone(), incoming.clone());
                 Some(incoming)
@@ -580,7 +635,7 @@ impl PublicChat {
     /// backend (регистрация в реестре) и пересылает соседям, кроме источника.
     /// Дедуп через `merge_site` гасит петли пересылки.
     async fn handle_site_announce(&self, manifest: SiteManifest, src: Option<&NodeId>) {
-        let Some(merged) = self.merge_site(manifest).await else {
+        let Some(merged) = self.merge_site(manifest, src).await else {
             return; // ничего нового — не пересылаем повторно
         };
         let _ = self.inner.site_tx.send(merged.clone());
@@ -718,9 +773,9 @@ impl PublicChat {
     /// backend'у (он реагирует re-announce'ом): пересылать его не нужно — это
     /// сверка с прямым соседом. Подпись/подсчёт — в backend.
     async fn handle_vote_gossip(&self, gossip: VoteGossip, src: Option<&NodeId>) {
-        let pkt = match gossip.clone() {
-            VoteGossip::Proposal(signed) => ChatPacket::ProposalAnnounce { signed },
-            VoteGossip::Vote(signed) => ChatPacket::VoteAnnounce { signed },
+        let (pkt, kind) = match gossip.clone() {
+            VoteGossip::Proposal(signed) => (ChatPacket::ProposalAnnounce { signed }, Kind::Proposal),
+            VoteGossip::Vote(signed) => (ChatPacket::VoteAnnounce { signed }, Kind::Vote),
             VoteGossip::Digest(_) => {
                 let _ = self.inner.vote_tx.send(gossip);
                 return; // дайджест не пересылаем
@@ -728,6 +783,11 @@ impl PublicChat {
         };
         if let Some(signed) = gossip_signature(&pkt) {
             if !self.first_seen_gossip(signed).await {
+                return;
+            }
+            // Предложения незнакомцев не пересылаются, голоса — не чаще лимита.
+            if src.is_some() && !self.admit_signed(signed, kind) {
+                self.unsee_gossip(signed).await;
                 return;
             }
         }
@@ -757,6 +817,10 @@ impl PublicChat {
         }
         if signed.verify().is_err() {
             return; // мусор не кэшируем и не пересылаем
+        }
+        if src.is_some() && !self.admit(&NodeId(signed.signer.clone()), Kind::Dns) {
+            self.unsee_gossip(&signed).await;
+            return;
         }
         self.cache_dns(&signed).await;
         let _ = self.inner.dns_tx.send(signed.clone());
@@ -1304,9 +1368,10 @@ impl PublicChat {
         self.accept_message(msg, src, true).await;
     }
 
-    /// `live_check` — учитывать ли сообщение в лимите частоты автора. Для
-    /// догоняющей истории (пакет History) не учитываем: это не поток в реальном
-    /// времени, и плодовитый автор не должен получать спам-штраф за свою историю.
+    /// `live_check` — учитывать ли сообщение в лимите пакетов доверенного автора.
+    /// Для догоняющей истории (пакет History) не учитываем: это не поток в
+    /// реальном времени, и плодовитый автор не должен получать спам-штраф за
+    /// свою историю. Незнакомцев и освоившихся лимит по уровню считает всегда.
     async fn accept_message(&self, msg: ChatMessage, src: Option<&NodeId>, live_check: bool) {
         if !message_within_limits(&msg) {
             warn!("Отброшено сообщение сверх лимитов от {}", msg.from);
@@ -1319,12 +1384,23 @@ impl PublicChat {
         if !self.mark_seen(&msg).await {
             return; // уже видели — гасим петлю пересылки
         }
-        // Спам-защита: живые чужие сообщения считаются в лимите частоты АВТОРА
+        // Спам-защита: чужие сообщения считаются в лимите частоты АВТОРА
         // (подпись доказывает авторство), а не соседа, который их переслал.
-        let live = (Utc::now().timestamp() - msg.timestamp).abs() <= LIVE_WINDOW_SECS;
-        if src.is_some() && live_check && live && !self.allow_packet(&msg.from).await {
-            debug!("Сообщение {} сверх лимита частоты — отброшено", msg.from);
-            return;
+        if src.is_some() {
+            if self.author_tier(&msg.from) == AuthorTier::Trusted {
+                let live = (Utc::now().timestamp() - msg.timestamp).abs() <= LIVE_WINDOW_SECS;
+                if live_check && live && !self.allow_packet(&msg.from).await {
+                    debug!("Сообщение {} сверх лимита частоты — отброшено", msg.from);
+                    return;
+                }
+            } else if !self.admit(&msg.from, Kind::message(&msg.channel)) {
+                // Незнакомцу и освоившемуся считаются и история, и сообщения с
+                // датой в прошлом — иначе старая дата обходила бы лимит. Отброс
+                // тихий; отметку снимаем, чтобы копия прошла позже.
+                self.unmark_seen(&msg).await;
+                debug!("Сообщение {} сверх лимита его уровня доверия — отброшено", msg.from);
+                return;
+            }
         }
 
         {
@@ -1357,6 +1433,9 @@ impl PublicChat {
             if profiles.get(&profile.node_id).is_some_and(|old| old.updated_at >= profile.updated_at) {
                 return;
             }
+            if src.is_some() && !self.admit(&profile.node_id, Kind::Profile) {
+                return; // не сохраняем — копия пройдёт позже
+            }
             profiles.insert(profile.node_id.clone(), profile.clone());
         }
 
@@ -1380,7 +1459,7 @@ impl PublicChat {
     /// Дедуп через `merge_manifest`: если новой информации нет, обработка
     /// прекращается, что гасит петли пересылки.
     async fn handle_file_announce(&self, manifest: FileManifest, src: Option<&NodeId>) {
-        let Some(merged) = self.merge_manifest(manifest).await else {
+        let Some(merged) = self.merge_manifest(manifest, src).await else {
             return; // ничего нового — не пересылаем повторно
         };
 
@@ -1543,6 +1622,8 @@ impl ChatHandle {
     pub fn subscribe_vouches(&self) -> broadcast::Receiver<VouchGossip> { self.chat.inner.vouch_tx.subscribe() }
     /// Новые связи с соседями.
     pub fn subscribe_links(&self) -> broadcast::Receiver<NodeId> { self.chat.inner.link_tx.subscribe() }
+    /// Уровень авторов по сети доверия — для лимитов частоты (см. [`crate::trust_limits`]).
+    pub fn set_author_tiers(&self, tiers: TierFn) { self.chat.set_author_tiers(tiers) }
     pub async fn relay_vouch(&self, signed: SignedMessage, except: Option<&NodeId>) {
         self.chat.relay_vouch(signed, except).await
     }
@@ -2175,7 +2256,7 @@ mod tests {
         }, &kp);
 
         // Сайт сперва известен.
-        assert!(chat.merge_site(mk("s1", 100)).await.is_some());
+        assert!(chat.merge_site(mk("s1", 100), None).await.is_some());
 
         // Надгробие в момент 150.
         let rev = SiteRevocation { name: "blog".into(), owner: id.clone(), revoked_at: 150 };
@@ -2183,11 +2264,11 @@ mod tests {
         chat.apply_revoke_local(rev, signed).await;
 
         // Устаревшие анонсы (created_at <= revoked_at) подавлены.
-        assert!(chat.merge_site(mk("s1", 100)).await.is_none(), "старый анонс не воскрешает сайт");
-        assert!(chat.merge_site(mk("s2", 150)).await.is_none(), "created_at == revoked_at тоже подавлен");
+        assert!(chat.merge_site(mk("s1", 100), None).await.is_none(), "старый анонс не воскрешает сайт");
+        assert!(chat.merge_site(mk("s2", 150), None).await.is_none(), "created_at == revoked_at тоже подавлен");
 
         // Переопубликация позже надгробия проходит.
-        assert!(chat.merge_site(mk("s3", 200)).await.is_some(), "новая публикация владельца проходит");
+        assert!(chat.merge_site(mk("s3", 200), None).await.is_some(), "новая публикация владельца проходит");
     }
 
     /// Фальшивый анонс узла («000…0», за ним никого нет) не мешает: дозвон до
@@ -2312,10 +2393,10 @@ mod tests {
             site_id: "sid".into(), name: name.into(), owner: id.clone(),
             entries: vec![], created_at: 1, signature: None,
         }, &kp);
-        assert!(chat.merge_site(mk("x&calc")).await.is_none());
-        assert!(chat.merge_site(mk("My Site")).await.is_none());
-        assert!(chat.merge_site(mk("../blog")).await.is_none());
-        assert!(chat.merge_site(mk("my-site")).await.is_some());
+        assert!(chat.merge_site(mk("x&calc"), None).await.is_none());
+        assert!(chat.merge_site(mk("My Site"), None).await.is_none());
+        assert!(chat.merge_site(mk("../blog"), None).await.is_none());
+        assert!(chat.merge_site(mk("my-site"), None).await.is_some());
     }
 
     /// Анонс «Алисы» с адресом самозванца: узел обрывает рукопожатие — на том
@@ -2361,16 +2442,16 @@ mod tests {
             site_id: "sid".into(), name: "bank".into(), owner: owner_id.clone(),
             entries: vec![], created_at: 1, signature: None,
         };
-        assert!(chat.merge_site(base.clone()).await.is_none(), "без подписи");
-        assert!(chat.merge_site(sign_site(base.clone(), &evil_kp)).await.is_none(), "подписал не владелец");
+        assert!(chat.merge_site(base.clone(), None).await.is_none(), "без подписи");
+        assert!(chat.merge_site(sign_site(base.clone(), &evil_kp), None).await.is_none(), "подписал не владелец");
 
         let mut tampered = sign_site(base.clone(), &owner_kp);
         tampered.entries.push(void_core::site::SiteEntry {
             path: "index.html".into(), file_id: "evil".into(), size_bytes: 1,
         });
-        assert!(chat.merge_site(tampered).await.is_none(), "подмена файлов после подписи");
+        assert!(chat.merge_site(tampered, None).await.is_none(), "подмена файлов после подписи");
 
-        assert!(chat.merge_site(sign_site(base, &owner_kp)).await.is_some(), "подпись владельца проходит");
+        assert!(chat.merge_site(sign_site(base, &owner_kp), None).await.is_some(), "подпись владельца проходит");
     }
 
     /// Профиль принимается только с подписью своего узла; старая версия не
@@ -2449,17 +2530,17 @@ mod tests {
             owners: vec![], chunks: vec![ChunkMeta { hash: "a".repeat(64), index: 0, size: 1 }],
             publisher: None, signature: None,
         };
-        assert!(chat.merge_manifest(base.clone()).await.is_none(), "без подписи");
+        assert!(chat.merge_manifest(base.clone(), None).await.is_none(), "без подписи");
 
         let mut renamed = sign_file(base.clone(), &alice_kp);
         renamed.name = "report.pdf.exe".into();
-        assert!(chat.merge_manifest(renamed).await.is_none(), "переименование после подписи");
+        assert!(chat.merge_manifest(renamed, None).await.is_none(), "переименование после подписи");
 
-        assert!(chat.merge_manifest(sign_file(base.clone(), &alice_kp)).await.is_some());
+        assert!(chat.merge_manifest(sign_file(base.clone(), &alice_kp), None).await.is_some());
         // Сидер без подписи пополняет уже известный файл.
         let mut seeder = base;
         seeder.owners = vec![NodeId("c".repeat(64))];
-        let merged = chat.merge_manifest(seeder).await.expect("новый сидер");
+        let merged = chat.merge_manifest(seeder, None).await.expect("новый сидер");
         assert_eq!(merged.name, "report.pdf");
         assert!(merged.signature.is_some(), "подписанная часть сохранилась");
     }
@@ -2652,5 +2733,66 @@ mod tests {
         let got = timeout(Duration::from_secs(5), vouches_b.recv()).await.unwrap().unwrap();
         assert_eq!(got.signed.signature, rec2.signature, "дубликат rec1 погашен, rec2 дошёл");
         assert!(timeout(Duration::from_millis(300), vouches_b.recv()).await.is_err());
+    }
+
+    /// Собирает тексты сообщений из приёмника за `ms` миллисекунд.
+    async fn collect_texts(rx: &mut broadcast::Receiver<ChatMessage>, ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        while let Ok(Ok(m)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            out.push(m.text);
+        }
+        out
+    }
+
+    /// Незнакомец в глазах получателя: в общем канале проходит лишь запас
+    /// (и для догоняющей истории — дата в прошлом лимит не обходит), в
+    /// «Новичках» он пишет свободно; ответы доверенного не ограничены.
+    #[tokio::test]
+    async fn stranger_limited_by_receiver_view() {
+        use crate::trust_limits::NEWCOMERS_CHANNEL;
+        let (ka, a) = mesh_peer(1);
+        let (kb, b) = mesh_peer(2);
+        // A пишет, пока ни с кем не связан: сообщения уйдут B историей.
+        let node_a = start_mesh_node(ka, &a, &[]).await;
+        for i in 0..6 {
+            node_a.send("global".into(), format!("old{i}")).await.unwrap();
+        }
+
+        // B считает A незнакомцем; узнаёт о нём только после этого.
+        let b_pl = PeerList::new();
+        let node_b = start_public_chat(b.clone(), b_pl.clone(), b.chat_port, kb, None).await.unwrap();
+        let stranger = a.id.clone();
+        node_b.set_author_tiers(Arc::new(move |id: &NodeId| {
+            if *id == stranger { AuthorTier::Stranger } else { AuthorTier::Trusted }
+        }));
+        let mut rx_b = node_b.subscribe();
+        let mut rx_a = node_a.subscribe();
+        b_pl.upsert(a.clone()).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while node_a.link_count().await == 0 || node_b.link_count().await == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "связь A–B не установилась");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let got = collect_texts(&mut rx_b, 1500).await;
+        assert_eq!(got.len(), 3, "из истории незнакомца прошёл только запас: {got:?}");
+
+        for i in 0..4 {
+            node_a.send("global".into(), format!("live{i}")).await.unwrap();
+        }
+        for i in 0..6 {
+            node_a.send(NEWCOMERS_CHANNEL.into(), format!("hi{i}")).await.unwrap();
+        }
+        let got = collect_texts(&mut rx_b, 1500).await;
+        assert!(got.iter().all(|t| t.starts_with("hi")), "запас общего канала исчерпан: {got:?}");
+        assert_eq!(got.len(), 6, "в «Новичках» незнакомец пишет свободно: {got:?}");
+
+        // У A политики нет — B для него как прежде без доп. лимитов.
+        for i in 0..8 {
+            node_b.send("global".into(), format!("reply{i}")).await.unwrap();
+        }
+        let got = collect_texts(&mut rx_a, 1500).await;
+        assert_eq!(got.iter().filter(|t| t.starts_with("reply")).count(), 8, "{got:?}");
     }
 }

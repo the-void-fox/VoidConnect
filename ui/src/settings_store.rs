@@ -21,6 +21,8 @@ pub struct Settings {
     pub bootstrap_nodes: Vec<String>,
     /// Базовый порт.
     pub base_port: u16,
+    /// Сворачивать в чате сообщения незнакомцев (их всё равно можно раскрыть).
+    pub fold_strangers: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             public_mode:     false,
             bootstrap_nodes: Vec::new(),
             base_port:       DEFAULT_BASE_PORT,
+            fold_strangers:  false,
         }
     }
 }
