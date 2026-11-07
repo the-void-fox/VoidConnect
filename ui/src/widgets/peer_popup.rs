@@ -237,7 +237,7 @@ pub fn show_peer_profile(
         }
     }
 
-    // Репутация узла (по локальным данным; сетевая синхронизация — отд. фаза)
+    // Качество раздачи (локальная репутация: валидные/битые чанки, отдача).
     if let Some(score) = reputation {
         use void_reputation::ReputationLevel;
         let (label, color) = match ReputationLevel::from_score(score) {
@@ -250,9 +250,12 @@ pub fn show_peer_profile(
         ui.separator();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Репутация:").strong());
+            ui.label(egui::RichText::new("Качество раздачи:").strong());
             ui.label(egui::RichText::new(format!("{label}  ({score:.1})")).color(color));
-        });
+        })
+        .response
+        .on_hover_text("Как этот узел отдаёт вам файлы: проверенные и битые части. \
+                        На доверие и голосования не влияет.");
     }
 
     if !description.is_empty() {

@@ -38,14 +38,15 @@ pub struct VotesPage {
     pub proposals:     Option<Arc<Mutex<Vec<ProposalView>>>>,
     pub propose_tx:    Option<UnboundedSender<ProposalKind>>,
     pub vote_cast_tx:  Option<UnboundedSender<(String, bool)>>,
-    pub my_score:      Option<Arc<Mutex<f64>>>,
+    /// Сколько узлов поручились за нас (0 — наши предложения никто не увидит).
+    pub my_vouchers:   Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub peers:         Option<Arc<Mutex<Vec<PeerInfo>>>>,
     pub profiles:      Option<Arc<Mutex<HashMap<NodeId, PeerProfile>>>>,
     pub storage_files: Option<Arc<Mutex<Vec<StorageFileInfo>>>>,
 
     // Локальное состояние UI.
     snapshot:     Vec<ProposalView>,
-    score:        f64,
+    vouchers:     usize,
     show_create:  bool,
     new_kind:     NewKind,
     target_node:  String,
@@ -60,12 +61,12 @@ impl Default for VotesPage {
             proposals:     None,
             propose_tx:    None,
             vote_cast_tx:  None,
-            my_score:      None,
+            my_vouchers:   None,
             peers:         None,
             profiles:      None,
             storage_files: None,
             snapshot:      Vec::new(),
-            score:         0.0,
+            vouchers:      0,
             show_create:   false,
             new_kind:      NewKind::default(),
             target_node:   String::new(),
@@ -81,22 +82,25 @@ impl VotesPage {
         if let Some(shared) = &self.proposals {
             self.snapshot = shared.lock().unwrap().clone();
         }
-        if let Some(shared) = &self.my_score {
-            self.score = *shared.lock().unwrap();
+        if let Some(n) = &self.my_vouchers {
+            self.vouchers = n.load(std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
         self.sync();
-        let can_propose = void_vote::can_propose(self.score);
-        let can_vote = void_vote::can_vote(self.score);
+        // Предложение показывают только те, у кого автор доверен, — без единого
+        // поручительства за нас его не увидит никто. Голосовать может каждый:
+        // вес голоса каждый узел считает сам.
+        let can_propose = self.vouchers > 0;
+        let can_vote = true;
 
         ui.horizontal(|ui| {
             ui.heading("\u{F0C30} Голосования");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(can_propose, Button::new(" \u{F0415} Создать"))
-                    .on_disabled_hover_text("Нужна высокая репутация (≥ 50)")
+                    .on_disabled_hover_text("Сначала кто-то должен поручиться за вас")
                     .clicked()
                 {
                     self.show_create = true;
@@ -104,22 +108,21 @@ impl VotesPage {
             });
         });
 
+        ui.label(
+            RichText::new(
+                "Вес голоса — доверие к голосующему в глазах вашего узла: проверенный лично \
+                 весит 1, через знакомых — меньше, незнакомец — ноль. Итог у каждого узла свой \
+                 и применяется только у него.",
+            )
+            .small()
+            .weak(),
+        );
         if !can_propose {
             ui.label(
-                RichText::new(format!(
-                    "Создавать голосования может узел с высокой репутацией (≥ 50). Ваша: {:.0}",
-                    self.score
-                ))
-                .small()
-                .weak(),
-            );
-        }
-        if !can_vote {
-            ui.label(
-                RichText::new(format!(
-                    "\u{F0026} Голосовать может узел с положительной репутацией. Ваша: {:.0}",
-                    self.score
-                ))
+                RichText::new(
+                    "\u{F0026} Ваши предложения увидят только узлы, которые вам доверяют, а за вас \
+                     ещё никто не поручился. Сверьте код безопасности со знакомым.",
+                )
                 .small()
                 .color(egui::Color32::from_rgb(210, 150, 60)),
             );
@@ -311,18 +314,22 @@ fn show_proposal(
         );
 
         ui.add_space(2.0);
-        let total = v.eligible.max(1);
-        let frac = v.yes as f32 / total as f32;
-        ui.add(egui::ProgressBar::new(frac).text(format!("За {} / Против {}", v.yes, v.no)));
+        let t = &v.tally;
+        let frac = if t.weight() > 0.0 { (t.yes / t.weight()) as f32 } else { 0.0 };
+        ui.add(egui::ProgressBar::new(frac).text(format!(
+            "За {:.2} ({}) / Против {:.2} ({})",
+            t.yes, t.yes_count, t.no, t.no_count,
+        )))
+        .on_hover_text("Вес голосов (в скобках — сколько голосов). Голоса незнакомцев не весят.");
 
         let p = void_vote::params(&v.kind);
         ui.label(
             RichText::new(format!(
-                "участников: {} (нужно {}) · высокореп.: {} (нужно {}) · порог: {}",
-                v.eligible,
-                p.min_voters,
-                v.high,
-                p.min_high,
+                "вес: {:.2} (нужно {:.1}) · доверенных: {} (нужно {}) · порог: {}",
+                t.weight(),
+                p.min_weight,
+                t.trusted,
+                p.min_trusted,
                 if p.supermajority { "⅔" } else { ">½" },
             ))
             .small()

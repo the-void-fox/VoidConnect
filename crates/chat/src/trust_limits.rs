@@ -47,6 +47,8 @@ pub(crate) enum Kind {
     Dns,
     Proposal,
     Vote,
+    /// Жалоба на узел.
+    Report,
 }
 
 impl Kind {
@@ -85,7 +87,7 @@ fn author_rate(tier: AuthorTier, kind: Kind) -> Option<Rate> {
         (_, Dns) => per(10.0, HOUR, 10.0),
         // Предложения незнакомцев не пересылаются вовсе.
         (Stranger, Proposal) => return None,
-        (_, Proposal | Vote) => per(1.0, MIN, 2.0),
+        (_, Proposal | Vote | Report) => per(1.0, MIN, 2.0),
     })
 }
 

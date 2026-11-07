@@ -1,58 +1,52 @@
-//! Детерминированный подсчёт голосов.
+//! Подсчёт голосов по весам доверия (проект — `Obsidian/Сеть доверия.md`,
+//! раздел «Голосования»).
 //!
-//! Подсчёт — чистая функция от (тип, набор голосов, локальные репутации, время).
-//! Без БД и async: одинаковый набор входов даёт одинаковый результат на любом
-//! узле. Репутации передаются снаружи (backend заранее выгружает их из
-//! `ScoreManager`), поэтому крейт не зависит от `void-reputation`.
+//! Подсчёт — чистая функция от (тип, набор голосов, веса голосующих, время).
+//! Вес голоса — доверие к голосующему **в глазах этого узла** (лично
+//! проверенный — 1, «через знакомых» — его `t`, освоившиеся — из общего пула,
+//! незнакомцы — 0). Веса считает backend по сети доверия, поэтому крейт от неё
+//! не зависит. Разные узлы видят разные итоги — это свойство модели: итог
+//! применяется «в моей сети».
 
 use std::collections::HashMap;
 
 use crate::types::{ProposalKind, VOTING_WINDOW_SECS};
 
-/// Минимальный score для права голоса (нужна «плюсовая» репутация).
-/// Зеркалит `void_reputation::score::SCORE_LOW`.
-pub const MIN_VOTER_SCORE: f64 = 0.0;
-
-/// Порог «высокой» репутации для кворума и права создавать предложения.
-/// Зеркалит `void_reputation::score::SCORE_HIGH`.
-pub const HIGH_SCORE: f64 = 50.0;
-
-/// Может ли узел с таким score инициировать голосование (нужен High).
-pub fn can_propose(score: f64) -> bool {
-    score >= HIGH_SCORE
-}
-
-/// Имеет ли узел право голоса (нужна положительная репутация).
-pub fn can_vote(score: f64) -> bool {
-    score > MIN_VOTER_SCORE
+/// Голосующий в глазах этого узла.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoterWeight {
+    /// Вес голоса (0..=1).
+    pub weight: f64,
+    /// Доверен «через знакомых» или лично (`t ≥ 0.05`) — для кворума по людям.
+    pub trusted: bool,
 }
 
 /// Пороги валидности и прохождения для типа предложения.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TallyParams {
-    /// Минимум разных подходящих проголосовавших (кворум участия).
-    pub min_voters: usize,
-    /// Минимум высокорепутационных (`score >= HIGH_SCORE`) среди них (кворум доверия).
-    pub min_high: usize,
-    /// `true` — нужно супербольшинство ⅔; `false` — строгое большинство >50%.
+    /// Минимальный суммарный вес проголосовавших (кворум по весу).
+    pub min_weight: f64,
+    /// Минимум доверенных (`t ≥ 0.05`) среди проголосовавших.
+    pub min_trusted: usize,
+    /// `true` — нужно ⅔ веса «за»; `false` — строго больше половины.
     pub supermajority: bool,
 }
 
-/// Пороги по типу предложения (см. согласованную таблицу).
+/// Пороги по типу предложения.
 pub fn params(kind: &ProposalKind) -> TallyParams {
     match kind {
-        // Безопасное аддитивное действие — мягкий порог.
+        // Безопасное добавление — мягкий порог.
         ProposalKind::AddChannel { .. } => TallyParams {
-            min_voters: 3,
-            min_high: 2,
+            min_weight: 1.5,
+            min_trusted: 2,
             supermajority: false,
         },
-        // Опасные/спорные действия — жёсткий порог.
+        // Опасные и спорные действия — жёсткий порог.
         ProposalKind::BanUser { .. }
         | ProposalKind::UnbanUser { .. }
         | ProposalKind::RemoveFile { .. } => TallyParams {
-            min_voters: 7,
-            min_high: 3,
+            min_weight: 3.0,
+            min_trusted: 3,
             supermajority: true,
         },
     }
@@ -63,24 +57,33 @@ pub fn params(kind: &ProposalKind) -> TallyParams {
 pub enum Outcome {
     /// Принято (порог пройден, кворум выполнен).
     Passed,
-    /// Отклонено (кворум выполнен, но не хватило голосов «за»).
+    /// Отклонено (кворум выполнен, но не хватило веса «за»).
     Rejected,
-    /// Нет кворума (мало участников или мало высокорепутационных).
+    /// Нет кворума (мало веса или мало доверенных голосующих).
     NoQuorum,
 }
 
-/// Результат подсчёта (учитываются только eligible — score > 0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Результат подсчёта. Голоса с нулевым весом не учитываются.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tally {
-    pub yes: usize,
-    pub no: usize,
-    /// Число eligible-голосов (yes + no).
-    pub eligible: usize,
-    /// Сколько из eligible — высокорепутационные (для кворума доверия).
-    pub high: usize,
+    /// Вес «за» и «против».
+    pub yes: f64,
+    pub no: f64,
+    /// Сколько голосов с ненулевым весом «за» и «против».
+    pub yes_count: usize,
+    pub no_count: usize,
+    /// Сколько из них доверенных (для кворума по людям).
+    pub trusted: usize,
     pub outcome: Outcome,
     /// Окно ещё открыто → `outcome` предварительный (живой подсчёт).
     pub open: bool,
+}
+
+impl Tally {
+    /// Суммарный вес проголосовавших.
+    pub fn weight(&self) -> f64 {
+        self.yes + self.no
+    }
 }
 
 /// Один уже дедуплицированный голос (по одному на узел — store отдаёт такой).
@@ -96,67 +99,62 @@ pub fn is_closed(created_at: i64, now: i64) -> bool {
     now >= created_at + VOTING_WINDOW_SECS
 }
 
-/// score голосующего по локальной карте; неизвестный узел = 0.0 (не eligible).
-fn score_of(scores: &HashMap<String, f64>, voter_key: &str) -> f64 {
-    scores.get(voter_key).copied().unwrap_or(0.0)
-}
-
-/// Подсчитывает итог. `scores` — локальный взгляд на репутацию голосующих.
+/// Подсчитывает итог. `weights` — вес каждого голосующего в глазах этого узла
+/// (нет в карте — вес 0).
 pub fn tally(
     kind: &ProposalKind,
     created_at: i64,
     votes: &[VoteRecord],
-    scores: &HashMap<String, f64>,
+    weights: &HashMap<String, VoterWeight>,
     now: i64,
 ) -> Tally {
     let p = params(kind);
-
-    let mut yes = 0usize;
-    let mut no = 0usize;
-    let mut high = 0usize;
+    let mut t = Tally {
+        yes: 0.0,
+        no: 0.0,
+        yes_count: 0,
+        no_count: 0,
+        trusted: 0,
+        outcome: Outcome::NoQuorum,
+        open: !is_closed(created_at, now),
+    };
     for v in votes {
-        let s = score_of(scores, &v.voter_key);
-        if !can_vote(s) {
-            continue; // нет права голоса — пропускаем
-        }
+        let Some(w) = weights.get(&v.voter_key).filter(|w| w.weight > 0.0) else {
+            continue; // голос без веса
+        };
         if v.choice {
-            yes += 1;
+            t.yes += w.weight;
+            t.yes_count += 1;
         } else {
-            no += 1;
+            t.no += w.weight;
+            t.no_count += 1;
         }
-        if s >= HIGH_SCORE {
-            high += 1;
+        if w.trusted {
+            t.trusted += 1;
         }
     }
-    let eligible = yes + no;
-
-    let outcome = if eligible < p.min_voters || high < p.min_high {
+    t.outcome = if t.weight() + EPS < p.min_weight || t.trusted < p.min_trusted {
         Outcome::NoQuorum
-    } else if passes(yes, eligible, p.supermajority) {
+    } else if passes(t.yes, t.weight(), p.supermajority) {
         Outcome::Passed
     } else {
         Outcome::Rejected
     };
-
-    Tally {
-        yes,
-        no,
-        eligible,
-        high,
-        outcome,
-        open: !is_closed(created_at, now),
-    }
+    t
 }
 
-/// Пройден ли порог. Целочисленная арифметика — детерминированно, без float.
-fn passes(yes: usize, total: usize, supermajority: bool) -> bool {
-    if total == 0 {
+/// Допуск сравнения сумм весов (сумма дробей может недобрать в последнем знаке).
+const EPS: f64 = 1e-9;
+
+/// Пройден ли порог по весу.
+fn passes(yes: f64, total: f64, supermajority: bool) -> bool {
+    if total <= 0.0 {
         return false;
     }
     if supermajority {
-        yes * 3 >= total * 2 // ≥ 2/3
+        yes * 3.0 + EPS >= total * 2.0 // ≥ ⅔
     } else {
-        yes * 2 > total // строго > 1/2
+        yes * 2.0 > total + EPS // строго > ½
     }
 }
 
@@ -168,100 +166,84 @@ mod tests {
         VoteRecord { voter_key: key.into(), choice, created_at: 0 }
     }
 
-    /// Карта репутаций: подходящие узлы помечаем нужным score.
-    fn scores(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
-        pairs.iter().map(|(k, s)| (k.to_string(), *s)).collect()
+    /// Веса: `(ключ, вес, доверенный)`.
+    fn weights(pairs: &[(&str, f64, bool)]) -> HashMap<String, VoterWeight> {
+        pairs
+            .iter()
+            .map(|(k, w, t)| (k.to_string(), VoterWeight { weight: *w, trusted: *t }))
+            .collect()
     }
 
+    fn channel() -> ProposalKind {
+        ProposalKind::AddChannel { id: "x".into(), name: "X".into(), icon: "#".into() }
+    }
+
+    const CLOSED: i64 = VOTING_WINDOW_SECS + 1;
+
     #[test]
-    fn add_channel_passes_with_soft_quorum() {
-        let kind = ProposalKind::AddChannel {
-            id: "tech2".into(),
-            name: "Tech2".into(),
-            icon: "#".into(),
-        };
-        // 3 голоса, 2 из них высокорепутационные, все «за».
-        let votes = [v("a", true), v("b", true), v("c", true)];
-        let sc = scores(&[("a", 60.0), ("b", 55.0), ("c", 5.0)]);
-        let t = tally(&kind, 0, &votes, &sc, VOTING_WINDOW_SECS + 1);
+    fn add_channel_passes_with_weight_quorum() {
+        // Двое лично проверенных — вес 2.0 ≥ 1.5, доверенных 2.
+        let votes = [v("a", true), v("b", true)];
+        let w = weights(&[("a", 1.0, true), ("b", 1.0, true)]);
+        let t = tally(&channel(), 0, &votes, &w, CLOSED);
         assert_eq!(t.outcome, Outcome::Passed);
-        assert_eq!((t.yes, t.no, t.high), (3, 0, 2));
+        assert_eq!((t.yes_count, t.no_count, t.trusted), (2, 0, 2));
         assert!(!t.open);
     }
 
     #[test]
-    fn add_channel_no_quorum_without_two_high() {
-        let kind = ProposalKind::AddChannel {
-            id: "x".into(),
-            name: "X".into(),
-            icon: "#".into(),
-        };
-        // 3 голоса, но лишь 1 высокорепутационный → нет кворума доверия.
-        let votes = [v("a", true), v("b", true), v("c", true)];
-        let sc = scores(&[("a", 60.0), ("b", 5.0), ("c", 5.0)]);
-        let t = tally(&kind, 0, &votes, &sc, VOTING_WINDOW_SECS + 1);
+    fn many_weak_voters_do_not_make_quorum_of_people() {
+        // Десять освоившихся из общего пула (вместе 1.0) и один доверенный:
+        // вес 1.5 есть, но доверенных людей только один.
+        let mut pairs: Vec<(String, f64, bool)> = (0..10).map(|i| (format!("s{i}"), 0.1, false)).collect();
+        pairs.push(("a".into(), 0.5, true));
+        let w: HashMap<String, VoterWeight> = pairs
+            .iter()
+            .map(|(k, w, t)| (k.clone(), VoterWeight { weight: *w, trusted: *t }))
+            .collect();
+        let votes: Vec<VoteRecord> = pairs.iter().map(|(k, _, _)| v(k, true)).collect();
+        let t = tally(&channel(), 0, &votes, &w, CLOSED);
+        assert!((t.weight() - 1.5).abs() < 1e-9);
         assert_eq!(t.outcome, Outcome::NoQuorum);
     }
 
     #[test]
-    fn ineligible_votes_excluded() {
-        let kind = ProposalKind::AddChannel {
-            id: "x".into(),
-            name: "X".into(),
-            icon: "#".into(),
-        };
-        // c — нулевая репутация (не eligible), d — неизвестен (=0). Останется 2 → < min_voters(3).
-        let votes = [v("a", true), v("b", true), v("c", true), v("d", true)];
-        let sc = scores(&[("a", 60.0), ("b", 55.0), ("c", 0.0)]);
-        let t = tally(&kind, 0, &votes, &sc, VOTING_WINDOW_SECS + 1);
-        assert_eq!(t.eligible, 2);
-        assert_eq!(t.outcome, Outcome::NoQuorum);
-    }
-
-    #[test]
-    fn ban_user_needs_two_thirds() {
-        let kind = ProposalKind::BanUser { target: "victim".into() };
-        // 7 голосов, 3 высокорепутационных. 5 «за» / 2 «против» = 71% ≥ ⅔ → проходит.
-        let votes = [
-            v("a", true), v("b", true), v("c", true), v("d", true), v("e", true),
-            v("f", false), v("g", false),
-        ];
-        let sc = scores(&[
-            ("a", 60.0), ("b", 55.0), ("c", 51.0),
-            ("d", 10.0), ("e", 10.0), ("f", 10.0), ("g", 10.0),
-        ]);
-        let t = tally(&kind, 0, &votes, &sc, VOTING_WINDOW_SECS + 1);
-        assert_eq!((t.yes, t.no, t.high), (5, 2, 3));
+    fn strangers_have_no_say() {
+        // Тысяча незнакомцев против — их голоса не весят ничего.
+        let mut votes = vec![v("a", true), v("b", true)];
+        votes.extend((0..1000).map(|i| v(&format!("bot{i}"), false)));
+        let w = weights(&[("a", 1.0, true), ("b", 0.6, true)]);
+        let t = tally(&channel(), 0, &votes, &w, CLOSED);
+        assert_eq!((t.yes_count, t.no_count), (2, 0));
         assert_eq!(t.outcome, Outcome::Passed);
     }
 
     #[test]
-    fn ban_user_rejected_below_two_thirds() {
+    fn ban_needs_two_thirds_of_weight() {
         let kind = ProposalKind::BanUser { target: "victim".into() };
-        // 7 голосов, 3 высокорепутационных, но 4 «за» / 3 «против» = 57% < ⅔.
-        let votes = [
-            v("a", true), v("b", true), v("c", true), v("d", true),
-            v("e", false), v("f", false), v("g", false),
-        ];
-        let sc = scores(&[
-            ("a", 60.0), ("b", 55.0), ("c", 51.0),
-            ("d", 10.0), ("e", 10.0), ("f", 10.0), ("g", 10.0),
-        ]);
-        let t = tally(&kind, 0, &votes, &sc, VOTING_WINDOW_SECS + 1);
+        let w = weights(&[("a", 1.0, true), ("b", 1.0, true), ("c", 1.0, true), ("d", 0.5, true)]);
+        // 2.0 «за» из 3.0 — ровно ⅔ → проходит.
+        let t = tally(&kind, 0, &[v("a", true), v("b", true), v("c", false)], &w, CLOSED);
+        assert_eq!(t.outcome, Outcome::Passed);
+        // 2.0 «за» из 3.5 — меньше ⅔ → отклонено.
+        let t = tally(&kind, 0, &[v("a", true), v("b", true), v("c", false), v("d", false)], &w, CLOSED);
         assert_eq!(t.outcome, Outcome::Rejected);
+        // Вес 2.5 < 3.0 — нет кворума, даже если все «за».
+        let t = tally(&kind, 0, &[v("a", true), v("b", true), v("d", true)], &w, CLOSED);
+        assert_eq!(t.outcome, Outcome::NoQuorum);
+    }
+
+    #[test]
+    fn simple_majority_is_strict() {
+        let w = weights(&[("a", 1.0, true), ("b", 1.0, true)]);
+        let t = tally(&channel(), 0, &[v("a", true), v("b", false)], &w, CLOSED);
+        assert_eq!(t.outcome, Outcome::Rejected, "ровно половина — не большинство");
     }
 
     #[test]
     fn open_window_marks_provisional() {
-        let kind = ProposalKind::AddChannel {
-            id: "x".into(),
-            name: "X".into(),
-            icon: "#".into(),
-        };
-        let votes = [v("a", true), v("b", true), v("c", true)];
-        let sc = scores(&[("a", 60.0), ("b", 55.0), ("c", 5.0)]);
-        // now внутри окна → open == true, но outcome уже считается (живой).
-        let t = tally(&kind, 1_000, &votes, &sc, 1_001);
+        let w = weights(&[("a", 1.0, true), ("b", 1.0, true)]);
+        let t = tally(&channel(), 1_000, &[v("a", true), v("b", true)], &w, 1_001);
         assert!(t.open);
         assert_eq!(t.outcome, Outcome::Passed);
     }

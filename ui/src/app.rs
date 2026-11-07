@@ -169,7 +169,7 @@ impl VoidApp {
         votes.proposals     = Some(std::sync::Arc::clone(&backend.proposals));
         votes.propose_tx    = Some(backend.propose_tx.clone());
         votes.vote_cast_tx  = Some(backend.vote_cast_tx.clone());
-        votes.my_score      = Some(std::sync::Arc::clone(&backend.my_score));
+        votes.my_vouchers   = Some(std::sync::Arc::clone(&backend.my_vouchers));
         votes.peers         = Some(std::sync::Arc::clone(&backend.peers));
         votes.profiles      = Some(std::sync::Arc::clone(&backend.peer_profiles));
         votes.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
@@ -430,8 +430,7 @@ impl VoidApp {
         self.profile.download_bytes = self.backend.bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
 
         // Своя репутация глазами пиров (из периодического gossip) + есть ли пиры.
-        self.profile.my_reputation = *self.backend.my_reputation.lock().unwrap();
-        self.profile.has_peers     = self.peer_count > 0;
+        self.profile.my_vouchers = self.backend.my_vouchers.load(std::sync::atomic::Ordering::Relaxed);
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {

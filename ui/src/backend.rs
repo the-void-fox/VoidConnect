@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use void_core::dns::{DnsKind, DnsRecord};
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile, Service};
-use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, RepGossip, VoteGossip};
+use void_chat::public_chat::{start_public_chat, ChatHandle, ChatMessage, VoteGossip};
 use void_chat::trust_limits::AuthorTier;
 use void_chat::private_chat::{start_private_chat, IncomingDm, DmSendCmd, PrivateChatHandle};
 use void_crypto::keys::{EncryptionKeypair, SigningKeypair};
@@ -18,7 +18,7 @@ use void_discovery::PeerList;
 use void_network::secure::NoiseIdentity;
 use void_storage::{ChunkEvent, ChunkStore, StorageManager};
 use void_reputation::{
-    EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager, SyncManager,
+    EventProcessor, RateLimiter, ReportManager, ReportReason, ReputationEvent, ScoreManager,
 };
 use void_core::site::SiteRevocation;
 use void_web::{publish_site, DnsRegistry, SiteRegistry};
@@ -396,16 +396,34 @@ impl TrustService {
             .collect();
         blocked.extend(self.access.lock().unwrap().blocked.iter().cloned().map(NodeId));
         let private = self.private.lock().unwrap().clone();
-        let reported = HashSet::new(); // жалобы с весом доверия — фаза 5
-        let map = void_trust::compute(&void_trust::TrustInputs {
+        let compute = |reported: &HashSet<NodeId>| void_trust::compute(&void_trust::TrustInputs {
             me: &self.my_id,
             vouches: &vouches,
             blocked: &blocked,
-            reported: &reported,
+            reported,
             settled: &settled,
             private_verified: &private,
         });
+        // Вес жалобы — доверие к заявителю, посчитанное без учёта жалоб (иначе
+        // круг); найденные цели «под жалобами» — во втором проходе.
+        let base = compute(&HashSet::new());
+        let reported = void_trust::reported(&base, &self.my_id, &self.recent_reports(now).await);
+        let map = if reported.is_empty() { base } else { compute(&reported) };
         *self.snapshot.lock().unwrap() = map;
+    }
+
+    /// Пары (цель, заявитель) жалоб, полученных за срок учёта (30 дней).
+    async fn recent_reports(&self, now: i64) -> Vec<(NodeId, NodeId)> {
+        let since = chrono::DateTime::from_timestamp(now - void_reputation::reports::REPORT_MAX_AGE_SECS, 0)
+            .unwrap_or_default()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        void_db::peers::recent_report_pairs(&self.pool, &since)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(target, reporter)| (NodeId(target), NodeId(reporter)))
+            .collect()
     }
 }
 
@@ -456,12 +474,12 @@ pub enum DownloadCmd {
     RemoveLocal(String),
 }
 
-/// Компоненты системы репутации, разделяемые между фоновыми задачами.
+/// Компоненты системы репутации (локальное качество раздачи + приём жалоб),
+/// разделяемые между фоновыми задачами.
 #[derive(Clone)]
 struct Reputation {
     score:   ScoreManager,
     events:  EventProcessor,
-    sync:    Arc<SyncManager>,
     reports: ReportManager,
     /// Наш ключ подписи — для создания подписанных жалоб.
     keypair: Arc<SigningKeypair>,
@@ -609,8 +627,6 @@ pub struct BackendHandle {
     pub blocklist: Arc<Mutex<HashMap<NodeId, i64>>>,
     /// Каналы чата, добавленные голосованием (мерджатся со встроенными).
     pub voted_channels: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
-    /// Наша собственная репутация (для проверки права голоса/предложения в UI).
-    pub my_score: Arc<Mutex<f64>>,
 
     // ── Статистика сессии (для профиля) ──────────────────────────────────────
     /// Момент старта бэкенда — для подсчёта аптайма сессии.
@@ -619,10 +635,6 @@ pub struct BackendHandle {
     pub bytes_uploaded: Arc<AtomicU64>,
     /// Всего принято байт чанков по сети за сессию.
     pub bytes_downloaded: Arc<AtomicU64>,
-    /// Наша репутация глазами подключённых пиров: среднее их оценок о нас + число
-    /// сообщивших пиров. `None` — данных нет (нет пиров или gossip ещё не пришёл).
-    /// Обновляется периодически из входящего reputation-gossip, НЕ по запросу из UI.
-    pub my_reputation: Arc<Mutex<Option<(f64, usize)>>>,
     /// Снимок доверия к узлам (сеть доверия, от лица нашего узла).
     pub trust: Arc<Mutex<void_trust::TrustMap>>,
     /// Неопубликованные отметки «проверен» (старые локальные).
@@ -685,7 +697,6 @@ pub fn start_backend(
     ));
     let voted_channels: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>> =
         Arc::new(Mutex::new(crate::vote_service::load_voted_channels()));
-    let my_score: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
     let my_ip = if local_mode {
         IpAddr::from([127, 0, 0, 1])
@@ -727,7 +738,6 @@ pub fn start_backend(
     let proposals_bg  = Arc::clone(&proposals);
     let blocklist_bg  = Arc::clone(&blocklist);
     let voted_channels_bg = Arc::clone(&voted_channels);
-    let my_score_bg   = Arc::clone(&my_score);
 
     // Статистика сессии (профиль): аптайм + реальные счётчики трафика.
     let start_time = std::time::Instant::now();
@@ -735,9 +745,6 @@ pub fn start_backend(
     let bytes_downloaded: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let bytes_uploaded_bg   = Arc::clone(&bytes_uploaded);
     let bytes_downloaded_bg = Arc::clone(&bytes_downloaded);
-    // Наша репутация глазами пиров (заполняется из входящего gossip).
-    let my_reputation: Arc<Mutex<Option<(f64, usize)>>> = Arc::new(Mutex::new(None));
-    let my_reputation_bg = Arc::clone(&my_reputation);
     let trust: Arc<Mutex<void_trust::TrustMap>> = Arc::new(Mutex::new(void_trust::TrustMap::default()));
     let trust_bg = Arc::clone(&trust);
     let private_verified: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(
@@ -770,8 +777,8 @@ pub fn start_backend(
                 publish_site_rx, sites_bg, site_http_port,
                 dns_bg, reach_bg, mirror_rx,
                 propose_rx, vote_cast_rx, proposals_bg,
-                blocklist_bg, voted_channels_bg, my_score_bg,
-                bytes_uploaded_bg, bytes_downloaded_bg, my_reputation_bg,
+                blocklist_bg, voted_channels_bg,
+                bytes_uploaded_bg, bytes_downloaded_bg,
                 trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg,
             ).await;
         });
@@ -816,11 +823,9 @@ pub fn start_backend(
         proposals,
         blocklist,
         voted_channels,
-        my_score,
         start_time,
         bytes_uploaded,
         bytes_downloaded,
-        my_reputation,
         trust,
         private_verified,
         trust_tx,
@@ -869,10 +874,8 @@ async fn backend_main(
     proposals_out: Arc<Mutex<Vec<crate::vote_service::ProposalView>>>,
     blocklist_out: Arc<Mutex<HashMap<NodeId, i64>>>,
     voted_channels_out: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
-    my_score_out: Arc<Mutex<f64>>,
     bytes_uploaded: Arc<AtomicU64>,
     bytes_downloaded: Arc<AtomicU64>,
-    my_reputation_out: Arc<Mutex<Option<(f64, usize)>>>,
     trust_out: Arc<Mutex<void_trust::TrustMap>>,
     private_out: Arc<Mutex<HashSet<NodeId>>>,
     trust_rx: tokio::sync::mpsc::UnboundedReceiver<TrustCmd>,
@@ -912,17 +915,13 @@ async fn backend_main(
     // TCP-соединения — DM, чанки, bootstrap, relay (чат создаёт свой из sign_kp).
     let noise = NoiseIdentity::new(&sign_kp);
 
-    // ── Система репутации (локальный скоринг + сетевая синхронизация) ─────────
+    // ── Репутация: локальное качество раздачи и приём жалоб ──────────────────
     // Доступна, если есть БД.
     let reputation: Option<Reputation> = db_pool.clone().map(|pool| {
         let score = ScoreManager::new(pool.clone());
         let events = EventProcessor::new(score.clone(), Arc::new(rate_limiter.clone()));
-        let sync = Arc::new(SyncManager::new(
-            pool.clone(), score.clone(),
-            sign_kp.clone(), my_peer.id.clone(),
-        ));
-        let reports = ReportManager::new(pool, score.clone(), my_peer.id.clone());
-        Reputation { score, events, sync, reports, keypair: sign_kp.clone() }
+        let reports = ReportManager::new(pool, score.clone());
+        Reputation { score, events, reports, keypair: sign_kp.clone() }
     });
 
     // Канал событий о качестве чанков из storage → события репутации.
@@ -1093,6 +1092,9 @@ async fn backend_main(
 
     // ── Сеть доверия ──────────────────────────────────────────────────────────
     let trust_snapshot = Arc::clone(&trust_out);
+    // Сигнал «пересчитать доверие» — и от жалоб (они меняют уровни узлов).
+    let trust_dirty = Arc::new(tokio::sync::Notify::new());
+    let my_vouchers_votes = Arc::clone(&my_vouchers);
     // Без БД (поручительства хранятся в ней) команды GUI просто не исполняются.
     if let Some(pool) = db_pool.clone() {
         let trust = TrustService {
@@ -1105,7 +1107,7 @@ async fn backend_main(
             blocklist: Arc::clone(&blocklist_out),
             my_vouchers,
             access:    Arc::clone(&dm_access),
-            dirty:     Arc::new(tokio::sync::Notify::new()),
+            dirty:     Arc::clone(&trust_dirty),
         };
         // Лимиты чата по уровню доверия — после первого расчёта, иначе в первые
         // секунды все авторы были бы незнакомцами (до этого чат их не ограничивает).
@@ -1368,21 +1370,14 @@ async fn backend_main(
     // сайтов по запросу). Клонируем до того, как peers_out уедет в задачу ниже.
     let sites_peers = Arc::clone(&peers_out);
 
-    // Задача: периодически снимаем peer_list и профили для GUI.
-    // Здесь же ведём репутацию: события подключения/отключения (аптайм) и
-    // обновление снимка score для GUI.
-    // Своя репутация: задача приёма кладёт сюда оценки других о нас (peer → score),
-    // снапшот-задача чистит карту до живых пиров и усредняет в my_reputation_out.
-    let my_rep_views: Arc<Mutex<HashMap<NodeId, f64>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Задача: периодически снимаем peer_list и профили для GUI, снимок
+    // качества раздачи и жалоб.
     let pl       = peer_list.clone();
     let chat_p   = chat.clone();
     let rep_snap = reputation.clone();
     let rep_out  = Arc::clone(&reputation_out);
-    let snap_rep_views = Arc::clone(&my_rep_views);
-    let my_rep_out = Arc::clone(&my_reputation_out);
     let reports_pool = db_pool.clone();
     let reports_out_t = Arc::clone(&reports_out);
-    let my_rep_id = my_peer.id.clone();
     let dns_snap = dns.clone();
     let rl_clean = rate_limiter.clone();
     // Для динамической регистрации на relay узлов, узнанных по gossip.
@@ -1449,42 +1444,13 @@ async fn backend_main(
                 .collect();
             let newly: Vec<NodeId> = cur_ids.difference(&prev_ids).cloned().collect();
 
+            // Снимок качества раздачи (локальная репутация) для GUI.
             if let Some(rep) = &rep_snap {
-                for id in &newly {
-                    rep.events.process(ReputationEvent::PeerConnected { peer_id: id.clone() }).await;
-                }
-                for id in prev_ids.difference(&cur_ids) {
-                    rep.events.process(ReputationEvent::PeerDisconnected { peer_id: id.clone() }).await;
-                }
-                // Рассылаем наш снимок оценок (gossip): при появлении новых узлов и
-                // периодически (~раз в 3 мин, tick=2с) — чтобы каждый узел регулярно
-                // узнавал свою репутацию из чужих снимков, без отдельных запросов.
-                if !newly.is_empty() || tick % 90 == 0 {
-                    if let Ok(signed) = rep.sync.build_signed_sync().await {
-                        chat_p.broadcast_reputation_sync(my_rep_id.clone(), signed).await;
-                    }
-                }
-                // Снимок репутации для GUI.
                 let mut snapshot = HashMap::with_capacity(cur_ids.len());
                 for id in &cur_ids {
                     snapshot.insert(id.clone(), rep.score.score(id).await);
                 }
                 *rep_out.lock().unwrap() = snapshot;
-
-                // Своя репутация: усредняем оценки о нас от ЖИВЫХ пиров (карту
-                // наполняет задача приёма gossip). Нет данных → None (UI покажет,
-                // что узнать репутацию нельзя / она ещё уточняется).
-                {
-                    let mut views = snap_rep_views.lock().unwrap();
-                    views.retain(|id, _| cur_ids.contains(id));
-                    let agg = if views.is_empty() {
-                        None
-                    } else {
-                        let sum: f64 = views.values().sum();
-                        Some((sum / views.len() as f64, views.len()))
-                    };
-                    *my_rep_out.lock().unwrap() = agg;
-                }
             }
 
             // Снимок жалоб на текущие узлы (для просмотра в профиле). Реже —
@@ -1514,43 +1480,28 @@ async fn backend_main(
         }
     });
 
-    // Задача: входящие пакеты репутации из сети (sync/жалобы) → применяем.
+    // Задача: входящие жалобы → в БД. Жалоба незнакомца веса не имеет — не
+    // храним; вес остальных учитывает пересчёт доверия (он же ставит «под жалобами»).
     if let Some(rep) = reputation.clone() {
-        let mut rep_rx = chat.subscribe_reputation();
-        let rep_views = Arc::clone(&my_rep_views);
-        let rep_my_key = my_peer.id.as_str().to_string();
+        let mut reports_rx = chat.subscribe_reports();
+        let reports_trust = Arc::clone(&trust_snapshot);
+        let dirty = Arc::clone(&trust_dirty);
         tokio::spawn(async move {
             loop {
-                match rep_rx.recv().await {
-                    Ok(RepGossip::Sync { from, signed }) => {
-                        // «Что пир думает о нас» — только для отображения в профиле,
-                        // поэтому достаточно проверки подписи и свежести: влиять на
-                        // чужие оценки (apply) может лишь доверенный отправитель.
-                        match SyncManager::verify_sync(&from, &signed) {
-                            Ok(payload) => {
-                                if let Some(e) = payload.entries.iter()
-                                    .find(|e| e.target_key == rep_my_key && e.score.is_finite())
-                                {
-                                    rep_views.lock().unwrap().insert(
-                                        from.clone(),
-                                        e.score.clamp(void_reputation::score::SCORE_MIN, void_reputation::score::SCORE_MAX),
-                                    );
-                                }
-                                if let Err(e) = rep.sync.apply_signed_sync(&from, &signed).await {
-                                    tracing::debug!("Sync репутации от {} не применён: {}", from, e);
-                                }
-                            }
-                            Err(e) => tracing::debug!("Отклонён sync репутации от {}: {}", from, e),
-                        }
-                    }
-                    Ok(RepGossip::Report { signed }) => {
+                match reports_rx.recv().await {
+                    Ok(signed) => {
                         let reporter = NodeId(signed.signer.clone());
-                        if let Err(e) = rep.reports.receive_report(signed, &reporter).await {
-                            tracing::debug!("Отклонена жалоба от {}: {}", reporter, e);
+                        if reports_trust.lock().unwrap().level(&reporter) < void_trust::TrustLevel::Settled {
+                            continue;
+                        }
+                        match rep.reports.receive_report(signed, &reporter).await {
+                            Ok(true) => dirty.notify_one(),
+                            Ok(false) => {}
+                            Err(e) => tracing::debug!("Отклонена жалоба от {}: {}", reporter, e),
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Reputation gossip lagged by {}", n);
+                        tracing::warn!("Жалобы: пропущено {} (переполнение)", n);
                     }
                     Err(_) => break,
                 }
@@ -1592,6 +1543,7 @@ async fn backend_main(
     if let Some(rep) = reputation.clone() {
         let chat_rep = chat.clone();
         let my_report_id = my_peer.id.clone();
+        let my_report_dirty = Arc::clone(&trust_dirty);
         tokio::spawn(async move {
             while let Some((target, reason)) = report_rx.recv().await {
                 if target == my_report_id {
@@ -1600,9 +1552,11 @@ async fn backend_main(
                 }
                 match ReportManager::create_report(&target, reason, &rep.keypair) {
                     Ok(signed) => {
-                        // Учитываем свою жалобу локально и рассылаем сети.
-                        if let Err(e) = rep.reports.receive_report(signed.clone(), &my_report_id).await {
-                            tracing::warn!("Локальная жалоба не принята: {}", e);
+                        // Учитываем свою жалобу локально (весит 1 — цель сразу
+                        // «под жалобами» у нас) и рассылаем сети.
+                        match rep.reports.receive_report(signed.clone(), &my_report_id).await {
+                            Ok(_) => my_report_dirty.notify_one(),
+                            Err(e) => tracing::warn!("Локальная жалоба не принята: {}", e),
                         }
                         chat_rep.broadcast_report(signed).await;
                         tracing::info!("Отправлена жалоба на {}", target);
@@ -1635,10 +1589,11 @@ async fn backend_main(
                     );
                     // Голосования (нужны БД + storage для RemoveFile).
                     start_vote_tasks(
-                        manager.clone(), pool.clone(), chat.clone(), reputation.clone(),
+                        manager.clone(), pool.clone(), chat.clone(),
+                        Arc::clone(&trust_snapshot), Arc::clone(&my_vouchers_votes),
                         my_peer.id.clone(), vote_kp,
                         propose_rx, vote_cast_rx,
-                        proposals_out, blocklist_out, voted_channels_out, my_score_out,
+                        proposals_out, blocklist_out, voted_channels_out,
                         Arc::clone(&removed_files),
                     );
                     // Сайты: HTTP-сервер + публикация + обнаружение по сети.
@@ -2253,7 +2208,8 @@ fn start_vote_tasks(
     manager: StorageManager,
     pool: void_db::DbPool,
     chat: ChatHandle,
-    reputation: Option<Reputation>,
+    trust: Arc<Mutex<void_trust::TrustMap>>,
+    my_vouchers: Arc<AtomicUsize>,
     my_id: NodeId,
     sign_kp: Arc<SigningKeypair>,
     mut propose_rx: tokio::sync::mpsc::UnboundedReceiver<void_vote::ProposalKind>,
@@ -2261,13 +2217,8 @@ fn start_vote_tasks(
     proposals_out: Arc<Mutex<Vec<crate::vote_service::ProposalView>>>,
     blocklist_out: Arc<Mutex<HashMap<NodeId, i64>>>,
     voted_channels_out: Arc<Mutex<Vec<crate::vote_service::ChannelDef>>>,
-    my_score_out: Arc<Mutex<f64>>,
     removed_files: Arc<Mutex<HashSet<String>>>,
 ) {
-    let Some(rep) = reputation else {
-        tracing::warn!("Голосования отключены: репутация недоступна (нет БД)");
-        return;
-    };
 
     // ── Приём из сети: предложения/голоса → БД; дайджест → re-announce. ──────
     {
@@ -2318,18 +2269,16 @@ fn start_vote_tasks(
         });
     }
 
-    // ── GUI → создать предложение (только High-репутация). ──────────────────
+    // ── GUI → создать предложение. Его покажут только те, у кого мы доверены, —
+    // без единого поручительства за нас его не увидит никто. ────────────────
     {
         let pool = pool.clone();
         let chat = chat.clone();
         let kp = sign_kp.clone();
-        let rep = rep.clone();
-        let me = my_id.clone();
         tokio::spawn(async move {
             while let Some(kind) = propose_rx.recv().await {
-                let score = rep.score.score(&me).await;
-                if !void_vote::can_propose(score) {
-                    tracing::warn!("Создание голосования отклонено: нужна High-репутация (сейчас {:.0})", score);
+                if my_vouchers.load(Ordering::Relaxed) == 0 {
+                    tracing::warn!("Создание голосования отклонено: за нас никто не поручился");
                     continue;
                 }
                 let p = match void_vote::Proposal::create(kind, &kp) {
@@ -2348,20 +2297,13 @@ fn start_vote_tasks(
         });
     }
 
-    // ── GUI → проголосовать (нужна положительная репутация, окно открыто). ──
+    // ── GUI → проголосовать (окно открыто). Вес голоса каждый узел считает сам. ─
     {
         let pool = pool.clone();
         let chat = chat.clone();
         let kp = sign_kp.clone();
-        let rep = rep.clone();
-        let me = my_id.clone();
         tokio::spawn(async move {
             while let Some((proposal_id, choice)) = vote_cast_rx.recv().await {
-                let score = rep.score.score(&me).await;
-                if !void_vote::can_vote(score) {
-                    tracing::warn!("Голос отклонён: нет права голоса (репутация {:.0})", score);
-                    continue;
-                }
                 let now = chrono::Utc::now().timestamp();
                 match void_vote::store::get_proposal(&pool, &proposal_id).await {
                     Ok(Some(sp)) if !void_vote::tally::is_closed(sp.created_at, now) => {
@@ -2377,20 +2319,16 @@ fn start_vote_tasks(
         });
     }
 
-    // ── Периодика: своя репутация, дайджест, финализация+исполнение, снимок. ─
+    // ── Периодика: дайджест, финализация+исполнение, снимок. ────────────────
     {
         let pool = pool.clone();
         let chat = chat.clone();
-        let rep = rep.clone();
         let me = my_id.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(VOTE_TICK_SECS));
             loop {
                 interval.tick().await;
                 let now = chrono::Utc::now().timestamp();
-
-                // Своя репутация → UI (право голоса/предложения).
-                *my_score_out.lock().unwrap() = rep.score.score(&me).await;
 
                 // Истёкшие баны убираем (с сохранением на диск).
                 {
@@ -2420,20 +2358,17 @@ fn start_vote_tasks(
                 let all = void_vote::store::list_proposals(&pool).await.unwrap_or_default();
                 let mut views = Vec::with_capacity(all.len());
                 for sp in &all {
+                    // Предложение недоверенного автора — спам: не показываем и не исполняем.
+                    let proposer_ok = proposer_trusted(&trust, &me, &sp.proposer_key);
                     let votes = void_vote::store::list_votes(&pool, &sp.id).await.unwrap_or_default();
-                    let scores = gather_scores(&rep, &votes).await;
-                    let t = void_vote::tally(&sp.kind, sp.created_at, &votes, &scores, now);
+                    let weights = voter_weights(&trust, &me, &votes);
+                    let t = void_vote::tally(&sp.kind, sp.created_at, &votes, &weights, now);
 
                     // Финализация: окно + grace прошли, ещё не исполнено.
                     let finalize_at = sp.created_at
                         + void_vote::VOTING_WINDOW_SECS + void_vote::VOTING_GRACE_SECS;
                     if sp.closed_at.is_none() && now >= finalize_at {
-                        // Доп. защита: автор должен иметь право предлагать (High).
-                        let proposer_score =
-                            rep.score.score(&NodeId(sp.proposer_key.clone())).await;
-                        if t.outcome == void_vote::Outcome::Passed
-                            && void_vote::can_propose(proposer_score)
-                        {
+                        if t.outcome == void_vote::Outcome::Passed && proposer_ok {
                             enforce_outcome(
                                 &sp.kind, &manager,
                                 &blocklist_out, &voted_channels_out, &removed_files, now,
@@ -2442,6 +2377,9 @@ fn start_vote_tasks(
                                 crate::vote_service::kind_label(&sp.kind));
                         }
                         let _ = void_vote::store::mark_closed(&pool, &sp.id, now).await;
+                    }
+                    if !proposer_ok {
+                        continue;
                     }
 
                     let my_vote = votes.iter()
@@ -2455,10 +2393,7 @@ fn start_vote_tasks(
                         created_at: sp.created_at,
                         closes_at: sp.created_at + void_vote::VOTING_WINDOW_SECS,
                         open: t.open,
-                        yes: t.yes,
-                        no: t.no,
-                        eligible: t.eligible,
-                        high: t.high,
+                        tally: t,
                         outcome: t.outcome,
                         my_vote,
                         finalized: sp.closed_at.is_some(),
@@ -2471,16 +2406,38 @@ fn start_vote_tasks(
     }
 }
 
-/// Собирает локальные репутации голосующих (для eligibility и кворума).
-async fn gather_scores(rep: &Reputation, votes: &[void_vote::VoteRecord]) -> HashMap<String, f64> {
-    let mut scores = HashMap::new();
-    for v in votes {
-        if !scores.contains_key(&v.voter_key) {
-            let s = rep.score.score(&NodeId(v.voter_key.clone())).await;
-            scores.insert(v.voter_key.clone(), s);
-        }
+/// Автор предложения доверен у нас («через знакомых» или лично) — или это мы.
+/// Иначе предложение — спам: его не показываем и не исполняем.
+fn proposer_trusted(trust: &Mutex<void_trust::TrustMap>, me: &NodeId, proposer: &str) -> bool {
+    use void_trust::TrustLevel::{Trusted, Verified};
+    proposer == me.as_str()
+        || matches!(trust.lock().unwrap().level(&NodeId(proposer.to_string())), Trusted | Verified)
+}
+
+/// Веса голосующих в наших глазах: свой голос — 1, остальные — доверие к ним
+/// (освоившиеся — из общего пула), незнакомцы — 0.
+fn voter_weights(
+    trust: &Mutex<void_trust::TrustMap>,
+    me: &NodeId,
+    votes: &[void_vote::VoteRecord],
+) -> HashMap<String, void_vote::VoterWeight> {
+    use void_trust::TrustLevel::{Trusted, Verified};
+    let map = trust.lock().unwrap();
+    let others: Vec<NodeId> = votes.iter()
+        .map(|v| NodeId(v.voter_key.clone()))
+        .filter(|id| id != me)
+        .collect();
+    let mut out: HashMap<String, void_vote::VoterWeight> = map.weights(others.iter())
+        .into_iter()
+        .map(|(id, weight)| {
+            let trusted = matches!(map.level(&id), Trusted | Verified);
+            (id.0, void_vote::VoterWeight { weight, trusted })
+        })
+        .collect();
+    if votes.iter().any(|v| v.voter_key == me.as_str()) {
+        out.insert(me.0.clone(), void_vote::VoterWeight { weight: 1.0, trusted: true });
     }
-    scores
+    out
 }
 
 /// Исполняет принятое решение локально и персистит результат.
@@ -2593,5 +2550,52 @@ fn db_msg_to_chat(m: void_db::messages::PublicMessage) -> ChatMessage {
         seq:       m.message_id.rsplit_once(':').and_then(|(_, s)| s.parse().ok()).unwrap_or(0),
         signature: if m.signature.is_empty() { None } else { Some(m.signature) },
         channel:   m.channel,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(i: u32) -> NodeId {
+        NodeId(format!("{i:064x}"))
+    }
+
+    fn vote(i: u32) -> void_vote::VoteRecord {
+        void_vote::VoteRecord { voter_key: n(i).0, choice: true, created_at: 0 }
+    }
+
+    /// Я — узел 0; лично проверил 1, через 1 знаю 2 (t = 0.5).
+    fn trust() -> Mutex<void_trust::TrustMap> {
+        let v = |from: u32, to: u32| void_trust::Vouch {
+            voucher: n(from), subject: n(to), kind: void_trust::VouchKind::Personal,
+            updated_at: 1, revoked: false,
+        };
+        let empty = HashSet::new();
+        Mutex::new(void_trust::compute(&void_trust::TrustInputs {
+            me: &n(0),
+            vouches: &[v(0, 1), v(1, 2)],
+            blocked: &empty,
+            reported: &empty,
+            settled: &empty,
+            private_verified: &empty,
+        }))
+    }
+
+    #[test]
+    fn my_vote_weighs_one_strangers_nothing() {
+        let w = voter_weights(&trust(), &n(0), &[vote(0), vote(1), vote(2), vote(9)]);
+        assert_eq!(w[&n(0).0], void_vote::VoterWeight { weight: 1.0, trusted: true });
+        assert_eq!(w[&n(1).0], void_vote::VoterWeight { weight: 1.0, trusted: true });
+        assert!((w[&n(2).0].weight - 0.5).abs() < 1e-9 && w[&n(2).0].trusted);
+        assert!(w.get(&n(9).0).is_none_or(|x| x.weight == 0.0), "незнакомец не весит");
+    }
+
+    #[test]
+    fn only_trusted_authors_proposals_count() {
+        let t = trust();
+        assert!(proposer_trusted(&t, &n(0), n(0).as_str()), "своё предложение");
+        assert!(proposer_trusted(&t, &n(0), n(2).as_str()), "через знакомых");
+        assert!(!proposer_trusted(&t, &n(0), n(9).as_str()), "незнакомец — спам");
     }
 }
