@@ -25,7 +25,15 @@ pub struct SitesPage {
     dns_snapshot:  Vec<DnsInfo>,
     /// Имя сайта, ожидающего подтверждения удаления (модальное окно).
     confirm_delete: Option<String>,
+    /// Сколько узлов поручились за нас (0 — подсказка про лимит публикаций).
+    pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
+
+/// Новичку другие узлы принимают не больше 10 публикаций в час (лимит по
+/// доверию, `void_chat::trust_limits`) — сверх этого сайт до них не дойдёт.
+pub const PUBLISH_LIMIT_HINT: &str =
+    "Пока за вас никто не поручился, другие узлы принимают от вас не больше 10 публикаций \
+     в час (файлов и сайтов вместе) — остальные они пока отбросят.";
 
 impl Default for SitesPage {
     fn default() -> Self {
@@ -41,6 +49,7 @@ impl Default for SitesPage {
             snapshot:       Vec::new(),
             dns_snapshot:   Vec::new(),
             confirm_delete: None,
+            my_vouchers:    None,
         }
     }
 }
@@ -129,6 +138,9 @@ impl SitesPage {
                     do_publish = true;
                 }
             });
+            if crate::trust_ui::is_newcomer(&self.my_vouchers) {
+                crate::trust_ui::newcomer_hint(ui, PUBLISH_LIMIT_HINT);
+            }
         });
         if do_publish {
             self.publish();

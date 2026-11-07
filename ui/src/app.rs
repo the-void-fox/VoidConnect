@@ -104,6 +104,7 @@ impl VoidApp {
             greeter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 crate::settings_store::load().greeter,
             )),
+            my_vouchers: std::sync::Arc::clone(&backend.my_vouchers),
             tx:      backend.trust_tx.clone(),
         };
         chat.trust = Some(trust.clone());
@@ -111,6 +112,7 @@ impl VoidApp {
             && !crate::verify_store::migration_asked();
         chat.my_id_hex = backend.my_id_full.clone();
         chat.my_vouchers = Some(std::sync::Arc::clone(&backend.my_vouchers));
+        chat.chat_links = Some(std::sync::Arc::clone(&backend.chat_links));
 
         // Load saved profile values (description, status) for the profile page
         let saved = crate::profile_store::load_or_create();
@@ -158,12 +160,14 @@ impl VoidApp {
         storage.downloads_dir = Some(backend.downloads_dir.clone());
         storage.peer_profiles = Some(std::sync::Arc::clone(&backend.peer_profiles));
         storage.my_id         = Some(backend.my_id_node.clone());
+        storage.my_vouchers   = Some(std::sync::Arc::clone(&backend.my_vouchers));
         storage.my_name       = backend.my_name.clone();
 
         // Страница сайтов: канал публикации + список сайтов + имена .void.
         let mut sites = SitesPage::default();
         sites.publish_tx     = Some(backend.publish_site_tx.clone());
         sites.mirror_tx      = Some(backend.mirror_tx.clone());
+        sites.my_vouchers    = Some(std::sync::Arc::clone(&backend.my_vouchers));
         sites.sites          = Some(std::sync::Arc::clone(&backend.sites));
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
@@ -322,6 +326,7 @@ impl VoidApp {
                     from_id: Some(msg.from.clone()),
                     channel: msg.channel.clone(),
                     seq:     msg.seq,
+                    may_drop: false,
                 });
             }
             self.history_loaded = true;
@@ -351,6 +356,7 @@ impl VoidApp {
                 from_id: Some(msg.from.clone()),
                 channel: msg.channel.clone(),
                 seq:     msg.seq,
+                may_drop: false,
             });
         }
     }
@@ -669,11 +675,16 @@ impl VoidApp {
                     egui::RichText::new(
                         "У новичков в канале «Новички» и в их профиле появится кнопка \
                          «Поприветствовать». Это слабое публичное поручительство: «похож на \
-                         живого человека». Для вас новичок станет освоившимся, а ваши знакомые \
-                         дадут ему немного доверия через вас. Если он окажется ботом, ваши \
-                         поручительства потеряют вес.")
+                         живого человека». Для вас и ваших знакомых новичок станет освоившимся. \
+                         Если он окажется ботом, ваши поручительства потеряют вес.")
                         .small().color(ui.visuals().weak_text_color()),
                 );
+                if self.settings.greeter && self.backend.my_vouchers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    crate::trust_ui::newcomer_hint(
+                        ui,
+                        "За вас ещё никто не поручился — у других узлов ваше приветствие пока ничего не весит.",
+                    );
+                }
 
                 ui.add_space(14.0);
                 ui.separator();

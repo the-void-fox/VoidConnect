@@ -12,6 +12,11 @@
 //! ботов за одним обманутым весит не больше доли этого обманутого.
 //! `m(V) = ACCOUNTABILITY^k`, где `k` — сколько подопечных V сейчас «плохие»
 //! (заблокированы мной или под жалобами).
+//!
+//! Приветствие встречающего — «похож на живого человека», а не «ручаюсь»:
+//! оно поднимает новичка не выше «освоившегося» и дальше не ведёт. Уровень
+//! «через знакомых» и передача доверия дальше — только по цепочке личных
+//! поручительств.
 
 use std::collections::{HashMap, HashSet};
 
@@ -174,6 +179,8 @@ pub fn compute(inputs: &TrustInputs) -> TrustMap {
     };
 
     let mut trust: HashMap<NodeId, f64> = HashMap::new();
+    // Доля доверия, пришедшая по личным поручительствам (без приветствий).
+    let mut personal: HashMap<NodeId, f64> = HashMap::new();
     let mut depth_of: HashMap<NodeId, usize> = HashMap::new();
     let mut via: HashMap<NodeId, Vec<(f64, NodeId)>> = HashMap::new();
     let mut verified: HashSet<NodeId> = HashSet::new();
@@ -194,6 +201,7 @@ pub fn compute(inputs: &TrustInputs) -> TrustMap {
         match kind {
             VouchKind::Personal => {
                 trust.insert(subject.clone(), 1.0);
+                personal.insert(subject.clone(), 1.0);
                 depth_of.insert(subject.clone(), 1);
                 verified.insert(subject.clone());
                 frontier.push(subject.clone());
@@ -204,34 +212,44 @@ pub fn compute(inputs: &TrustInputs) -> TrustMap {
         }
     }
 
-    // Слои 2..=MAX_DEPTH: вклад только от узлов предыдущего слоя.
+    // Слои 2..=MAX_DEPTH: вклад только от узлов предыдущего слоя и только
+    // по их личному доверию — поприветствованный дальше не ведёт.
     for depth in 1..MAX_DEPTH {
-        let mut next: HashMap<NodeId, f64> = HashMap::new();
+        // Узел → (всё доверие, доля по личным поручительствам).
+        let mut next: HashMap<NodeId, (f64, f64)> = HashMap::new();
         for voucher in &frontier {
             let Some(out) = edges.get(voucher) else { continue };
-            let share = trust[voucher] * DECAY * multiplier(voucher) / out.len() as f64;
+            let share = personal[voucher] * DECAY * multiplier(voucher) / out.len() as f64;
             for (subject, kind) in out {
                 if excluded(subject) || depth_of.get(*subject).is_some_and(|d| *d <= depth) {
                     continue;
                 }
                 let c = share * kind_weight(*kind);
-                *next.entry((*subject).clone()).or_insert(0.0) += c;
+                let e = next.entry((*subject).clone()).or_insert((0.0, 0.0));
+                e.0 += c;
+                if *kind == VouchKind::Personal {
+                    e.1 += c;
+                }
                 via.entry((*subject).clone()).or_default().push((c, voucher.clone()));
             }
         }
         frontier = Vec::with_capacity(next.len());
-        for (subject, t) in next {
+        for (subject, (t, p)) in next {
             trust.insert(subject.clone(), t.min(1.0));
             depth_of.insert(subject.clone(), depth + 1);
-            frontier.push(subject);
+            if p > 0.0 {
+                personal.insert(subject.clone(), p.min(1.0));
+                frontier.push(subject);
+            }
         }
     }
 
     let mut map: HashMap<NodeId, TrustInfo> = HashMap::new();
     for (id, t) in &trust {
+        let p = personal.get(id).copied().unwrap_or(0.0);
         let level = if verified.contains(id) {
             TrustLevel::Verified
-        } else if *t >= TRUSTED_THRESHOLD {
+        } else if p >= TRUSTED_THRESHOLD {
             TrustLevel::Trusted
         } else if *t >= SETTLED_MIN_TRUST {
             TrustLevel::Settled
@@ -443,6 +461,20 @@ mod tests {
         assert!(approx(m.get(&n(3)).weight, 0.25));
         // Моё собственное приветствие — уровень «освоившийся».
         assert_eq!(run(&[greet(0, 5)]).level(&n(5)), TrustLevel::Settled);
+    }
+
+    /// Единственное приветствие проверенного мной встречающего даёт 0.15 —
+    /// больше порога «через знакомых», но приветствие поднимает не выше
+    /// «освоившегося» и дальше не ведёт.
+    #[test]
+    fn greeting_never_makes_trusted_and_does_not_propagate() {
+        let m = run(&[v(0, 1), greet(1, 2), v(2, 3)]);
+        assert!(approx(m.get(&n(2)).weight, 0.5 * GREETER_WEIGHT));
+        assert_eq!(m.level(&n(2)), TrustLevel::Settled);
+        assert_eq!(m.level(&n(3)), TrustLevel::Stranger, "поручительства поприветствованного не учитываются");
+        // Личное поручительство вдобавок к приветствию — уже «через знакомых».
+        let m = run(&[v(0, 1), v(0, 4), greet(1, 2), v(4, 2)]);
+        assert_eq!(m.level(&n(2)), TrustLevel::Trusted);
     }
 
     #[test]

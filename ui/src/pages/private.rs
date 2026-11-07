@@ -427,6 +427,7 @@ impl PrivatePage {
         let peer_status = self.peer_profiles.get(&peer_id).map(|p| p.status.clone());
         let my_avatar   = self.my_avatar.clone();
         let folder      = self.folder(&peer_id);
+        let has_incoming = self.conversations[selected].messages.iter().any(|m| !m.is_me);
 
         // Заголовок: имя + признак шифрования
         ui.horizontal(|ui| {
@@ -488,6 +489,18 @@ impl PrivatePage {
                 }
                 ui.add_space(8.0);
             }
+            Folder::Inbox if !has_incoming => {
+                ui.label(
+                    egui::RichText::new(
+                        "\u{F02FC}  Собеседник вам ещё не писал. Если вы для него незнакомец, \
+                         сообщения лягут к нему в «Запросы»: он увидит первые 5 и решит, принять \
+                         ли. Пока он не ответил, к сообщениям прикладывается «марка работы» — \
+                         первое за день уходит на несколько секунд дольше.")
+                        .small()
+                        .color(REQUEST_COLOR),
+                );
+                ui.add_space(8.0);
+            }
             Folder::Inbox => {}
         }
         let messages_height = (messages_height - (ui.cursor().top() - banner_top)).max(80.0);
@@ -510,10 +523,18 @@ impl PrivatePage {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     let len = self.conversations[selected].messages.len();
+                    let mut own = 0u32;
                     for idx in 0..len {
                         let (text, time, is_me, delivery) = {
                             let m = &self.conversations[selected].messages[idx];
                             (m.text.clone(), m.time.clone(), m.is_me, m.delivery)
+                        };
+                        // Без ответа собеседника мы, возможно, у него в «Запросах»:
+                        // сверх их лимита сообщения отбрасываются.
+                        own += u32::from(is_me);
+                        let status = MsgStatus {
+                            delivery,
+                            may_drop: is_me && !has_incoming && own > crate::dm_access::MAX_REQUEST_MSGS,
                         };
                         let sender = if is_me { self.my_name.clone() } else { peer_name.clone() };
                         let (avatar, fill) = if is_me {
@@ -521,7 +542,7 @@ impl PrivatePage {
                         } else {
                             (peer_avatar.as_deref(), status_colors(peer_status.as_deref()).0)
                         };
-                        render_message(ui, &text, &time, is_me, &sender, avatar, fill, delivery);
+                        render_message(ui, &text, &time, is_me, &sender, avatar, fill, status);
                         ui.add_space(8.0);
                     }
 
@@ -695,6 +716,15 @@ impl PeerInfoExt for PeerInfo {
 
 // ── Рендер пузырька ───────────────────────────────────────────────────────────
 
+/// Статус своего сообщения.
+#[derive(Clone, Copy)]
+struct MsgStatus {
+    /// Доставка до узла собеседника (`None` — входящее или из истории).
+    delivery: Option<DeliveryState>,
+    /// Сверх лимита запроса у собеседника — скорее всего, отброшено.
+    may_drop: bool,
+}
+
 fn render_message(
     ui: &mut egui::Ui,
     text: &str,
@@ -703,8 +733,9 @@ fn render_message(
     sender: &str,
     avatar: Option<&str>,
     avatar_fill: egui::Color32,
-    delivery: Option<DeliveryState>,
+    status: MsgStatus,
 ) {
+    let MsgStatus { delivery, may_drop } = status;
     let bubble = Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8.0))
         .outer_margin(egui::Margin::symmetric(4.0, 2.0))
@@ -742,13 +773,19 @@ fn render_message(
                             DeliveryState::Sending =>
                                 ("󰔟", ui.visuals().weak_text_color(), "Отправляется…"),
                             DeliveryState::Delivered =>
-                                ("󰄬", egui::Color32::from_rgb(80, 180, 80), "Доставлено"),
+                                ("󰄬", egui::Color32::from_rgb(80, 180, 80), "Доставлено на узел собеседника"),
                             DeliveryState::Failed =>
                                 ("󰀪", egui::Color32::from_rgb(210, 90, 70), "Не доставлено"),
                         };
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new(glyph).small().color(color))
                             .on_hover_text(hint);
+                    }
+                    if may_drop {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("\u{F0026}").small().color(REQUEST_COLOR))
+                            .on_hover_text("Скорее всего, не дошло: если вы у собеседника в «Запросах», \
+                                            он увидит только первые 5 сообщений, пока не примет запрос.");
                     }
                 });
                 ui.add_space(4.0);

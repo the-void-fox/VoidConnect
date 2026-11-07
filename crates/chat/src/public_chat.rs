@@ -63,7 +63,7 @@ const MAX_DNS_CACHE: usize = 4096;
 /// Лимит текста одного сообщения чата (байт). Пакет может быть до
 /// `MAX_MESSAGE_LEN` (манифесты больших файлов), но 16 МиБ текста в чате —
 /// это DoS интерфейса у всех получателей.
-const MAX_CHAT_TEXT_BYTES: usize = 8 * 1024;
+pub const MAX_CHAT_TEXT_BYTES: usize = 8 * 1024;
 /// Лимиты служебных полей сообщения (символов).
 const MAX_CHANNEL_CHARS: usize = 64;
 const MAX_SENDER_NAME_CHARS: usize = void_core::peer::MAX_PROFILE_NAME_CHARS;

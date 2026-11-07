@@ -384,6 +384,12 @@ pub fn show_peer_profile(
     ui.add_space(4.0);
     let mut report = None;
     ui.menu_button("  󰀦  Пожаловаться", |ui| {
+        if trust.is_some_and(|t| t.i_am_newcomer) {
+            crate::trust_ui::newcomer_hint(
+                ui,
+                "За вас ещё никто не поручился: жалобу учтёт только ваш узел.",
+            );
+        }
         if ui.button(" 󱃈  Спам").clicked() {
             report = Some(ReportReason::Spam);
             ui.close_menu();

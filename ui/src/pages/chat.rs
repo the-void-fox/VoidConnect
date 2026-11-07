@@ -44,6 +44,16 @@ pub struct ChatMessage {
     pub channel: String,
     /// Номер сообщения у автора (вместе с `from_id` — ключ сообщения).
     pub seq:     u64,
+    /// Своё сообщение сверх лимита новичка: узлы, которые нас не знают, его,
+    /// скорее всего, отбросили.
+    pub may_drop: bool,
+}
+
+/// Свой темп в канале глазами узлов, которые нас не знают: зеркало их лимита
+/// для незнакомцев (запас и момент последнего пересчёта).
+struct OwnPace {
+    tokens: f64,
+    last:   std::time::Instant,
 }
 
 /// Метка сообщения незнакомца.
@@ -111,6 +121,12 @@ pub struct ChatPage {
     expanded: HashSet<(NodeId, u64)>,
     /// Сколько узлов поручились за нас (0 — показываем подсказку новичку).
     pub my_vouchers: Option<Arc<AtomicUsize>>,
+    /// Сколько живых связей у чата (0 — сообщения пока никуда не уходят).
+    pub chat_links: Option<Arc<AtomicUsize>>,
+    /// Свой темп для лимита новичка: ключ — канал «Новички» или остальные.
+    pace: HashMap<bool, OwnPace>,
+    /// Почему сообщение не отправлено (слишком длинное).
+    send_error: Option<String>,
 }
 
 impl ChatPage {
@@ -141,6 +157,9 @@ impl ChatPage {
             fold_strangers:   false,
             expanded:         HashSet::new(),
             my_vouchers:      None,
+            chat_links:       None,
+            pace:             HashMap::new(),
+            send_error:       None,
         }
     }
 
@@ -169,6 +188,60 @@ impl ChatPage {
         self.blocklist.as_ref()
             .and_then(|m| m.lock().ok().and_then(|m| m.get(id).copied()))
             .is_some_and(|until| until > now)
+    }
+
+    /// За нас никто не поручился — для других узлов мы незнакомец.
+    fn is_newcomer(&self) -> bool {
+        self.my_vouchers.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0)
+    }
+
+    /// Запас нашего лимита новичка в канале на этот момент.
+    fn pace_tokens(&self, channel: &str) -> f64 {
+        let (rate, burst) = void_chat::trust_limits::stranger_message_rate(channel);
+        self.pace
+            .get(&(channel == NEWCOMERS_CHANNEL))
+            .map_or(burst, |p| (p.tokens + p.last.elapsed().as_secs_f64() * rate).min(burst))
+    }
+
+    /// Через сколько секунд следующее сообщение пройдёт лимит новичка.
+    fn pace_wait_secs(&self, channel: &str) -> u64 {
+        let (rate, _) = void_chat::trust_limits::stranger_message_rate(channel);
+        let tokens = self.pace_tokens(channel);
+        if tokens >= 1.0 { 0 } else { ((1.0 - tokens) / rate).ceil() as u64 }
+    }
+
+    /// Списывает сообщение с лимита новичка; `false` — его, скорее всего, отбросят.
+    fn take_pace(&mut self, channel: &str) -> bool {
+        let tokens = self.pace_tokens(channel);
+        let ok = tokens >= 1.0;
+        self.pace.insert(
+            channel == NEWCOMERS_CHANNEL,
+            OwnPace { tokens: if ok { tokens - 1.0 } else { tokens }, last: std::time::Instant::now() },
+        );
+        ok
+    }
+
+    /// Подсказка под полем ввода: почему сообщение может не дойти.
+    fn input_note(&self) -> Option<(String, egui::Color32)> {
+        if let Some(e) = &self.send_error {
+            return Some((e.clone(), egui::Color32::from_rgb(220, 90, 70)));
+        }
+        if self.chat_links.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0) {
+            return Some((
+                "\u{F0026}  Нет связи с другими узлами — сообщения увидят, когда связь появится.".into(),
+                NEWCOMER_COLOR,
+            ));
+        }
+        if self.is_newcomer() {
+            let wait = self.pace_wait_secs(&self.current_channel);
+            if wait > 0 {
+                return Some((
+                    format!("\u{F0026}  Следующее сообщение дойдёт до узлов, которые вас не знают, через {wait} с."),
+                    NEWCOMER_COLOR,
+                ));
+            }
+        }
+        None
     }
 
     /// Полный список каналов: встроенные + добавленные голосованием (дедуп по id).
@@ -215,6 +288,9 @@ impl Default for ChatPage {
             fold_strangers:   false,
             expanded:         HashSet::new(),
             my_vouchers:      None,
+            chat_links:       None,
+            pace:             HashMap::new(),
+            send_error:       None,
         }
     }
 }
@@ -356,7 +432,13 @@ impl ChatPage {
 
         // Высоту области сообщений считаем здесь — после панели каналов, чтобы
         // учесть её фактическую высоту (она может переноситься на пару строк).
-        let messages_h = (ui.available_height() - input_area_total_h).max(100.0);
+        let input_note = self.input_note();
+        if input_note.is_some() {
+            // Обратный отсчёт до следующего сообщения — обновляем раз в секунду.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let note_h = if input_note.is_some() { line_height + 6.0 } else { 0.0 };
+        let messages_h = (ui.available_height() - input_area_total_h - note_h).max(100.0);
 
         // Есть ли сообщения в текущем канале (для заглушки пустого состояния).
         let channel_has_msgs = self.messages.iter().any(|m| m.channel == self.current_channel);
@@ -458,6 +540,11 @@ impl ChatPage {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
+
+        if let Some((note, color)) = &input_note {
+            ui.label(egui::RichText::new(note).small().color(*color));
+            ui.add_space(6.0);
+        }
 
         let mut should_send = false;
         let line_count      = self.input.lines().count().max(1).min(4);
@@ -606,6 +693,13 @@ impl ChatPage {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                         );
+                        if msg.may_drop {
+                            ui.label(egui::RichText::new("\u{F0026}").small().color(NEWCOMER_COLOR))
+                                .on_hover_text("Скорее всего, не дошло до узлов, которые вас не знают: \
+                                                от новичка они пропускают одно сообщение в 30 секунд \
+                                                (в «Новичках» — раз в 2 секунды). Узлы, которые вам \
+                                                доверяют, его получили.");
+                        }
                         if greet {
                             ui.add_space(8.0);
                             let hi = egui::RichText::new("\u{F1821} поприветствовать")
@@ -658,6 +752,17 @@ impl ChatPage {
             self.input.clear();
             return;
         }
+        let max = void_chat::public_chat::MAX_CHAT_TEXT_BYTES;
+        if text.len() > max {
+            self.send_error = Some(format!(
+                "\u{F0026}  Сообщение длиннее {} КБ — другие узлы его не примут. Сократите его.",
+                max / 1024,
+            ));
+            return;
+        }
+        self.send_error = None;
+        let channel = self.current_channel.clone();
+        let may_drop = self.is_newcomer() && !self.take_pace(&channel);
 
         self.messages.push(ChatMessage {
             author:  self.my_name.clone(),
@@ -667,6 +772,7 @@ impl ChatPage {
             from_id: None,
             channel: self.current_channel.clone(),
             seq:     0,
+            may_drop,
         });
         self.input.clear();
         if self.was_at_bottom { self.scroll_to_bottom = true; }

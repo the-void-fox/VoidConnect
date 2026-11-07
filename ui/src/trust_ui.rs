@@ -2,7 +2,7 @@
 //! команды «поручиться / отозвать / заблокировать».
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -12,6 +12,19 @@ use void_trust::store::Activity;
 use void_trust::{TrustInfo, TrustMap};
 
 use crate::backend::{TrustCmd, TrustDetails};
+
+/// Цвет подсказок «вы пока новичок».
+pub const NEWCOMER_HINT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(200, 160, 70);
+
+/// За нас никто не поручился — для других узлов мы незнакомец.
+pub fn is_newcomer(my_vouchers: &Option<Arc<AtomicUsize>>) -> bool {
+    my_vouchers.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0)
+}
+
+/// Подсказка новичку: почему другие узлы могут не принять действие.
+pub fn newcomer_hint(ui: &mut eframe::egui::Ui, text: &str) {
+    ui.label(eframe::egui::RichText::new(format!("\u{F0026}  {text}")).small().color(NEWCOMER_HINT));
+}
 
 /// Доступ к снимку доверия backend (общий для страниц).
 #[derive(Clone)]
@@ -25,6 +38,8 @@ pub struct TrustUi {
     pub details: Arc<Mutex<TrustDetails>>,
     /// Включена роль встречающего (настройка).
     pub greeter: Arc<AtomicBool>,
+    /// Сколько узлов поручились за нас (0 — мы новичок для других).
+    pub my_vouchers: Arc<AtomicUsize>,
     pub tx: UnboundedSender<TrustCmd>,
 }
 
@@ -43,6 +58,8 @@ pub struct TrustView {
     pub activity: Option<Activity>,
     /// Включена роль встречающего — показывать «Поприветствовать».
     pub greeter_mode: bool,
+    /// Мы сами новичок: наши жалобы другие узлы не учтут.
+    pub i_am_newcomer: bool,
 }
 
 impl TrustUi {
@@ -70,6 +87,7 @@ impl TrustUi {
         TrustView {
             info, via_names, private_mark, blocked_by_me, greeted_by_me, activity,
             greeter_mode: self.is_greeter(),
+            i_am_newcomer: self.my_vouchers.load(Ordering::Relaxed) == 0,
         }
     }
 
