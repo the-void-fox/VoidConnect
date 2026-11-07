@@ -682,6 +682,8 @@ pub struct BackendHandle {
     pub my_vouchers: Arc<AtomicUsize>,
     /// Мои приветствия и наблюдения за узлами (для профиля узла).
     pub trust_details: Arc<Mutex<TrustDetails>>,
+    /// Сколько живых связей у общего чата (0 — сообщения пока никуда не уходят).
+    pub chat_links: Arc<AtomicUsize>,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
     /// командами `TrustCmd::{Allow, Block, Unblock}`).
     pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
@@ -797,6 +799,8 @@ pub fn start_backend(
     let dm_access_bg = Arc::clone(&dm_access);
     let trust_details: Arc<Mutex<TrustDetails>> = Arc::new(Mutex::new(TrustDetails::default()));
     let trust_details_bg = Arc::clone(&trust_details);
+    let chat_links = Arc::new(AtomicUsize::new(0));
+    let chat_links_bg = Arc::clone(&chat_links);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -821,6 +825,7 @@ pub fn start_backend(
                 blocklist_bg, voted_channels_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg,
                 trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg, trust_details_bg,
+                chat_links_bg,
             ).await;
         });
     });
@@ -873,6 +878,7 @@ pub fn start_backend(
         my_vouchers,
         dm_access,
         trust_details,
+        chat_links,
     }
 }
 
@@ -924,6 +930,7 @@ async fn backend_main(
     my_vouchers: Arc<AtomicUsize>,
     dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
     trust_details: Arc<Mutex<TrustDetails>>,
+    chat_links: Arc<AtomicUsize>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1416,6 +1423,7 @@ async fn backend_main(
 
     // Задача: периодически снимаем peer_list и профили для GUI, снимок
     // качества раздачи и жалоб.
+    let snap_links = Arc::clone(&chat_links);
     let pl       = peer_list.clone();
     let chat_p   = chat.clone();
     let rep_snap = reputation.clone();
@@ -1438,6 +1446,7 @@ async fn backend_main(
             tick = tick.wrapping_add(1);
             let peers = pl.all().await;
             *peers_out.lock().unwrap() = peers.clone();
+            snap_links.store(chat_p.link_count().await, Ordering::Relaxed);
             let profiles = chat_p.get_profiles().await;
             {
                 let mut map = profiles_out.lock().unwrap();

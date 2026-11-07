@@ -236,6 +236,13 @@ impl ProfilePage {
                     .color(ui.visuals().weak_text_color()),
             );
         });
+        if self.my_vouchers == 0 {
+            crate::trust_ui::newcomer_hint(
+                ui,
+                "Пока за вас никто не поручился, другие узлы принимают изменения профиля не чаще \
+                 раза в минуту (два подряд): частые правки дойдут не сразу.",
+            );
+        }
 
         ui.add_space(16.0);
         ui.separator();

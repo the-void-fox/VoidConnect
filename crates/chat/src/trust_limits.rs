@@ -91,6 +91,13 @@ fn author_rate(tier: AuthorTier, kind: Kind) -> Option<Rate> {
     })
 }
 
+/// Сколько сообщений другие узлы пропускают от незнакомца в канал:
+/// (пополнение в секунду, запас). Чтобы отправитель-новичок знал, что дойдёт.
+pub fn stranger_message_rate(channel: &str) -> (f64, f64) {
+    let r = author_rate(AuthorTier::Stranger, Kind::message(channel)).expect("сообщения разрешены");
+    (r.per_sec, r.burst)
+}
+
 /// Общий бюджет всех авторов уровня: ферма ботов упирается в него, а не в
 /// число ключей. Ключ — имя бюджета.
 fn shared_rate(tier: AuthorTier, kind: Kind) -> Option<(&'static str, Rate)> {

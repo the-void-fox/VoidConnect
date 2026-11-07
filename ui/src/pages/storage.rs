@@ -91,6 +91,8 @@ pub struct StoragePage {
     pub my_name: String,
     /// Жалоба на публикатора, ожидающая отправки в backend (target, причина).
     pub pending_report: Option<(NodeId, ReportReason)>,
+    /// Сколько узлов поручились за нас (0 — подсказка про лимит публикаций).
+    pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for StoragePage {
@@ -111,6 +113,7 @@ impl Default for StoragePage {
             my_id: None,
             my_name: String::new(),
             pending_report: None,
+            my_vouchers: None,
         }
     }
 }
@@ -376,6 +379,9 @@ impl StoragePage {
                 do_publish = true;
             }
         });
+        if crate::trust_ui::is_newcomer(&self.my_vouchers) {
+            crate::trust_ui::newcomer_hint(ui, crate::pages::sites::PUBLISH_LIMIT_HINT);
+        }
         if do_publish {
             self.publish_current();
         }
