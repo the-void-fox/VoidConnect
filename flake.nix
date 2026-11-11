@@ -53,7 +53,9 @@
               nativeBuildInputs = [ pkgs.pkg-config ]
                 ++ pkgs.lib.optional gui pkgs.makeWrapper;
               # gtk3/glib нужны rfd (нативные файловые диалоги); GL/X11/Wayland — egui.
-              buildInputs = [ pkgs.gtk3 pkgs.glib ]
+              # sqlite — для sqlx: с ноября 2026 nixpkgs не даёт libsqlite3-sys
+              # собирать свою копию (LIBSQLITE3_SYS_USE_PKG_CONFIG=1), нужна системная.
+              buildInputs = [ pkgs.gtk3 pkgs.glib pkgs.sqlite ]
                 ++ pkgs.lib.optionals gui rlibs;
 
               # Тесты гоняем в dev-окружении (`nix develop` → cargo test); для GUI-сборки
