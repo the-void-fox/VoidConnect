@@ -23,6 +23,9 @@ pub enum ReputationError {
 
     #[error("deserialization error: {0}")]
     Deserialize(String),
+
+    #[error("report is older than 30 days or from the future")]
+    StaleReport,
 }
 
 impl From<DbError> for ReputationError {

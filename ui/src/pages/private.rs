@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui::{Button, Frame, ScrollArea, TextEdit};
@@ -9,7 +9,19 @@ use void_core::peer::{PeerInfo, PeerProfile};
 use void_chat::private_chat::{DmSendCmd, IncomingDm};
 use void_crypto::keys::EncryptionKeypair;
 use crate::widgets::peer_popup::status_colors;
-use crate::backend::DeliveryState;
+use crate::backend::{DeliveryState, TrustCmd};
+use crate::dm_access::DmAccess;
+
+/// Цвет папки «Запросы».
+const REQUEST_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 70);
+
+/// Где беседа: во «Входящих», в «Запросах» или узел заблокирован мной.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Folder {
+    Inbox,
+    Request,
+    Blocked,
+}
 
 // ── Модели ────────────────────────────────────────────────────────────────────
 
@@ -42,16 +54,18 @@ pub struct PrivatePage {
     // Доступ к backend
     pub dm_sender:  Option<tokio::sync::mpsc::UnboundedSender<DmSendCmd>>,
     pub my_enc_kp:  Option<Arc<EncryptionKeypair>>,
-    pub my_enc_pub: [u8; 32],
-    pub my_node_id: Option<NodeId>,
     pub my_name:    String,
     /// Свой аватар (base64-PNG) — для строк собственных сообщений.
     pub my_avatar:  Option<String>,
-    pub base_port:  u16,
 
     // Актуальные данные о пирах (обновляется каждый кадр из app.rs)
     pub peers:         Vec<PeerInfo>,
     pub peer_profiles: HashMap<NodeId, PeerProfile>,
+
+    /// Доступ к личке (разрешённые / заблокированные / запросы) из backend.
+    pub access:   Option<Arc<Mutex<DmAccess>>>,
+    /// Команды «принять запрос / заблокировать / разблокировать».
+    pub trust_tx: Option<tokio::sync::mpsc::UnboundedSender<TrustCmd>>,
 }
 
 impl Default for PrivatePage {
@@ -62,13 +76,12 @@ impl Default for PrivatePage {
             input:         String::new(),
             dm_sender:     None,
             my_enc_kp:     None,
-            my_enc_pub:    [0u8; 32],
-            my_node_id:    None,
             my_name:       "Вы".into(),
             my_avatar:     None,
-            base_port:     7700,
             peers:         Vec::new(),
             peer_profiles: HashMap::new(),
+            access:        None,
+            trust_tx:      None,
         }
     }
 }
@@ -203,6 +216,24 @@ impl PrivatePage {
         false
     }
 
+    fn folder(&self, id: &NodeId) -> Folder {
+        let Some(access) = &self.access else { return Folder::Inbox };
+        let access = access.lock().unwrap();
+        if access.blocked.contains(id.as_str()) {
+            Folder::Blocked
+        } else if access.is_request(id.as_str()) {
+            Folder::Request
+        } else {
+            Folder::Inbox
+        }
+    }
+
+    fn send_trust(&self, cmd: TrustCmd) {
+        if let Some(tx) = &self.trust_tx {
+            let _ = tx.send(cmd);
+        }
+    }
+
     /// Обновляет имена пиров в беседах если они изменились.
     pub fn update_context(&mut self, peers: Vec<PeerInfo>, profiles: HashMap<NodeId, PeerProfile>) {
         self.peers         = peers;
@@ -249,7 +280,9 @@ impl PrivatePage {
         ui.separator();
         ui.add_space(4.0);
 
-        if self.conversations.is_empty() {
+        // Заблокированные мной в списке не показываем.
+        let folders: Vec<Folder> = self.conversations.iter().map(|c| self.folder(&c.peer_id)).collect();
+        if folders.iter().all(|f| *f == Folder::Blocked) {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -265,72 +298,96 @@ impl PrivatePage {
             .id_source("private_sidebar_scroll")
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                for i in 0..self.conversations.len() {
-                    let is_selected  = self.selected == i;
-                    let peer_name    = self.conversations[i].peer_name.clone();
-                    let last_msg     = self.conversations[i].last_message.clone();
-                    let unread       = self.conversations[i].unread;
-                    let peer_id      = self.conversations[i].peer_id.clone();
-                    let avatar_b64   = self.peer_profiles.get(&peer_id)
-                        .and_then(|p| p.avatar_png.clone());
-                    let status       = self.peer_profiles.get(&peer_id)
-                        .map(|p| p.status.clone());
-
-                    let frame_fill = if is_selected {
-                        ui.visuals().widgets.active.bg_fill
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-
-                    let frame = Frame::none()
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                        .fill(frame_fill);
-
-                    let resp = frame.show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            // Аватар пира (или цветной кружок с буквой, как запасной).
-                            let (fill, _) = status_colors(status.as_deref());
-                            crate::avatar::show_avatar(ui, avatar_b64.as_deref(), &peer_name, fill, 30.0);
-
-                            ui.add_space(6.0);
-                            ui.vertical(|ui| {
-                                ui.set_min_width(0.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(&peer_name).strong().size(13.0));
-                                    if unread > 0 {
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("{}", unread))
-                                                    .small().strong()
-                                                    .color(ui.visuals().hyperlink_color),
-                                            );
-                                        });
-                                    }
-                                });
-                                ui.label(
-                                    egui::RichText::new(&last_msg).small()
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            });
-                        });
-                    });
-
-                    let clicked = ui.interact(
-                        resp.response.rect,
-                        ui.id().with(("conv_click", i)),
-                        egui::Sense::click(),
-                    ).clicked();
-
-                    if clicked {
-                        self.selected = i;
-                        self.conversations[i].unread = 0;
-                        self.input.clear();
+                for i in (0..folders.len()).filter(|i| folders[*i] == Folder::Inbox) {
+                    self.conv_row(ui, i);
+                }
+                let requests: Vec<usize> =
+                    (0..folders.len()).filter(|i| folders[*i] == Folder::Request).collect();
+                if !requests.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(format!("\u{F02FC}  Запросы ({})", requests.len()))
+                            .strong()
+                            .color(REQUEST_COLOR),
+                    );
+                    ui.label(
+                        egui::RichText::new("От тех, кто не в вашей сети доверия.")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(4.0);
+                    for i in requests {
+                        self.conv_row(ui, i);
                     }
-
-                    ui.add_space(2.0);
                 }
             });
+    }
+
+    /// Строка беседы в списке слева.
+    fn conv_row(&mut self, ui: &mut egui::Ui, i: usize) {
+        let is_selected  = self.selected == i;
+        let peer_name    = self.conversations[i].peer_name.clone();
+        let last_msg     = self.conversations[i].last_message.clone();
+        let unread       = self.conversations[i].unread;
+        let peer_id      = self.conversations[i].peer_id.clone();
+        let avatar_b64   = self.peer_profiles.get(&peer_id)
+            .and_then(|p| p.avatar_png.clone());
+        let status       = self.peer_profiles.get(&peer_id)
+            .map(|p| p.status.clone());
+
+        let frame_fill = if is_selected {
+            ui.visuals().widgets.active.bg_fill
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+
+        let frame = Frame::none()
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .fill(frame_fill);
+
+        let resp = frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                // Аватар пира (или цветной кружок с буквой, как запасной).
+                let (fill, _) = status_colors(status.as_deref());
+                crate::avatar::show_avatar(ui, avatar_b64.as_deref(), &peer_name, fill, 30.0);
+
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(0.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&peer_name).strong().size(13.0));
+                        if unread > 0 {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", unread))
+                                        .small().strong()
+                                        .color(ui.visuals().hyperlink_color),
+                                );
+                            });
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(&last_msg).small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                });
+            });
+        });
+
+        let clicked = ui.interact(
+            resp.response.rect,
+            ui.id().with(("conv_click", i)),
+            egui::Sense::click(),
+        ).clicked();
+
+        if clicked {
+            self.selected = i;
+            self.conversations[i].unread = 0;
+            self.input.clear();
+        }
+
+        ui.add_space(2.0);
     }
 
     fn show_chat(&mut self, ui: &mut egui::Ui, messages_height: f32, input_scroll_height: f32) {
@@ -363,6 +420,8 @@ impl PrivatePage {
         let peer_avatar = self.peer_profiles.get(&peer_id).and_then(|p| p.avatar_png.clone());
         let peer_status = self.peer_profiles.get(&peer_id).map(|p| p.status.clone());
         let my_avatar   = self.my_avatar.clone();
+        let folder      = self.folder(&peer_id);
+        let has_incoming = self.conversations[selected].messages.iter().any(|m| !m.is_me);
 
         // Заголовок: имя + признак шифрования
         ui.horizontal(|ui| {
@@ -389,6 +448,57 @@ impl PrivatePage {
         ui.separator();
         ui.add_space(12.0);
 
+        // Запрос от незнакомца или заблокированный узел: решение — над перепиской.
+        let banner_top = ui.cursor().top();
+        match folder {
+            Folder::Request => {
+                ui.label(
+                    egui::RichText::new(
+                        "\u{F02FC}  Запрос от узла вне вашей сети доверия. Примите — его сообщения \
+                         пойдут во «Входящие» и вы сможете ответить. Отклоните — узел будет \
+                         заблокирован.")
+                        .color(REQUEST_COLOR),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("\u{F012C}  Принять").clicked() {
+                        self.send_trust(TrustCmd::Allow(peer_id.clone()));
+                    }
+                    if ui.button("\u{F0156}  Отклонить").clicked() {
+                        self.send_trust(TrustCmd::Block(peer_id.clone()));
+                    }
+                });
+                ui.add_space(8.0);
+            }
+            Folder::Blocked => {
+                ui.label(
+                    egui::RichText::new(
+                        "\u{F00AD}  Вы заблокировали этот узел: его личные сообщения и сообщения \
+                         в общем чате не показываются.")
+                        .color(egui::Color32::from_rgb(220, 80, 60)),
+                );
+                ui.add_space(4.0);
+                if ui.button("Разблокировать").clicked() {
+                    self.send_trust(TrustCmd::Unblock(peer_id.clone()));
+                }
+                ui.add_space(8.0);
+            }
+            Folder::Inbox if !has_incoming => {
+                ui.label(
+                    egui::RichText::new(
+                        "\u{F02FC}  Собеседник вам ещё не писал. Если вы для него незнакомец, \
+                         сообщения лягут к нему в «Запросы»: он увидит первые 5 и решит, принять \
+                         ли. Пока он не ответил, к сообщениям прикладывается «марка работы» — \
+                         первое за день уходит на несколько секунд дольше.")
+                        .small()
+                        .color(REQUEST_COLOR),
+                );
+                ui.add_space(8.0);
+            }
+            Folder::Inbox => {}
+        }
+        let messages_height = (messages_height - (ui.cursor().top() - banner_top)).max(80.0);
+
         // Область сообщений
         if self.conversations[selected].messages.is_empty() {
             ui.allocate_ui(egui::vec2(ui.available_width(), messages_height), |ui| {
@@ -407,10 +517,18 @@ impl PrivatePage {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     let len = self.conversations[selected].messages.len();
+                    let mut own = 0u32;
                     for idx in 0..len {
                         let (text, time, is_me, delivery) = {
                             let m = &self.conversations[selected].messages[idx];
                             (m.text.clone(), m.time.clone(), m.is_me, m.delivery)
+                        };
+                        // Без ответа собеседника мы, возможно, у него в «Запросах»:
+                        // сверх их лимита сообщения отбрасываются.
+                        own += u32::from(is_me);
+                        let status = MsgStatus {
+                            delivery,
+                            may_drop: is_me && !has_incoming && own > crate::dm_access::MAX_REQUEST_MSGS,
                         };
                         let sender = if is_me { self.my_name.clone() } else { peer_name.clone() };
                         let (avatar, fill) = if is_me {
@@ -418,7 +536,7 @@ impl PrivatePage {
                         } else {
                             (peer_avatar.as_deref(), status_colors(peer_status.as_deref()).0)
                         };
-                        render_message(ui, &text, &time, is_me, &sender, avatar, fill, delivery);
+                        render_message(ui, &text, &time, is_me, &sender, avatar, fill, status);
                         ui.add_space(8.0);
                     }
 
@@ -441,7 +559,7 @@ impl PrivatePage {
         ui.add_space(8.0);
 
         // Поле ввода + кнопка
-        let line_count  = self.input.lines().count().max(1).min(4);
+        let line_count  = self.input.lines().count().clamp(1, 4);
         let mut should_send = false;
 
         // Проверяем доступность отправки
@@ -449,7 +567,8 @@ impl PrivatePage {
             .and_then(|p| p.enc_pubkey.as_ref())
             .is_some()
             && self.peers.iter().any(|p| p.id == peer_id)
-            && self.dm_sender.is_some();
+            && self.dm_sender.is_some()
+            && folder == Folder::Inbox;
 
         ui.horizontal(|ui| {
             let btn_w   = 100.0;
@@ -462,10 +581,11 @@ impl PrivatePage {
                     .max_height(input_scroll_height)
                     .auto_shrink([false; 2])
                     .show(ui, |ui: &mut egui::Ui| {
-                        let hint = if can_send {
-                            "Введите сообщение… (Enter — отправить)"
-                        } else {
-                            "Ожидание подключения пира…"
+                        let hint = match folder {
+                            Folder::Request => "Примите запрос, чтобы ответить",
+                            Folder::Blocked => "Узел заблокирован",
+                            Folder::Inbox if can_send => "Введите сообщение… (Enter — отправить)",
+                            Folder::Inbox => "Ожидание подключения пира…",
                         };
                         let te = TextEdit::multiline(&mut self.input)
                             .hint_text(hint)
@@ -547,6 +667,10 @@ impl PrivatePage {
             }
         }
 
+        // Пока собеседник нам не писал, он может нас не знать: прикладываем марку
+        // работы (без неё незнакомец отбросит сообщение).
+        let stamp = !self.conversations[selected].messages.iter().any(|m| !m.is_me);
+
         // Добавляем в UI сразу (не ждём подтверждения)
         let conv = &mut self.conversations[selected];
         conv.messages.push(UiMessage {
@@ -567,6 +691,7 @@ impl PrivatePage {
                 their_enc_pubkey,
                 plaintext:        text,
                 message_id,
+                stamp,
             });
         }
 
@@ -585,6 +710,16 @@ impl PeerInfoExt for PeerInfo {
 
 // ── Рендер пузырька ───────────────────────────────────────────────────────────
 
+/// Статус своего сообщения.
+#[derive(Clone, Copy)]
+struct MsgStatus {
+    /// Доставка до узла собеседника (`None` — входящее или из истории).
+    delivery: Option<DeliveryState>,
+    /// Сверх лимита запроса у собеседника — скорее всего, отброшено.
+    may_drop: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_message(
     ui: &mut egui::Ui,
     text: &str,
@@ -593,8 +728,9 @@ fn render_message(
     sender: &str,
     avatar: Option<&str>,
     avatar_fill: egui::Color32,
-    delivery: Option<DeliveryState>,
+    status: MsgStatus,
 ) {
+    let MsgStatus { delivery, may_drop } = status;
     let bubble = Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8.0))
         .outer_margin(egui::Margin::symmetric(4.0, 2.0))
@@ -632,13 +768,19 @@ fn render_message(
                             DeliveryState::Sending =>
                                 ("󰔟", ui.visuals().weak_text_color(), "Отправляется…"),
                             DeliveryState::Delivered =>
-                                ("󰄬", egui::Color32::from_rgb(80, 180, 80), "Доставлено"),
+                                ("󰄬", egui::Color32::from_rgb(80, 180, 80), "Доставлено на узел собеседника"),
                             DeliveryState::Failed =>
                                 ("󰀪", egui::Color32::from_rgb(210, 90, 70), "Не доставлено"),
                         };
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new(glyph).small().color(color))
                             .on_hover_text(hint);
+                    }
+                    if may_drop {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("\u{F0026}").small().color(REQUEST_COLOR))
+                            .on_hover_text("Скорее всего, не дошло: если вы у собеседника в «Запросах», \
+                                            он увидит только первые 5 сообщений, пока не примет запрос.");
                     }
                 });
                 ui.add_space(4.0);

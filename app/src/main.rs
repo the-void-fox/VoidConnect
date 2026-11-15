@@ -64,8 +64,8 @@ async fn main() -> anyhow::Result<()> {
     // Вручную добавляем пира если передан --peer=ip:port
     // chat_port пира = его основной порт + 2 (соглашение)
     for arg in args.iter() {
-        if let Some(addr_str) = arg.strip_prefix("--peer=") {
-            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+        if let Some(addr_str) = arg.strip_prefix("--peer=")
+            && let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
                 let peer_base = addr.port();
                 let stub = PeerInfo {
                     id:        NodeId(format!("stub-{}", addr)),
@@ -79,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
                 info!("Manually added peer: {} (chat_port={})", stub.addr(), stub.chat_port);
                 peer_list.upsert(stub).await;
             }
-        }
     }
 
     start_mdns(my_peer.clone(), peer_list.clone()).await?;

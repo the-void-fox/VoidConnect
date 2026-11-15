@@ -84,12 +84,11 @@ impl TokenBucket {
         self.last_refill = now;
 
         // Сбрасываем страйки если прошло достаточно времени
-        if let Some(first) = self.first_strike_at {
-            if now.duration_since(first).as_secs() > STRIKE_RESET_SECS {
+        if let Some(first) = self.first_strike_at
+            && now.duration_since(first).as_secs() > STRIKE_RESET_SECS {
                 self.strikes = 0;
                 self.first_strike_at = None;
             }
-        }
 
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;

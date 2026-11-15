@@ -1,9 +1,7 @@
-/// score.rs — подсчёт и хранение репутации узлов.
-///
-/// Репутация хранится в SQLite через void-db.
-/// Этот модуль предоставляет высокоуровневый API поверх сырых DB-операций.
-
-use std::time::Duration;
+//! score.rs — подсчёт и хранение репутации узлов.
+//!
+//! Репутация — локальная оценка качества раздачи (чанки, отдача) и флуда.
+//! Хранится в SQLite через void-db; этот модуль — API поверх сырых DB-операций.
 
 use tracing::{debug, warn};
 use void_core::identity::NodeId;
@@ -32,9 +30,6 @@ pub const PENALTY_SPAM_STRIKE: f64 = -3.0;
 
 /// Бонус за каждый мегабайт загруженных данных.
 pub const BONUS_UPLOAD_PER_MB: f64 = 0.05;
-
-/// Бонус за час аптайма.
-pub const BONUS_UPTIME_PER_HOUR: f64 = 0.5;
 
 /// Бонус за каждый успешный чанк.
 pub const BONUS_VALID_CHUNK: f64 = 0.1;
@@ -188,32 +183,6 @@ impl ScoreManager {
         )
         .await;
         warn!("Spam strike from {}: reputation penalty", peer_id);
-    }
-
-    /// Добавляет аптайм-бонус за указанный период.
-    pub async fn record_uptime(&self, peer_id: &NodeId, duration: Duration) {
-        let seconds = duration.as_secs() as i64;
-        self.apply(
-            peer_id,
-            ReputationDelta {
-                uptime_seconds: seconds,
-                ..Default::default()
-            },
-        )
-        .await;
-    }
-
-    /// Добавляет bootstrap-бонус (узел помог новому участнику войти в сеть).
-    pub async fn record_bootstrap_assist(&self, peer_id: &NodeId, bonus: f64) {
-        self.apply(
-            peer_id,
-            ReputationDelta {
-                bootstrap_bonus: bonus,
-                ..Default::default()
-            },
-        )
-        .await;
-        debug!("Bootstrap bonus +{} for {}", bonus, peer_id);
     }
 
     // ─── Внутреннее ──────────────────────────────────────────────────────────

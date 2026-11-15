@@ -6,7 +6,7 @@
 //! файлы сайта, читая их из хранилища.
 //!
 //! ```ignore
-//! let manifest = publish_site(&storage, Path::new("./site"), "blog", my_id).await?;
+//! let manifest = publish_site(&storage, Path::new("./site"), "blog", &signing_kp).await?;
 //! registry.register(manifest).await;
 //! serve("127.0.0.1:8080".parse()?, registry, storage).await?;
 //! // → http://127.0.0.1:8080/blog
@@ -20,8 +20,11 @@ pub mod server;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use void_core::dns::normalize_name;
 use void_core::identity::NodeId;
 use void_core::site::{SiteEntry, SiteManifest};
+use void_crypto::keys::SigningKeypair;
+use void_crypto::sign::SignedMessage;
 use void_storage::StorageManager;
 
 pub use dns::DnsRegistry;
@@ -31,15 +34,22 @@ pub use server::{router, serve, PeerSnapshot};
 
 /// Публикует каталог как сайт: каждый файл уходит в хранилище, из путей и
 /// `file_id` собирается манифест. Имя — без зоны (`blog`, не `blog.void`).
+/// Манифест подписывается ключом владельца — без подписи узлы его не примут.
 pub async fn publish_site(
     storage: &StorageManager,
     dir: &Path,
     name: &str,
-    owner: NodeId,
+    owner_kp: &SigningKeypair,
 ) -> Result<SiteManifest, WebError> {
+    let owner = NodeId::from_public_key_bytes(&owner_kp.public_bytes());
     if !dir.is_dir() {
         return Err(WebError::Invalid(format!("не каталог: {}", dir.display())));
     }
+    // Имя сайта попадает в URL и в зону `.void` — только нормализованная метка
+    // `[a-z0-9-]`. Узлы отбрасывают анонсы с ненормализованным именем.
+    let name = normalize_name(name)
+        .ok_or_else(|| WebError::Invalid(format!("недопустимое имя сайта: {:?}", name)))?;
+    let name = name.as_str();
 
     let mut files = Vec::new();
     collect_files(dir, dir, &mut files)?;
@@ -57,13 +67,18 @@ pub async fn publish_site(
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     let site_id = compute_site_id(name, &entries);
-    Ok(SiteManifest {
+    let mut manifest = SiteManifest {
         site_id,
         name: name.to_string(),
         owner,
         entries,
         created_at: chrono::Utc::now().timestamp(),
-    })
+        signature: None,
+    };
+    let signed = SignedMessage::sign(manifest.signing_bytes(), owner_kp)
+        .map_err(|e| WebError::Invalid(format!("подпись манифеста: {:?}", e)))?;
+    manifest.signature = Some(signed.signature);
+    Ok(manifest)
 }
 
 /// Рекурсивно собирает файлы каталога как пары (относительный путь, абсолютный путь).
@@ -127,14 +142,18 @@ mod tests {
     use void_storage::ChunkStore;
 
     fn node(seed: u8) -> NodeId {
-        NodeId::from_public_key_bytes(&[seed; 32])
+        NodeId::from_public_key_bytes(&kp(seed).public_bytes())
+    }
+
+    fn kp(seed: u8) -> SigningKeypair {
+        SigningKeypair::from_seed(&[seed; 32]).unwrap()
     }
 
     async fn storage(seed: u8) -> (tempfile::TempDir, StorageManager) {
         let dir = tempfile::tempdir().unwrap();
         let pool = void_db::open(&dir.path().join("db.sqlite")).await.unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
-        let mgr = StorageManager::new(pool, store, node(seed)).await.unwrap();
+        let mgr = StorageManager::new(pool, store, std::sync::Arc::new(kp(seed))).await.unwrap();
         (dir, mgr)
     }
 
@@ -150,13 +169,20 @@ mod tests {
         let site_dir = tempfile::tempdir().unwrap();
         write_sample_site(site_dir.path());
 
-        let manifest = publish_site(&mgr, site_dir.path(), "blog", node(1)).await.unwrap();
+        let manifest = publish_site(&mgr, site_dir.path(), "blog", &kp(1)).await.unwrap();
         assert_eq!(manifest.name, "blog");
         assert_eq!(manifest.dns_name(), "blog.void");
         assert_eq!(manifest.entries.len(), 2);
         assert!(manifest.index().is_some(), "index.html должен быть в манифесте");
         assert!(manifest.entry("css/style.css").is_some());
         assert!(!manifest.site_id.is_empty());
+        let signature = manifest.signature.clone().expect("манифест подписан владельцем");
+        let signed = SignedMessage {
+            payload: manifest.signing_bytes(),
+            signature,
+            signer: manifest.owner.as_str().to_string(),
+        };
+        assert!(signed.verify().is_ok(), "подпись манифеста проверяется ключом владельца");
 
         // Файлы реально читаются из хранилища.
         let index = manifest.index().unwrap();
@@ -172,7 +198,7 @@ mod tests {
         write_sample_site(site_dir.path());
 
         let registry = SiteRegistry::new();
-        let manifest = publish_site(&mgr, site_dir.path(), "blog", node(2)).await.unwrap();
+        let manifest = publish_site(&mgr, site_dir.path(), "blog", &kp(2)).await.unwrap();
         registry.register(manifest).await;
 
         // Поднимаем сервер на свободном порту. Сайт локальный → пиры не нужны.
@@ -213,13 +239,19 @@ mod tests {
         let (_da, mgr_a) = storage(10).await;
         let site_dir = tempfile::tempdir().unwrap();
         write_sample_site(site_dir.path());
-        let manifest = publish_site(&mgr_a, site_dir.path(), "remote", node(10)).await.unwrap();
+        let manifest = publish_site(&mgr_a, site_dir.path(), "remote", &kp(10)).await.unwrap();
 
-        // chunk-сервер A.
+        // chunk-сервер A. Ждём, пока он реально начнёт принимать соединения:
+        // под нагрузкой полного прогона фиксированной паузы бывало мало.
         let a_port = free_port();
         let srv = mgr_a.clone();
         tokio::spawn(async move { let _ = srv.start_server(a_port).await; });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", a_port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // B узнаёт о файлах сайта ТОЛЬКО из манифестов (никаких локальных чанков).
         let (_db, mgr_b) = storage(11).await;
@@ -249,8 +281,16 @@ mod tests {
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Первый запрос → докачка у A → страница отдаётся.
-        let body = http_get(addr, "/remote.void").await;
+        // Первый запрос → докачка у A → страница отдаётся. Несколько попыток —
+        // на случай медленного старта серверов; сломанная докачка не пройдёт ни одну.
+        let mut body = String::new();
+        for _ in 0..5 {
+            body = http_get(addr, "/remote.void").await;
+            if body.contains("<h1>Hello Void</h1>") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
         assert!(body.contains("<h1>Hello Void</h1>"),
             "ожидался докачанный index чужого сайта, получено: {body}");
 

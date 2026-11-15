@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rand = { workspace = true }
 void-core      = { path = "../core" }
 void-crypto    = { path = "../crypto" }
 void-discovery = { path = "../discovery" }
 void-network   = { path = "../network" }
 hex = { workspace = true }
+sha2 = { workspace = true }
 
 chrono = { workspace = true }
 tokio = { workspace = true }

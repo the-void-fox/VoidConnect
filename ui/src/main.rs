@@ -3,11 +3,13 @@ mod avatar;
 mod backend;
 mod boot;
 mod device_lock;
+mod dm_access;
 mod pages;
 mod profile_store;
 mod private_store;
 mod settings_store;
 mod sys_open;
+mod trust_ui;
 mod verify_store;
 mod vote_service;
 mod widgets;
@@ -148,7 +150,7 @@ fn install_fonts(ctx: &egui::Context) {
     let font_bytes = include_bytes!("assets/fonts/FiraCode.ttf").to_vec();
     fonts.font_data.insert(
         "FiraCode".to_owned(),
-        egui::FontData::from_owned(font_bytes).into(),
+        egui::FontData::from_owned(font_bytes),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(family).or_default().insert(0, "FiraCode".to_owned());

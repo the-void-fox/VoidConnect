@@ -1,31 +1,38 @@
 //! Личный P2P чат — прямые зашифрованные TCP-соединения между узлами.
 //!
 //! Порт: base_port + 3  (например 7703 при base 7700)
-//! Протокол: length-prefixed JSON поверх TCP
-//! Шифрование: X25519 DH + BLAKE3 KDF + XChaCha20-Poly1305
+//! Транспорт: Noise XX ([`void_network::secure`]) — собеседник доказывает свой
+//! NodeId до обмена данными, поток зашифрован (в т.ч. через relay-туннель).
+//! Протокол: length-prefixed JSON поверх защищённого потока.
+//! Сообщения дополнительно шифруются для хранения на диске:
+//! X25519 DH + BLAKE3 KDF + XChaCha20-Poly1305 (ключом из аутентифицированного Hello).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{
-    TcpListener, TcpStream,
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use void_core::identity::NodeId;
 use void_core::peer::PeerInfo;
+use void_core::sanitize::display_text;
 use void_network::conn_guard::ConnLimiter;
+use void_network::secure::{self, BoxStream, Channel, NoiseIdentity, SecureStream};
 use void_crypto::encrypt::EncryptedMessage;
 use void_crypto::keys::EncryptionKeypair;
 
 const MAX_PKT: usize = 65_536;
 const BCAST_BUF: usize = 128;
+
+/// DM-соединение после Noise-рукопожатия (прямое TCP или relay-туннель).
+type DmStream = SecureStream<BoxStream>;
+type DmRead = ReadHalf<DmStream>;
+type DmWrite = WriteHalf<DmStream>;
 
 // ── Протокол ─────────────────────────────────────────────────────────────────
 
@@ -43,6 +50,10 @@ pub enum DmPacket {
         /// JSON-сериализованный EncryptedMessage
         encrypted_blob: String,
         timestamp:      i64,
+        /// «Марка работы» ([`crate::dm_pow`]) — нужна, если получатель нас
+        /// не знает: без неё он отбросит сообщение.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pow:            Option<u64>,
     },
     Ping,
     Pong,
@@ -62,6 +73,8 @@ pub struct IncomingDm {
     pub timestamp:      i64,
     /// Оригинальный зашифрованный blob (для хранения на диске).
     pub encrypted_blob: String,
+    /// К сообщению приложена действующая марка работы (отправитель → мы).
+    pub stamped:        bool,
 }
 
 /// Команда из GUI: отправить личное сообщение пиру.
@@ -70,10 +83,14 @@ pub struct DmSendCmd {
     pub to:               NodeId,
     /// Адрес DM-сервера пира: "ip:dm_port"
     pub to_dm_addr:       String,
-    /// X25519 публичный ключ получателя (для шифрования)
+    /// X25519-ключ получателя из профиля — только запасной вариант: шифруем
+    /// ключом, который получатель сам назвал в аутентифицированном Hello.
     pub their_enc_pubkey: [u8; 32],
     pub plaintext:        String,
     pub message_id:       String,
+    /// Приложить марку работы (получатель нас, возможно, не знает). Марка
+    /// подбирается раз в день на собеседника (1–2 с CPU) и кэшируется.
+    pub stamp:            bool,
 }
 
 // ── Внутреннее состояние ──────────────────────────────────────────────────────
@@ -89,11 +106,15 @@ struct PeerConn {
 struct Inner {
     my_peer:       PeerInfo,
     my_enc_kp:     Arc<EncryptionKeypair>,
+    /// Noise-ключ, привязанный к нашему NodeId.
+    noise:         NoiseIdentity,
     incoming_tx:   broadcast::Sender<IncomingDm>,
     /// Активные соединения (входящие + исходящие)
     connections:   Mutex<HashMap<NodeId, PeerConn>>,
-    /// Кэш enc_pubkey пиров, полученных при handshake
+    /// Кэш enc_pubkey пиров из аутентифицированного Hello
     known_pubkeys: Mutex<HashMap<NodeId, ([u8; 32], String)>>,
+    /// Подобранные марки работы: получатель → (день UTC, nonce).
+    stamps:        Mutex<HashMap<NodeId, (i64, u64)>>,
 }
 
 // ── Handle ────────────────────────────────────────────────────────────────────
@@ -107,6 +128,7 @@ pub struct PrivateChatHandle {
 pub async fn start_private_chat(
     my_peer:   PeerInfo,
     my_enc_kp: Arc<EncryptionKeypair>,
+    noise:     NoiseIdentity,
     dm_port:   u16,
 ) -> anyhow::Result<PrivateChatHandle> {
     let (incoming_tx, _) = broadcast::channel(BCAST_BUF);
@@ -114,9 +136,11 @@ pub async fn start_private_chat(
         inner: Arc::new(Inner {
             my_peer,
             my_enc_kp,
+            noise,
             incoming_tx,
             connections:   Mutex::new(HashMap::new()),
             known_pubkeys: Mutex::new(HashMap::new()),
+            stamps:        Mutex::new(HashMap::new()),
         }),
     };
 
@@ -158,7 +182,7 @@ async fn run_dm_server(handle: PrivateChatHandle, port: u16) -> anyhow::Result<(
                 let h = handle.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    accept_dm_conn(stream, h).await;
+                    accept_dm_conn(Box::new(stream), peer_addr.to_string(), h).await;
                 });
             }
             Err(e) => warn!("DM accept error: {}", e),
@@ -166,12 +190,16 @@ async fn run_dm_server(handle: PrivateChatHandle, port: u16) -> anyhow::Result<(
     }
 }
 
-async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
-    let addr = stream.peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "<relay>".to_string());
+async fn accept_dm_conn(stream: BoxStream, addr: String, handle: PrivateChatHandle) {
     debug!("DM incoming from {}", addr);
-    let (mut rd, mut wr) = stream.into_split();
+
+    // Noise: собеседник доказывает свой NodeId до любого обмена данными.
+    let secure = match secure::accept(stream, &handle.inner.noise, Channel::Dm).await {
+        Ok(s) => s,
+        Err(e) => { warn!("DM: handshake with {} failed: {}", addr, e); return; }
+    };
+    let peer_id = secure.peer().clone();
+    let (mut rd, mut wr) = tokio::io::split(secure);
 
     // Читаем Hello от клиента (с таймаутом — защита от slowloris)
     let hello = match timeout(DM_HELLO_TIMEOUT, read_dm_pkt(&mut rd)).await {
@@ -179,15 +207,22 @@ async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
         Ok(Err(e)) => { warn!("DM: no Hello from {}: {}", addr, e); return; }
         Err(_) => { warn!("DM: Hello timeout from {}", addr); return; }
     };
-    let (peer_id, peer_name, their_enc_pub) = match hello {
+    let (peer_name, their_enc_pub) = match hello {
         DmPacket::Hello { node_id, name, enc_pubkey } => {
+            // node_id из Hello обязан совпасть с доказанным рукопожатием: иначе
+            // узел выдаёт себя за другого (а id ещё и становится именем файла
+            // переписки — «../keystore» перезаписал бы ключи).
+            if node_id != peer_id {
+                warn!("DM: Hello node_id ≠ authenticated {} from {}", peer_id, addr);
+                return;
+            }
             let bytes: [u8; 32] = match hex::decode(&enc_pubkey)
                 .ok().and_then(|b| b.try_into().ok())
             {
                 Some(b) => b,
                 None => { warn!("DM: invalid enc_pubkey from {}", addr); return; }
             };
-            (node_id, name, bytes)
+            (display_text(&name, void_core::peer::MAX_PROFILE_NAME_CHARS), bytes)
         }
         _ => { warn!("DM: expected Hello from {}", addr); return; }
     };
@@ -195,11 +230,7 @@ async fn accept_dm_conn(stream: TcpStream, handle: PrivateChatHandle) {
     info!("DM accepted: {} ({}) from {}", peer_name, peer_id, addr);
 
     // Отвечаем своим Hello
-    if let Err(e) = write_dm_pkt(&mut wr, &DmPacket::Hello {
-        node_id:    handle.inner.my_peer.id.clone(),
-        name:       handle.inner.my_peer.name.clone(),
-        enc_pubkey: hex::encode(handle.inner.my_enc_kp.public_bytes()),
-    }).await {
+    if let Err(e) = write_dm_pkt(&mut wr, &handle.hello()).await {
         warn!("DM: hello reply failed: {}", e);
         return;
     }
@@ -232,9 +263,19 @@ impl PrivateChatHandle {
 
     /// Обрабатывает уже установленный поток как ВХОДЯЩЕЕ DM-соединение.
     /// Используется для туннелей через relay (symmetric NAT): поток приходит не
-    /// из `accept()`, а из [`void-discovery`] relay-клиента, но логика та же.
-    pub async fn accept_stream(&self, stream: TcpStream) {
-        accept_dm_conn(stream, self.clone()).await;
+    /// из `accept()`, а из [`void-discovery`] relay-клиента, но логика та же —
+    /// включая Noise-рукопожатие с собеседником (relay видит только шифротекст).
+    pub async fn accept_stream(&self, stream: BoxStream) {
+        accept_dm_conn(stream, "<relay>".to_string(), self.clone()).await;
+    }
+
+    /// Наш Hello для DM-рукопожатия.
+    fn hello(&self) -> DmPacket {
+        DmPacket::Hello {
+            node_id:    self.inner.my_peer.id.clone(),
+            name:       self.inner.my_peer.name.clone(),
+            enc_pubkey: hex::encode(self.inner.my_enc_kp.public_bytes()),
+        }
     }
 
     /// Получить кэшированный enc_pubkey пира (если он подключался ранее).
@@ -242,25 +283,30 @@ impl PrivateChatHandle {
         self.inner.known_pubkeys.lock().await.get(id).map(|(k, _)| *k)
     }
 
+    /// Марка работы для `cmd` (если она нужна): из кэша на сегодня или
+    /// подобранная заново в отдельном потоке. Звать ДО открытия соединения:
+    /// подбор занимает секунды, и открытое соединение собеседник закрыл бы по
+    /// таймауту рукопожатия. `send_dm` делает это сам.
+    pub async fn prepare_stamp(&self, cmd: &DmSendCmd) -> Option<u64> {
+        if !cmd.stamp {
+            return None;
+        }
+        let to = &cmd.to;
+        let today = crate::dm_pow::utc_day(chrono::Utc::now().timestamp());
+        if let Some((_, nonce)) = self.inner.stamps.lock().await.get(to).filter(|(day, _)| *day == today) {
+            return Some(*nonce);
+        }
+        let (from, to_id) = (self.inner.my_peer.id.clone(), to.clone());
+        let nonce = tokio::task::spawn_blocking(move || crate::dm_pow::mint(&from, &to_id, today))
+            .await
+            .ok()?;
+        self.inner.stamps.lock().await.insert(to.clone(), (today, nonce));
+        Some(nonce)
+    }
+
     /// Зашифровать и отправить личное сообщение пиру.
     pub async fn send_dm(&self, cmd: DmSendCmd) -> anyhow::Result<()> {
-        use anyhow::anyhow;
-
-        // Шифруем для получателя
-        let enc = EncryptedMessage::encrypt(
-            cmd.plaintext.as_bytes(),
-            &cmd.their_enc_pubkey,
-            &self.inner.my_enc_kp,
-        ).map_err(|e| anyhow!("DM encrypt: {:?}", e))?;
-
-        let blob = serde_json::to_string(&enc)?;
-
-        let pkt = DmPacket::Message {
-            message_id:     cmd.message_id,
-            encrypted_blob: blob,
-            timestamp:      chrono::Utc::now().timestamp(),
-        };
-
+        let pow = self.prepare_stamp(&cmd).await;
         // Пробуем существующее соединение (в т.ч. ранее поднятый relay-туннель).
         // Берём отправитель под локом и СРАЗУ освобождаем лок: держать его на время
         // await нельзя — cleanup соединения (`run_conn_tasks`) тоже берёт
@@ -270,14 +316,16 @@ impl PrivateChatHandle {
             conns.get(&cmd.to).map(|c| c.fwd_tx.clone())
         };
         if let Some(fwd_tx) = existing {
+            // Соединение аутентифицировано — ключ из его Hello уже в кэше.
+            let to_pub = self.known_pubkey(&cmd.to).await.unwrap_or(cmd.their_enc_pubkey);
+            let pkt = encrypt_message(&self.inner.my_enc_kp, &to_pub, &cmd.plaintext, cmd.message_id.clone(), pow)?;
             let (ack_tx, ack_rx) = oneshot::channel();
             // Ok из send() лишь подтверждает постановку в очередь; доставку
             // подтверждает ack из write-задачи (фактическая запись в сокет).
-            if fwd_tx.send((pkt.clone(), ack_tx)).await.is_ok() {
-                if let Ok(true) = ack_rx.await {
+            if fwd_tx.send((pkt, ack_tx)).await.is_ok()
+                && let Ok(true) = ack_rx.await {
                     return Ok(());
                 }
-            }
             // Соединение мертво (очередь закрыта или запись не удалась) — выбрасываем
             // его из кэша и пробуем заново прямой дозвон, а выше по стеку — relay.
             self.inner.connections.lock().await.remove(&cmd.to);
@@ -285,71 +333,59 @@ impl PrivateChatHandle {
 
         // Устанавливаем новое исходящее соединение (прямое)
         let stream = dial(&cmd.to_dm_addr).await?;
-        self.establish_outbound(stream, cmd.to, &cmd.their_enc_pubkey, pkt).await
+        self.establish_outbound(Box::new(stream), cmd, pow).await
     }
 
     /// Отправляет DM по УЖЕ установленному потоку (например, relay-туннелю), когда
-    /// прямое соединение невозможно (symmetric NAT). Шифрует и проводит тот же
-    /// handshake, что и прямой дозвон, но без `TcpStream::connect`.
+    /// прямое соединение невозможно (symmetric NAT). Проводит то же рукопожатие,
+    /// что и прямой дозвон, но без `TcpStream::connect`. Марку работы готовьте
+    /// заранее ([`Self::prepare_stamp`]) — до открытия потока.
     pub async fn send_dm_over_stream(
         &self,
         cmd:    DmSendCmd,
-        stream: TcpStream,
+        stream: BoxStream,
     ) -> anyhow::Result<()> {
-        use anyhow::anyhow;
-
-        let enc = EncryptedMessage::encrypt(
-            cmd.plaintext.as_bytes(),
-            &cmd.their_enc_pubkey,
-            &self.inner.my_enc_kp,
-        ).map_err(|e| anyhow!("DM encrypt: {:?}", e))?;
-        let blob = serde_json::to_string(&enc)?;
-        let pkt = DmPacket::Message {
-            message_id:     cmd.message_id,
-            encrypted_blob: blob,
-            timestamp:      chrono::Utc::now().timestamp(),
-        };
-
-        self.establish_outbound(stream, cmd.to, &cmd.their_enc_pubkey, pkt).await
+        let pow = self.prepare_stamp(&cmd).await;
+        self.establish_outbound(stream, cmd, pow).await
     }
 
-    /// Общая часть исходящего соединения: handshake (наш/их Hello), кэширование
-    /// enc_pubkey, отправка первого пакета и запуск задач соединения. Работает
-    /// поверх любого подключённого потока — прямого TCP или relay-туннеля.
-    async fn establish_outbound(
-        &self,
-        stream:        TcpStream,
-        to:            NodeId,
-        their_enc_pub: &[u8; 32],
-        first_pkt:     DmPacket,
-    ) -> anyhow::Result<()> {
-        let (mut rd, mut wr) = stream.into_split();
+    /// Общая часть исходящего соединения: Noise-рукопожатие с проверкой, что на
+    /// том конце именно `cmd.to`, обмен Hello, шифрование первого сообщения
+    /// ключом из аутентифицированного Hello и запуск задач соединения. Работает
+    /// поверх любого потока — прямого TCP или relay-туннеля.
+    async fn establish_outbound(&self, stream: BoxStream, cmd: DmSendCmd, pow: Option<u64>) -> anyhow::Result<()> {
+        use anyhow::anyhow;
+
+        // Подменённый адрес (чужой узел, злой relay) обрывается здесь, до того
+        // как мы что-либо отправим.
+        let secure = secure::connect(stream, &self.inner.noise, Channel::Dm, Some(&cmd.to)).await?;
+        let (mut rd, mut wr) = tokio::io::split(secure);
 
         // Наш Hello
-        write_dm_pkt(&mut wr, &DmPacket::Hello {
-            node_id:    self.inner.my_peer.id.clone(),
-            name:       self.inner.my_peer.name.clone(),
-            enc_pubkey: hex::encode(self.inner.my_enc_kp.public_bytes()),
-        }).await?;
+        write_dm_pkt(&mut wr, &self.hello()).await?;
 
         // Их Hello
-        let (peer_name, confirmed_pub) = match read_dm_pkt(&mut rd).await? {
-            DmPacket::Hello { name, enc_pubkey, .. } => {
+        let (peer_name, confirmed_pub) = match timeout(DM_HELLO_TIMEOUT, read_dm_pkt(&mut rd)).await {
+            Ok(Ok(DmPacket::Hello { node_id, name, enc_pubkey })) if node_id == cmd.to => {
                 let bytes: [u8; 32] = hex::decode(&enc_pubkey)
                     .ok().and_then(|b| b.try_into().ok())
-                    .unwrap_or(*their_enc_pub);
-                (name, bytes)
+                    .ok_or_else(|| anyhow!("DM: invalid enc_pubkey in Hello from {}", cmd.to))?;
+                (display_text(&name, void_core::peer::MAX_PROFILE_NAME_CHARS), bytes)
             }
-            _ => (String::new(), *their_enc_pub),
+            Ok(Ok(_)) => anyhow::bail!("DM: expected Hello from {}", cmd.to),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("DM: Hello timeout from {}", cmd.to),
         };
 
         // Кэшируем
         self.inner.known_pubkeys.lock().await
-            .insert(to.clone(), (confirmed_pub, peer_name.clone()));
+            .insert(cmd.to.clone(), (confirmed_pub, peer_name.clone()));
 
-        // Отправляем первый пакет
+        // Ключ берём из аутентифицированного Hello, а не из неподписанного профиля.
+        let first_pkt = encrypt_message(&self.inner.my_enc_kp, &confirmed_pub, &cmd.plaintext, cmd.message_id, pow)?;
         write_dm_pkt(&mut wr, &first_pkt).await?;
 
+        let to = cmd.to;
         let (fwd_tx, fwd_rx) = mpsc::channel::<FwdItem>(64);
         self.inner.connections.lock().await
             .insert(to.clone(), PeerConn { fwd_tx });
@@ -362,6 +398,24 @@ impl PrivateChatHandle {
 
         Ok(())
     }
+}
+
+/// Шифрует текст для получателя (хранится на диске в зашифрованном виде).
+fn encrypt_message(
+    my_kp:      &EncryptionKeypair,
+    to_pub:     &[u8; 32],
+    plaintext:  &str,
+    message_id: String,
+    pow:        Option<u64>,
+) -> anyhow::Result<DmPacket> {
+    let enc = EncryptedMessage::encrypt(plaintext.as_bytes(), to_pub, my_kp)
+        .map_err(|e| anyhow::anyhow!("DM encrypt: {:?}", e))?;
+    Ok(DmPacket::Message {
+        message_id,
+        encrypted_blob: serde_json::to_string(&enc)?,
+        timestamp:      chrono::Utc::now().timestamp(),
+        pow,
+    })
 }
 
 /// Прямой дозвон до DM-сервера пира (`ip:dm_port`).
@@ -386,8 +440,8 @@ async fn run_conn_tasks(
     peer_id:       NodeId,
     peer_name:     String,
     their_enc_pub: [u8; 32],
-    mut rd:        OwnedReadHalf,
-    mut wr:        OwnedWriteHalf,
+    mut rd:        DmRead,
+    mut wr:        DmWrite,
     mut fwd_rx:    mpsc::Receiver<FwdItem>,
 ) {
     let inner_r = Arc::clone(&inner);
@@ -397,8 +451,8 @@ async fn run_conn_tasks(
     let read_task = tokio::spawn(async move {
         loop {
             match read_dm_pkt(&mut rd).await {
-                Ok(DmPacket::Message { message_id, encrypted_blob, timestamp }) => {
-                    on_dm_message(&inner_r, &pid_r, &pname_r, message_id, encrypted_blob, timestamp).await;
+                Ok(pkt @ DmPacket::Message { .. }) => {
+                    on_dm_message(&inner_r, &pid_r, &pname_r, &their_enc_pub, pkt).await;
                 }
                 Ok(DmPacket::Ping) | Ok(DmPacket::Pong)
                 | Ok(DmPacket::Hello { .. }) | Ok(DmPacket::Unknown) => {}
@@ -409,8 +463,6 @@ async fn run_conn_tasks(
             }
         }
     });
-
-    let _their_enc_pub = their_enc_pub; // подавляем предупреждение
 
     let write_task = tokio::spawn(async move {
         while let Some((pkt, ack)) = fwd_rx.recv().await {
@@ -438,14 +490,23 @@ async fn on_dm_message(
     inner:          &Inner,
     from:           &NodeId,
     from_name:      &str,
-    message_id:     String,
-    encrypted_blob: String,
-    timestamp:      i64,
+    their_enc_pub:  &[u8; 32],
+    pkt:            DmPacket,
 ) {
+    let DmPacket::Message { message_id, encrypted_blob, timestamp, pow } = pkt else { return };
+    let stamped = pow.is_some_and(|n| {
+        crate::dm_pow::verify(from, &inner.my_peer.id, chrono::Utc::now().timestamp(), n)
+    });
     let enc: EncryptedMessage = match serde_json::from_str(&encrypted_blob) {
         Ok(e) => e,
         Err(e) => { warn!("DM: bad blob from {}: {}", from, e); return; }
     };
+    // Блоб должен быть зашифрован ключом, который отправитель назвал в своём
+    // аутентифицированном Hello — иначе это не его сообщение.
+    if enc.sender_pubkey != hex::encode(their_enc_pub) {
+        warn!("DM: blob from {} encrypted by a foreign key, dropped", from);
+        return;
+    }
     let plaintext_bytes = match enc.decrypt(&inner.my_enc_kp) {
         Ok(b) => b,
         Err(e) => { warn!("DM: decrypt from {} failed: {:?}", from, e); return; }
@@ -459,21 +520,23 @@ async fn on_dm_message(
         plaintext,
         timestamp,
         encrypted_blob,
+        stamped,
     };
     let _ = inner.incoming_tx.send(dm);
 }
 
 // ── I/O хелперы ───────────────────────────────────────────────────────────────
 
-async fn write_dm_pkt(wr: &mut OwnedWriteHalf, pkt: &DmPacket) -> anyhow::Result<()> {
+async fn write_dm_pkt<W: AsyncWrite + Unpin>(wr: &mut W, pkt: &DmPacket) -> anyhow::Result<()> {
     let json = serde_json::to_vec(pkt)?;
     if json.len() > MAX_PKT { anyhow::bail!("DM packet too large"); }
     wr.write_all(&(json.len() as u32).to_be_bytes()).await?;
     wr.write_all(&json).await?;
+    wr.flush().await?;
     Ok(())
 }
 
-async fn read_dm_pkt(rd: &mut OwnedReadHalf) -> anyhow::Result<DmPacket> {
+async fn read_dm_pkt<R: AsyncRead + Unpin>(rd: &mut R) -> anyhow::Result<DmPacket> {
     let mut len_buf = [0u8; 4];
     rd.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -492,6 +555,7 @@ mod tests {
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
     use void_core::peer::Service;
+    use void_crypto::keys::SigningKeypair;
 
     /// Берёт свободный TCP-порт на loopback (закрывая временный листенер).
     fn free_port() -> u16 {
@@ -502,8 +566,13 @@ mod tests {
             .port()
     }
 
+    /// Ed25519-ключ узла: NodeId должен быть настоящим — Noise его проверяет.
+    fn signing(seed: u8) -> SigningKeypair {
+        SigningKeypair::from_seed(&[seed; 32]).unwrap()
+    }
+
     fn node_id(seed: u8) -> NodeId {
-        NodeId::from_public_key_bytes(&[seed; 32])
+        NodeId::from_public_key_bytes(&signing(seed).public_bytes())
     }
 
     fn test_peer(name: &str, id_seed: u8, dm_port: u16) -> PeerInfo {
@@ -529,7 +598,8 @@ mod tests {
         let kp = Arc::new(EncryptionKeypair::generate());
         let peer = test_peer(name, id_seed, dm_port);
         let id = peer.id.clone();
-        let handle = start_private_chat(peer, Arc::clone(&kp), dm_port)
+        let noise = NoiseIdentity::new(&signing(id_seed));
+        let handle = start_private_chat(peer, Arc::clone(&kp), noise, dm_port)
             .await
             .expect("start_private_chat");
         (handle, kp, id)
@@ -555,6 +625,7 @@ mod tests {
                 their_enc_pubkey: b_kp.public_bytes(),
                 plaintext:        "привет, Боб 🔒".into(),
                 message_id:       "m1".into(),
+                stamp:            false,
             })
             .await
             .expect("send_dm");
@@ -567,6 +638,41 @@ mod tests {
         assert_eq!(dm.plaintext, "привет, Боб 🔒");
         assert_eq!(dm.from, a_id, "from должен быть NodeId Алисы");
         assert_eq!(dm.message_id, "m1");
+    }
+
+    /// Марка работы: подбирается один раз и прикладывается ко всем сообщениям
+    /// дня; получатель видит её как действующую. Без запроса марки — нет.
+    #[tokio::test]
+    async fn dm_stamp_attached_and_verified() {
+        let a_port = free_port();
+        let b_port = free_port();
+        let (alice, _a_kp, a_id) = start_node("alice", 1, a_port).await;
+        let (bob, b_kp, b_id) = start_node("bob", 2, b_port).await;
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        let send = |id: &str, stamp: bool| DmSendCmd {
+            to:               b_id.clone(),
+            to_dm_addr:       format!("127.0.0.1:{}", b_port),
+            their_enc_pubkey: b_kp.public_bytes(),
+            plaintext:        id.into(),
+            message_id:       id.into(),
+            stamp,
+        };
+        alice.send_dm(send("s1", true)).await.expect("send s1");
+        let today = crate::dm_pow::utc_day(chrono::Utc::now().timestamp());
+        let cached = alice.inner.stamps.lock().await.get(&b_id).copied();
+        assert!(matches!(cached, Some((day, _)) if day == today), "марка закэширована на сегодня");
+        alice.send_dm(send("s2", true)).await.expect("send s2");
+        assert_eq!(alice.inner.stamps.lock().await.get(&b_id).copied(), cached, "вторая — та же марка");
+        alice.send_dm(send("plain", false)).await.expect("send plain");
+
+        for (id, stamped) in [("s1", true), ("s2", true), ("plain", false)] {
+            let dm = timeout(Duration::from_secs(5), bob_rx.recv()).await.unwrap().unwrap();
+            assert_eq!(dm.message_id, id);
+            assert_eq!(dm.from, a_id);
+            assert_eq!(dm.stamped, stamped, "{id}");
+        }
     }
 
     /// Двунаправленный обмен: Bob отвечает Alice, используя enc_pubkey,
@@ -590,6 +696,7 @@ mod tests {
                 their_enc_pubkey: b_kp.public_bytes(),
                 plaintext:        "ping".into(),
                 message_id:       "m1".into(),
+                stamp:            false,
             })
             .await
             .expect("send ping");
@@ -614,6 +721,7 @@ mod tests {
             their_enc_pubkey: a_pub,
             plaintext:        "pong".into(),
             message_id:       "m2".into(),
+            stamp:            false,
         })
         .await
         .expect("send pong");
@@ -645,6 +753,7 @@ mod tests {
                     their_enc_pubkey: b_kp.public_bytes(),
                     plaintext:        format!("msg-{i}"),
                     message_id:       format!("m{i}"),
+                    stamp:            false,
                 })
                 .await
                 .expect("send_dm");
@@ -682,7 +791,7 @@ mod tests {
 
         // Bob обрабатывает свою сторону как входящее DM-соединение.
         let bob2 = bob.clone();
-        tokio::spawn(async move { bob2.accept_stream(bob_side).await; });
+        tokio::spawn(async move { bob2.accept_stream(Box::new(bob_side)).await; });
 
         // Alice шлёт сообщение по своей стороне.
         alice
@@ -693,8 +802,9 @@ mod tests {
                     their_enc_pubkey: b_kp.public_bytes(),
                     plaintext:        "через туннель".into(),
                     message_id:       "rm1".into(),
+                    stamp:            false,
                 },
-                alice_side,
+                Box::new(alice_side),
             )
             .await
             .expect("send_dm_over_stream");
@@ -723,5 +833,67 @@ mod tests {
         // Пакет неизвестного типа от будущей версии не должен ломать парсинг.
         let unknown: DmPacket = serde_json::from_str(r#"{"kind":"from_the_future"}"#).unwrap();
         assert!(matches!(unknown, DmPacket::Unknown));
+    }
+
+    /// Узел не может назваться в Hello чужим NodeId (или путём «../keystore»):
+    /// node_id обязан совпасть с доказанным Noise-рукопожатием.
+    #[tokio::test]
+    async fn dm_hello_must_match_authenticated_id() {
+        let b_port = free_port();
+        let (bob, b_kp, _b_id) = start_node("bob", 2, b_port).await;
+        let mut bob_rx = bob.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        let mallory = NoiseIdentity::new(&signing(9));
+        for claimed in [node_id(1), NodeId("../keystore".into())] {
+            let evil_kp = EncryptionKeypair::generate();
+            let tcp = TcpStream::connect(("127.0.0.1", b_port)).await.unwrap();
+            let secure = secure::connect(tcp, &mallory, Channel::Dm, None).await.unwrap();
+            let (mut rd, mut wr) = tokio::io::split(secure);
+            write_dm_pkt(&mut wr, &DmPacket::Hello {
+                node_id:    claimed,
+                name:       "alice".into(),
+                enc_pubkey: hex::encode(evil_kp.public_bytes()),
+            }).await.unwrap();
+            assert!(read_dm_pkt(&mut rd).await.is_err(), "сервер не должен отвечать на чужой node_id");
+
+            let enc = EncryptedMessage::encrypt(b"pwned", &b_kp.public_bytes(), &evil_kp).unwrap();
+            let _ = write_dm_pkt(&mut wr, &DmPacket::Message {
+                message_id:     "x".into(),
+                encrypted_blob: serde_json::to_string(&enc).unwrap(),
+                timestamp:      0,
+                pow:            None,
+            }).await;
+        }
+
+        assert!(
+            timeout(Duration::from_millis(500), bob_rx.recv()).await.is_err(),
+            "сообщение от самозванца не должно доходить до UI"
+        );
+    }
+
+    /// Отправка «Бобу» по адресу, где на самом деле другой узел (подменённый IP
+    /// в discovery или злой relay), обрывается на рукопожатии: сообщение не уходит.
+    #[tokio::test]
+    async fn dm_to_impostor_address_fails() {
+        let c_port = free_port();
+        let (carol, _c_kp, _c_id) = start_node("carol", 3, c_port).await;
+        let (alice, _a_kp, _a_id) = start_node("alice", 1, free_port()).await;
+        let mut carol_rx = carol.subscribe();
+        sleep(Duration::from_millis(300)).await;
+
+        let res = alice.send_dm(DmSendCmd {
+            to:               node_id(2), // Боб
+            to_dm_addr:       format!("127.0.0.1:{}", c_port),
+            their_enc_pubkey: [7u8; 32],
+            plaintext:        "секрет".into(),
+            message_id:       "x".into(),
+            stamp:            false,
+        }).await;
+        assert!(res.is_err(), "рукопожатие с самозванцем должно провалиться");
+        assert!(
+            timeout(Duration::from_millis(500), carol_rx.recv()).await.is_err(),
+            "самозванец не должен получить сообщение"
+        );
     }
 }

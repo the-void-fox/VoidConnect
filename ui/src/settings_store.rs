@@ -21,6 +21,10 @@ pub struct Settings {
     pub bootstrap_nodes: Vec<String>,
     /// Базовый порт.
     pub base_port: u16,
+    /// Сворачивать в чате сообщения незнакомцев (их всё равно можно раскрыть).
+    pub fold_strangers: bool,
+    /// Роль встречающего: кнопка «Поприветствовать» у незнакомцев.
+    pub greeter: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +33,8 @@ impl Default for Settings {
             public_mode:     false,
             bootstrap_nodes: Vec::new(),
             base_port:       DEFAULT_BASE_PORT,
+            fold_strangers:  false,
+            greeter:         false,
         }
     }
 }
@@ -48,6 +54,6 @@ pub fn load() -> Settings {
 /// Сохраняет настройки на диск (в папку данных).
 pub fn save(s: &Settings) -> std::io::Result<()> {
     let data = serde_json::to_string_pretty(s)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(settings_path(), data)
 }

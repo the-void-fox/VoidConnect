@@ -10,6 +10,7 @@ members = [
     "crates/web",
     "crates/reputation",
     "crates/vote",
+    "crates/trust",
     "app",
     "ui"
 ]
@@ -18,25 +19,22 @@ resolver = "2"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.21"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Networking
-mdns-sd = "0.10"
-futures ="0.3"
+# Noise Protocol Framework — аутентифицированное шифрование всех TCP-каналов.
+snow = { version = "0.10", default-features = false, features = ["std", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 
 # Crypto
-sodiumoxide = "0.2"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand_core = "0.6"
 hmac = "0.12"
 blake3 = "1"
 chacha20poly1305 = "0.10"
-mac_address = "1.1"
 gethostname = "0.4"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -56,13 +54,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utils
-uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
-base64 = "0.21"
 rand = "0.8"
 bytes = "1"
-tokio-util = { version = "0.7", features = ["codec"] }
 
 # Тесты
 tempfile = "3"

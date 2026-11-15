@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 # Внутренние крейты
-void-core   = { path = "../core" }
 void-crypto = { path = "../crypto" }
 void-db     = { path = "../db" }
 

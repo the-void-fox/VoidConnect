@@ -54,6 +54,7 @@ impl Direction {
 
 /// Сохраняет входящее/исходящее сообщение общего чата.
 /// Игнорирует дубли (по message_id).
+#[allow(clippy::too_many_arguments)] // поля строки таблицы, по одному на столбец
 pub async fn save_public_message(
     pool: &DbPool,
     message_id: &str,

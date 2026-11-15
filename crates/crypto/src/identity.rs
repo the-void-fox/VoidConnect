@@ -1,26 +1,26 @@
-/// identity.rs — генерация и хранение Identity, привязанного к железу.
-///
-/// ## Как это работает
-///
-/// ```text
-/// [MAC + hostname]  ──HMAC-SHA256──►  machine_seed (32 байта)
-///                         ▲
-///                   machine_secret  ←── файл ~/.void/machine.secret
-///                   (генерируется 1 раз, 32 случайных байта)
-///
-/// machine_seed  ──BLAKE3-KDF──►  signing_seed   → Ed25519 keypair
-///                           └──►  encryption_seed → X25519 keypair
-///
-/// AccountId = hex(Ed25519 public key)  — 64 символа
-/// ```
-///
-/// ## Почему так безопасно
-///
-/// - Скопировать БД без `machine.secret` → ключ не восстановить
-/// - Скопировать `machine.secret` на другое железо → HMAC вернёт
-///   другой `machine_seed` (другой MAC/hostname) → другой keypair
-/// - Оба файла на другом железе → ID совпадёт (это намеренно —
-///   пользователь сам решает мигрировать аккаунт)
+//! identity.rs — генерация и хранение Identity, привязанного к железу.
+//!
+//! ## Как это работает
+//!
+//! ```text
+//! [MAC + hostname]  ──HMAC-SHA256──►  machine_seed (32 байта)
+//!                         ▲
+//!                   machine_secret  ←── файл ~/.void/machine.secret
+//!                   (генерируется 1 раз, 32 случайных байта)
+//!
+//! machine_seed  ──BLAKE3-KDF──►  signing_seed   → Ed25519 keypair
+//!                           └──►  encryption_seed → X25519 keypair
+//!
+//! AccountId = hex(Ed25519 public key)  — 64 символа
+//! ```
+//!
+//! ## Почему так безопасно
+//!
+//! - Скопировать БД без `machine.secret` → ключ не восстановить
+//! - Скопировать `machine.secret` на другое железо → HMAC вернёт
+//!   другой `machine_seed` (другой MAC/hostname) → другой keypair
+//! - Оба файла на другом железе → ID совпадёт (это намеренно —
+//!   пользователь сам решает мигрировать аккаунт)
 
 use std::path::Path;
 use std::fs;

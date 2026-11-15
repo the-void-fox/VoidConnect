@@ -76,6 +76,11 @@ impl ChunkIndex {
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }
+
+    /// Индекс пуст.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
 }
 
 impl Default for ChunkIndex {

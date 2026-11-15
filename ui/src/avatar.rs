@@ -10,7 +10,11 @@ use eframe::egui;
 const AVATAR_SIZE: u32 = 64;
 /// Лимит base64-строки аватара (~24 КБ) — чтобы профиль оставался лёгким для
 /// рассылки по relay чата.
-pub const MAX_AVATAR_B64: usize = 24 * 1024;
+pub use void_core::peer::MAX_AVATAR_B64;
+/// Максимальная сторона ЧУЖОГО аватара (свой всегда 64×64). Больше — отбрасываем
+/// по заголовку, не декодируя пиксели: «PNG-бомба» весит килобайты, а
+/// распаковывается в гигабайты.
+const MAX_AVATAR_SIDE: u32 = 256;
 
 /// Декодирует изображение из файла, масштабирует/обрезает до 64×64 и кодирует
 /// в base64-PNG. `None` — не удалось прочитать/слишком большой результат.
@@ -42,10 +46,28 @@ pub fn avatar_hash(b64: &str) -> u64 {
     h
 }
 
+/// Декодирует base64 аватара из сети и проверяет размер файла и размеры
+/// картинки по заголовку (без распаковки пикселей). `None` — отбросить.
+fn checked_avatar_bytes(b64: &str) -> Option<Vec<u8>> {
+    if b64.len() > MAX_AVATAR_B64 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if w == 0 || h == 0 || w > MAX_AVATAR_SIDE || h > MAX_AVATAR_SIDE {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Строит egui-картинку из base64-PNG. URI содержит хэш содержимого, поэтому
 /// смена аватара инвалидирует кэш текстур egui.
 pub fn image_from_b64(b64: &str) -> Option<egui::Image<'static>> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let bytes = checked_avatar_bytes(b64)?;
     let uri = format!("bytes://avatar/{:016x}.png", avatar_hash(b64));
     Some(egui::Image::from_bytes(uri, bytes))
 }
@@ -54,7 +76,7 @@ pub fn image_from_b64(b64: &str) -> Option<egui::Image<'static>> {
 /// аватара в произвольном `Painter` (например, узлы графа), где виджет
 /// [`egui::Image`] неприменим. `None` — битые данные.
 pub fn color_image_from_b64(b64: &str) -> Option<egui::ColorImage> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let bytes = checked_avatar_bytes(b64)?;
     let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (w, h) = rgba.dimensions();
     Some(egui::ColorImage::from_rgba_unmultiplied(
@@ -123,4 +145,43 @@ pub fn show_avatar(
         egui::FontId::proportional(size * 0.45),
         egui::Color32::WHITE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Однотонный PNG с максимальным сжатием (так собирают «PNG-бомбу»).
+    fn png_b64(w: u32, h: u32) -> String {
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        use image::ImageEncoder;
+        let raw = vec![0u8; (w * h * 4) as usize];
+        let mut png = Vec::new();
+        PngEncoder::new_with_quality(&mut png, CompressionType::Best, FilterType::NoFilter)
+            .write_image(&raw, w, h, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    }
+
+    #[test]
+    fn normal_avatar_decodes() {
+        let img = color_image_from_b64(&png_b64(64, 64)).expect("64×64 должен декодироваться");
+        assert_eq!(img.size, [64, 64]);
+    }
+
+    #[test]
+    fn oversized_dimensions_rejected_before_decoding() {
+        // Однотонная 1024×1024 сжимается в PNG до килобайт (проходит лимит по
+        // байтам), но в памяти — 4 МБ; при 16k×16k было бы уже 1 ГБ.
+        let bomb = png_b64(1024, 1024);
+        assert!(bomb.len() <= MAX_AVATAR_B64, "бомба должна пролезать в лимит по байтам");
+        assert!(color_image_from_b64(&bomb).is_none());
+        assert!(image_from_b64(&bomb).is_none());
+    }
+
+    #[test]
+    fn garbage_rejected() {
+        assert!(color_image_from_b64("not base64 !!!").is_none());
+        assert!(color_image_from_b64(&"A".repeat(MAX_AVATAR_B64 + 4)).is_none());
+    }
 }

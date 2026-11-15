@@ -80,6 +80,8 @@ pub struct VoidApp {
     pw_confirm:       String,
     /// Результат последней операции с паролем: (это_ошибка, текст).
     pw_msg:           Option<(bool, String)>,
+    /// Один раз спросить, публиковать ли старые локальные отметки «проверен».
+    trust_prompt:     bool,
 }
 
 impl VoidApp {
@@ -93,10 +95,24 @@ impl VoidApp {
         chat.reports = Some(std::sync::Arc::clone(&backend.reports));
         chat.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
         chat.voted_channels = Some(std::sync::Arc::clone(&backend.voted_channels));
-        // Локальный список проверенных контактов (общий для chat и graph).
-        let verified = std::sync::Arc::new(std::sync::Mutex::new(crate::verify_store::load_verified()));
-        chat.verified = Some(std::sync::Arc::clone(&verified));
+        // Сеть доверия (общая для chat и graph).
+        let trust = crate::trust_ui::TrustUi {
+            map:     std::sync::Arc::clone(&backend.trust),
+            private: std::sync::Arc::clone(&backend.private_verified),
+            access:  std::sync::Arc::clone(&backend.dm_access),
+            details: std::sync::Arc::clone(&backend.trust_details),
+            greeter: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                crate::settings_store::load().greeter,
+            )),
+            my_vouchers: std::sync::Arc::clone(&backend.my_vouchers),
+            tx:      backend.trust_tx.clone(),
+        };
+        chat.trust = Some(trust.clone());
+        let trust_prompt = !backend.private_verified.lock().unwrap().is_empty()
+            && !crate::verify_store::migration_asked();
         chat.my_id_hex = backend.my_id_full.clone();
+        chat.my_vouchers = Some(std::sync::Arc::clone(&backend.my_vouchers));
+        chat.chat_links = Some(std::sync::Arc::clone(&backend.chat_links));
 
         // Load saved profile values (description, status) for the profile page
         let saved = crate::profile_store::load_or_create();
@@ -121,16 +137,18 @@ impl VoidApp {
         graph.reputation = Some(std::sync::Arc::clone(&backend.peer_reputation));
         graph.reports = Some(std::sync::Arc::clone(&backend.reports));
         graph.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
-        graph.verified = Some(std::sync::Arc::clone(&verified));
+        graph.trust = Some(trust);
+        graph.topology = Some(std::sync::Arc::clone(&backend.topology));
 
         // Инициализируем страницу личных сообщений
-        let mut private = PrivatePage::default();
-        private.my_enc_kp  = Some(std::sync::Arc::clone(&backend.my_enc_kp));
-        private.my_enc_pub = backend.my_enc_kp.public_bytes();
-        private.dm_sender  = Some(backend.dm_sender.clone());
-        private.my_node_id = Some(backend.my_id_node.clone());
-        private.my_name    = backend.my_name.clone();
-        private.base_port  = backend.base_port;
+        let mut private = PrivatePage {
+            my_enc_kp:  Some(std::sync::Arc::clone(&backend.my_enc_kp)),
+            dm_sender:  Some(backend.dm_sender.clone()),
+            my_name:    backend.my_name.clone(),
+            access:     Some(std::sync::Arc::clone(&backend.dm_access)),
+            trust_tx:   Some(backend.trust_tx.clone()),
+            ..PrivatePage::default()
+        };
         // Загружаем историю с диска
         private.load_history_from_disk();
 
@@ -142,12 +160,14 @@ impl VoidApp {
         storage.downloads_dir = Some(backend.downloads_dir.clone());
         storage.peer_profiles = Some(std::sync::Arc::clone(&backend.peer_profiles));
         storage.my_id         = Some(backend.my_id_node.clone());
+        storage.my_vouchers   = Some(std::sync::Arc::clone(&backend.my_vouchers));
         storage.my_name       = backend.my_name.clone();
 
         // Страница сайтов: канал публикации + список сайтов + имена .void.
         let mut sites = SitesPage::default();
         sites.publish_tx     = Some(backend.publish_site_tx.clone());
         sites.mirror_tx      = Some(backend.mirror_tx.clone());
+        sites.my_vouchers    = Some(std::sync::Arc::clone(&backend.my_vouchers));
         sites.sites          = Some(std::sync::Arc::clone(&backend.sites));
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
@@ -157,13 +177,14 @@ impl VoidApp {
         votes.proposals     = Some(std::sync::Arc::clone(&backend.proposals));
         votes.propose_tx    = Some(backend.propose_tx.clone());
         votes.vote_cast_tx  = Some(backend.vote_cast_tx.clone());
-        votes.my_score      = Some(std::sync::Arc::clone(&backend.my_score));
+        votes.my_vouchers   = Some(std::sync::Arc::clone(&backend.my_vouchers));
         votes.peers         = Some(std::sync::Arc::clone(&backend.peers));
         votes.profiles      = Some(std::sync::Arc::clone(&backend.peer_profiles));
         votes.storage_files = Some(std::sync::Arc::clone(&backend.storage_files));
 
         let settings = crate::settings_store::load();
         let settings_bootstrap_input = settings.bootstrap_nodes.join("\n");
+        chat.fold_strangers = settings.fold_strangers;
 
         Self {
             current_page: Page::Chat,
@@ -181,6 +202,7 @@ impl VoidApp {
             pw_new: String::new(),
             pw_confirm: String::new(),
             pw_msg: None,
+            trust_prompt,
             show_settings: false,
             show_about: false,
             show_docs: false,
@@ -303,6 +325,8 @@ impl VoidApp {
                     is_me,
                     from_id: Some(msg.from.clone()),
                     channel: msg.channel.clone(),
+                    seq:     msg.seq,
+                    may_drop: false,
                 });
             }
             self.history_loaded = true;
@@ -331,6 +355,8 @@ impl VoidApp {
                 is_me:   false,
                 from_id: Some(msg.from.clone()),
                 channel: msg.channel.clone(),
+                seq:     msg.seq,
+                may_drop: false,
             });
         }
     }
@@ -414,8 +440,7 @@ impl VoidApp {
         self.profile.download_bytes = self.backend.bytes_downloaded.load(std::sync::atomic::Ordering::Relaxed);
 
         // Своя репутация глазами пиров (из периодического gossip) + есть ли пиры.
-        self.profile.my_reputation = *self.backend.my_reputation.lock().unwrap();
-        self.profile.has_peers     = self.peer_count > 0;
+        self.profile.my_vouchers = self.backend.my_vouchers.load(std::sync::atomic::Ordering::Relaxed);
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -544,6 +569,7 @@ impl VoidApp {
     // ── Окна из меню ──────────────────────────────────────────────────────────
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        self.show_trust_prompt(ctx);
         self.show_settings_window(ctx);
         self.show_about_window(ctx);
         self.show_docs_window(ctx);
@@ -551,6 +577,62 @@ impl VoidApp {
 
     /// Окно настроек: публичный режим, bootstrap-узлы, базовый порт.
     /// Значения сохраняются в settings.json и применяются при следующем запуске.
+    /// Один раз после обновления: раньше отметки «проверен» были только
+    /// локальными, теперь «проверен» — публичное поручительство. Спрашиваем,
+    /// публиковать ли старые отметки; если нет — они остаются только у нас.
+    fn show_trust_prompt(&mut self, ctx: &egui::Context) {
+        if !self.trust_prompt {
+            return;
+        }
+        let count = self.backend.private_verified.lock().unwrap().len();
+        let mut answer: Option<bool> = None;
+        egui::Window::new("Проверенные контакты")
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([400.0, 0.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("У вас {count} контакт(ов), отмеченных проверенными."));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Теперь отметка «проверен» — это публичное поручительство: его видят \
+                         другие узлы, и ваше доверие к контакту помогает доверию к нему у ваших \
+                         знакомых (сеть доверия). Раньше отметки были видны только вам.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Если не публиковать, отметки продолжат работать только для вас; \
+                         опубликовать любую можно позже в профиле контакта.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Оставить только у меня").clicked() {
+                        answer = Some(false);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Опубликовать").clicked() {
+                            answer = Some(true);
+                        }
+                    });
+                });
+            });
+        if let Some(publish) = answer {
+            if publish {
+                let _ = self.backend.trust_tx.send(crate::backend::TrustCmd::PublishPrivate);
+            }
+            crate::verify_store::mark_migration_asked();
+            self.trust_prompt = false;
+        }
+    }
+
     fn show_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         egui::Window::new("\u{F0493}  Настройки")
@@ -561,6 +643,52 @@ impl VoidApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+                ui.label(egui::RichText::new("Чат").strong().size(15.0));
+                ui.add_space(8.0);
+                if ui
+                    .checkbox(&mut self.chat.fold_strangers, "Сворачивать сообщения незнакомцев")
+                    .changed()
+                {
+                    // Применяется сразу; сохраняем только это поле — несохранённые
+                    // правки сетевых настроек ниже на диск не попадают.
+                    self.settings.fold_strangers = self.chat.fold_strangers;
+                    let mut on_disk = crate::settings_store::load();
+                    on_disk.fold_strangers = self.chat.fold_strangers;
+                    let _ = crate::settings_store::save(&on_disk);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Сообщения тех, за кого никто из вашей сети доверия не поручился, \
+                         показываются свёрнутыми — их можно раскрыть по щелчку.")
+                        .small().color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(6.0);
+                if ui.checkbox(&mut self.settings.greeter, "Я встречающий").changed() {
+                    if let Some(trust) = &self.chat.trust {
+                        trust.greeter.store(self.settings.greeter, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let mut on_disk = crate::settings_store::load();
+                    on_disk.greeter = self.settings.greeter;
+                    let _ = crate::settings_store::save(&on_disk);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "У новичков в канале «Новички» и в их профиле появится кнопка \
+                         «Поприветствовать». Это слабое публичное поручительство: «похож на \
+                         живого человека». Для вас и ваших знакомых новичок станет освоившимся. \
+                         Если он окажется ботом, ваши поручительства потеряют вес.")
+                        .small().color(ui.visuals().weak_text_color()),
+                );
+                if self.settings.greeter && self.backend.my_vouchers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    crate::trust_ui::newcomer_hint(
+                        ui,
+                        "За вас ещё никто не поручился — у других узлов ваше приветствие пока ничего не весит.",
+                    );
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("Глобальная сеть").strong().size(15.0));
                 ui.add_space(8.0);
 

@@ -15,7 +15,11 @@ use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, Service};
 
 const SERVICE_TYPE: &str = "_void-connect._tcp.local.";
-const PROTOCOL_VERSION: &str = "1";
+/// v2: все TCP-соединения через Noise (`void_network::secure`).
+/// v3: подписаны профили/манифесты/имя автора; чат — сеть без центра (обе
+/// стороны связи шлют Hello). Узлы старых версий с нами говорить не могут —
+/// их не показываем.
+const PROTOCOL_VERSION: &str = "3";
 
 pub async fn start_mdns(
     my_peer: PeerInfo,
@@ -137,6 +141,10 @@ async fn handle_resolved(peer_list: &PeerList, info: mdns_sd::ServiceInfo, my_id
 
     if id_str == my_id.as_str() {
         debug!("mDNS: ignoring own announcement");
+        return;
+    }
+    if !void_core::sanitize::is_hex64(&id_str) {
+        warn!("mDNS: peer '{}' has invalid id, skipping", info.get_fullname());
         return;
     }
 

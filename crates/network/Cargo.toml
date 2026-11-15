@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 void-core = { path = "../core" }
+void-crypto = { path = "../crypto" }
+
+snow = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
 
 # Async runtime (используется только RateLimiter: tokio::sync::Mutex)
 tokio = { workspace = true }

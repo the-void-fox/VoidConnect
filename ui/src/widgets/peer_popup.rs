@@ -2,6 +2,20 @@ use eframe::egui;
 use void_core::peer::{PeerInfo, PeerProfile};
 use void_db::peers::ReportRow;
 use void_reputation::ReportReason;
+use void_trust::TrustLevel;
+
+use crate::trust_ui::TrustView;
+
+/// Поручительство, выбранное в попапе.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VouchAction {
+    /// Поручиться лично (код безопасности совпал) — или опубликовать старую отметку.
+    Vouch,
+    /// Отозвать поручительство или приветствие (или снять локальную отметку).
+    Revoke,
+    /// Поприветствовать новичка (роль встречающего).
+    Greet,
+}
 
 /// Действие, выбранное пользователем в попапе профиля узла.
 #[derive(Default)]
@@ -10,8 +24,88 @@ pub struct PeerPopupAction {
     pub start_dm: bool,
     /// Выбрана причина жалобы на узел.
     pub report: Option<ReportReason>,
-    /// Пользователь переключил отметку «проверен» (сверил safety number).
-    pub toggle_verify: bool,
+    /// Поручиться / отозвать.
+    pub vouch: Option<VouchAction>,
+    /// `Some(true)` — заблокировать, `Some(false)` — разблокировать.
+    pub block: Option<bool>,
+}
+
+/// Наблюдения за незнакомцем («когда освоится») и кнопки встречающего.
+fn show_newcomer_section(ui: &mut egui::Ui, view: &TrustView) -> Option<VouchAction> {
+    use void_trust::store::{SETTLE_ACTIVE_DAYS, SETTLE_SECS};
+    let level = view.info.level;
+    let stranger = level == TrustLevel::Stranger && !view.info.reported;
+    let can_greet = view.greeter_mode && !view.greeted_by_me && (stranger || level == TrustLevel::Settled);
+    if !stranger && !can_greet && !view.greeted_by_me {
+        return None;
+    }
+    let weak = ui.visuals().weak_text_color();
+    let mut action = None;
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(4.0);
+    if stranger {
+        let text = match view.activity {
+            Some(a) => {
+                let days = ((chrono::Utc::now().timestamp() - a.first_seen) / 86_400).max(0);
+                format!(
+                    "Освоится по поведению: ваш узел видит его {} дн. из {}, писал в {} дн. из {}.",
+                    days.min(SETTLE_SECS / 86_400), SETTLE_SECS / 86_400,
+                    a.active_days.min(SETTLE_ACTIVE_DAYS), SETTLE_ACTIVE_DAYS,
+                )
+            }
+            None => "Ваш узел ещё не видел его в сети.".to_string(),
+        };
+        ui.label(egui::RichText::new(text).small().color(weak));
+    }
+    if can_greet {
+        if ui.button("\u{F1821}  Поприветствовать")
+            .on_hover_text("Слабое публичное поручительство: «похож на живого человека». \
+                            Для вас он станет освоившимся; если окажется ботом — ваши \
+                            поручительства потеряют вес.")
+            .clicked()
+        {
+            action = Some(VouchAction::Greet);
+        }
+    } else if view.greeted_by_me && ui.button("Отменить приветствие").clicked() {
+        action = Some(VouchAction::Revoke);
+    }
+    action
+}
+
+/// Подпись и цвет уровня доверия.
+fn trust_badge(view: &TrustView) -> (String, egui::Color32) {
+    match view.info.level {
+        TrustLevel::Verified if view.private_mark => (
+            "󰄬  Проверен лично (не опубликовано)".into(),
+            egui::Color32::from_rgb(80, 190, 110),
+        ),
+        TrustLevel::Verified => ("󰄬  Проверен лично".into(), egui::Color32::from_rgb(80, 190, 110)),
+        TrustLevel::Trusted => {
+            let mut names = view.via_names.join(", ");
+            if names.is_empty() {
+                names = "общие контакты".into();
+            }
+            (format!("󰡉  Через знакомых: {names}"), egui::Color32::from_rgb(120, 170, 220))
+        }
+        TrustLevel::Settled => {
+            let why = if view.greeted_by_me {
+                " · вы поприветствовали".to_string()
+            } else if view.info.settled {
+                " · по поведению".to_string()
+            } else if !view.via_names.is_empty() {
+                format!(" · через {}", view.via_names.join(", "))
+            } else {
+                String::new()
+            };
+            (format!("Освоившийся{why}"), egui::Color32::from_rgb(170, 160, 120))
+        }
+        TrustLevel::Stranger if view.info.reported => {
+            ("󰀦  Незнакомец · под жалобами".into(), egui::Color32::from_rgb(220, 140, 60))
+        }
+        TrustLevel::Stranger => ("Незнакомец".into(), egui::Color32::from_gray(140)),
+        TrustLevel::Blocked => ("󰂭  Заблокирован".into(), egui::Color32::from_rgb(220, 80, 60)),
+    }
 }
 
 pub fn status_colors(status: Option<&str>) -> (egui::Color32, egui::Color32) {
@@ -26,6 +120,7 @@ pub fn status_colors(status: Option<&str>) -> (egui::Color32, egui::Color32) {
 
 /// Показывает профиль пира. Возвращает выбранное действие (начать беседу /
 /// пожаловаться).
+#[allow(clippy::too_many_arguments)]
 pub fn show_peer_profile(
     ui:         &mut egui::Ui,
     peer:       Option<&PeerInfo>,
@@ -34,7 +129,7 @@ pub fn show_peer_profile(
     reports:    &[ReportRow],
     banned:     bool,
     my_id:      &str,
-    verified:   bool,
+    trust:      Option<&TrustView>,
 ) -> PeerPopupAction {
     let name        = profile.map(|p| p.name.as_str())
         .or_else(|| peer.map(|p| p.name.as_str()))
@@ -43,7 +138,7 @@ pub fn show_peer_profile(
     let status      = profile.map(|p| p.status.as_str()).unwrap_or("online");
     let has_dm_key  = profile.and_then(|p| p.enc_pubkey.as_ref()).is_some();
     let is_bootstrap = profile.map(|p| p.is_bootstrap).unwrap_or(false);
-    let mut toggle_verify = false;
+    let mut vouch = None;
 
     // Avatar + name/status row
     ui.horizontal(|ui| {
@@ -88,13 +183,9 @@ pub fn show_peer_profile(
                         .color(egui::Color32::from_rgb(220, 80, 60)),
                 );
             }
-            if verified {
-                ui.label(
-                    egui::RichText::new("󰄬  Контакт проверен")
-                        .small()
-                        .strong()
-                        .color(egui::Color32::from_rgb(80, 190, 110)),
-                );
+            if let Some(view) = trust {
+                let (label, color) = trust_badge(view);
+                ui.label(egui::RichText::new(label).small().strong().color(color));
             }
         });
     });
@@ -135,7 +226,9 @@ pub fn show_peer_profile(
     // ── Проверка контакта (safety number) ────────────────────────────────────
     let peer_id = peer.map(|p| p.id.as_str())
         .or_else(|| profile.map(|p| p.node_id.as_str()));
-    if let Some(pid) = peer_id {
+    let verified = trust.is_some_and(|t| t.info.level == TrustLevel::Verified);
+    let private_mark = trust.is_some_and(|t| t.private_mark);
+    if let (Some(pid), Some(_)) = (peer_id, trust) {
         if !my_id.is_empty() && pid != my_id {
             ui.add_space(6.0);
             ui.separator();
@@ -152,7 +245,7 @@ pub fn show_peer_profile(
                     egui::RichText::new(
                         "Имена не удостоверены — кто угодно может назваться так же. Сверьте эти \
                          цифры с собеседником по другому каналу (звонок, личная встреча). \
-                         Совпали — отметьте контакт проверенным. Если код вдруг изменился — \
+                         Совпали — поручитесь за контакт. Если код вдруг изменился — \
                          возможна подмена личности.",
                     )
                     .small()
@@ -162,15 +255,55 @@ pub fn show_peer_profile(
                 let code = void_crypto::verify::safety_number(my_id, pid);
                 ui.label(egui::RichText::new(&code).monospace().size(15.0));
                 ui.add_space(6.0);
-                let label = if verified { "Снять отметку «проверен»" } else { "Отметить проверенным" };
-                if ui.button(label).clicked() {
-                    toggle_verify = true;
+                if private_mark {
+                    ui.label(
+                        egui::RichText::new(
+                            "Отметка стоит только у вас. Опубликуйте её, чтобы она стала \
+                             поручительством и помогала доверию к контакту у ваших знакомых.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Опубликовать поручительство").clicked() {
+                            vouch = Some(VouchAction::Vouch);
+                        }
+                        if ui.button("Снять отметку").clicked() {
+                            vouch = Some(VouchAction::Revoke);
+                        }
+                    });
+                } else if verified {
+                    if ui.button("Отозвать поручительство").clicked() {
+                        vouch = Some(VouchAction::Revoke);
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Поручительство публично: его увидят другие узлы, и ваше доверие \
+                             к контакту войдёт в их расчёт. Ручайтесь только за тех, с кем \
+                             сверили код.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    if ui.button("󰄬  Поручиться: код совпал").clicked() {
+                        vouch = Some(VouchAction::Vouch);
+                    }
                 }
             });
         }
     }
 
-    // Репутация узла (по локальным данным; сетевая синхронизация — отд. фаза)
+    // Новичок: когда освоится по поведению; приветствие встречающего.
+    if let (Some(view), Some(pid)) = (trust, peer_id) {
+        if !my_id.is_empty() && pid != my_id {
+            if let Some(greet) = show_newcomer_section(ui, view) {
+                vouch = Some(greet);
+            }
+        }
+    }
+
+    // Качество раздачи (локальная репутация: валидные/битые чанки, отдача).
     if let Some(score) = reputation {
         use void_reputation::ReputationLevel;
         let (label, color) = match ReputationLevel::from_score(score) {
@@ -183,9 +316,12 @@ pub fn show_peer_profile(
         ui.separator();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Репутация:").strong());
+            ui.label(egui::RichText::new("Качество раздачи:").strong());
             ui.label(egui::RichText::new(format!("{label}  ({score:.1})")).color(color));
-        });
+        })
+        .response
+        .on_hover_text("Как этот узел отдаёт вам файлы: проверенные и битые части. \
+                        На доверие и голосования не влияет.");
     }
 
     if !description.is_empty() {
@@ -249,6 +385,12 @@ pub fn show_peer_profile(
     ui.add_space(4.0);
     let mut report = None;
     ui.menu_button("  󰀦  Пожаловаться", |ui| {
+        if trust.is_some_and(|t| t.i_am_newcomer) {
+            crate::trust_ui::newcomer_hint(
+                ui,
+                "За вас ещё никто не поручился: жалобу учтёт только ваш узел.",
+            );
+        }
         if ui.button(" 󱃈  Спам").clicked() {
             report = Some(ReportReason::Spam);
             ui.close_menu();
@@ -263,5 +405,24 @@ pub fn show_peer_profile(
         }
     });
 
-    PeerPopupAction { start_dm: clicked, report, toggle_verify }
+    // Блокировка: личка и сообщения в чате от узла не показываются (локально).
+    let mut block = None;
+    if let (Some(view), Some(pid)) = (trust, peer_id) {
+        if !my_id.is_empty() && pid != my_id {
+            ui.add_space(4.0);
+            if view.blocked_by_me {
+                if ui.button("Разблокировать").clicked() {
+                    block = Some(false);
+                }
+            } else if ui.button("  \u{F00AD}  Заблокировать")
+                .on_hover_text("Его личные сообщения и сообщения в чате перестанут показываться. \
+                                Решение только ваше — в сеть оно не уходит.")
+                .clicked()
+            {
+                block = Some(true);
+            }
+        }
+    }
+
+    PeerPopupAction { start_dm: clicked, report, vouch, block }
 }
