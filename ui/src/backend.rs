@@ -1750,6 +1750,7 @@ fn start_site_tasks(
 
     // Обнаружение чужих сайтов: манифесты из сети → реестр + снимок для GUI.
     let disc_reg  = registry.clone();
+    let disc_mgr  = manager.clone();
     let disc_out  = Arc::clone(&sites_out);
     let disc_key  = my_key.clone();
     let disc_mirror = Arc::clone(&mirrored);
@@ -1760,7 +1761,16 @@ fn start_site_tasks(
                 Ok(manifest) => {
                     tracing::info!("Обнаружен сайт в сети: '{}' ({} файлов)",
                         manifest.name, manifest.entries.len());
+                    let old = disc_reg.get(&manifest.name).await;
                     disc_reg.register(manifest).await;
+                    // Новая версия чужого сайта: кэш файлов прошлой версии (зеркало
+                    // или открытые страницы) больше не нужен — стираем.
+                    if let Some(old) = old.filter(|o| o.owner.as_str() != disc_key) {
+                        let known = disc_reg.list().await;
+                        for file_id in stale_site_files(&old, &known) {
+                            let _ = disc_mgr.delete_file(&file_id).await;
+                        }
+                    }
                     refresh_sites(&disc_reg, &disc_key, http_port, &disc_mirror, &disc_out).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
@@ -1835,18 +1845,16 @@ fn start_site_tasks(
                         }
                     }
                     let site_name = manifest.name.clone();
+                    let old = registry.get(&site_name).await;
+                    registry.register(manifest.clone()).await;
                     // Обновление своего сайта: файлы прошлой версии, которых нет в
                     // новой, больше никому не нужны — стираем, чтобы не копились.
-                    if let Some(old) = registry.get(&site_name).await {
-                        if old.owner.as_str() == my_key {
-                            for entry in &old.entries {
-                                if !manifest.entries.iter().any(|e| e.file_id == entry.file_id) {
-                                    let _ = manager.delete_file(&entry.file_id).await;
-                                }
-                            }
+                    if let Some(old) = old.filter(|o| o.owner.as_str() == my_key) {
+                        let known = registry.list().await;
+                        for file_id in stale_site_files(&old, &known) {
+                            let _ = manager.delete_file(&file_id).await;
                         }
                     }
-                    registry.register(manifest.clone()).await;
                     // Объявляем сайт сети.
                     pub_chat.announce_site(manifest).await;
                     refresh_sites(&registry, &my_key, http_port, &pub_mirror, &sites_out).await;
@@ -1988,6 +1996,19 @@ fn save_mirrored_sites(set: &HashSet<String>) {
     if let Ok(json) = serde_json::to_string_pretty(set) {
         let _ = std::fs::write(mirrored_sites_path(), json);
     }
+}
+
+/// Файлы прошлой версии сайта, которые больше не нужны: их нет ни в новой
+/// версии, ни в другом известном сайте (`known` — реестр уже с новой версией).
+fn stale_site_files(
+    old: &void_core::site::SiteManifest,
+    known: &[void_core::site::SiteManifest],
+) -> Vec<String> {
+    old.entries
+        .iter()
+        .filter(|e| !known.iter().any(|m| m.entries.iter().any(|k| k.file_id == e.file_id)))
+        .map(|e| e.file_id.clone())
+        .collect()
 }
 
 /// Путь к файлу с манифестами своих и зеркалируемых сайтов.
@@ -2827,5 +2848,21 @@ mod tests {
         std::fs::write(&path, "{не json").unwrap();
         assert!(load_saved_sites(&path).is_empty(), "испорченный файл не роняет запуск");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_site_files_skip_reused_and_shared() {
+        let entry = |path: &str, id: char| void_core::site::SiteEntry {
+            path: path.into(), file_id: id.to_string().repeat(64), size_bytes: 1,
+        };
+        let mut v1 = site("blog", 2, 1);
+        v1.entries = vec![entry("index.html", 'a'), entry("logo.png", 'b'), entry("old.css", 'c')];
+        let mut v2 = site("blog", 2, 2);
+        v2.entries = vec![entry("index.html", 'd'), entry("logo.png", 'b')]; // логотип не менялся
+        let mut other = site("docs", 3, 1);
+        other.entries = vec![entry("style.css", 'c')]; // тот же файл у другого сайта
+
+        let stale = stale_site_files(&v1, &[v2, other]);
+        assert_eq!(stale, vec!["a".repeat(64)], "стираем только старый index.html");
     }
 }
