@@ -21,6 +21,8 @@ pub struct SitesPage {
     pub site_http_port: u16,
     search:        String,
     publish_path:  String,
+    /// Почему последняя публикация не ушла (папка не найдена и т. п.).
+    publish_error: Option<String>,
     publish_name:  String,
     snapshot:      Vec<SiteInfo>,
     dns_snapshot:  Vec<DnsInfo>,
@@ -59,6 +61,23 @@ impl SitesPage {
         let path = self.publish_path.trim().to_string();
         let name = self.publish_name.trim().to_string();
         if path.is_empty() || name.is_empty() { return; }
+        // Проверяем здесь: ошибка backend дошла бы только до лога.
+        let dir = std::path::Path::new(&path);
+        if !dir.is_dir() {
+            self.publish_error = Some(if dir.is_file() {
+                format!("Нужна папка с сайтом, а это файл: {path}. Файл можно опубликовать в «Хранилище».")
+            } else {
+                format!("Папка не найдена: {path}")
+            });
+            return;
+        }
+        if !dir.join("index.html").is_file() {
+            self.publish_error = Some(
+                "В папке нет index.html — с него открывается сайт. Добавьте его и опубликуйте снова.".into(),
+            );
+            return;
+        }
+        self.publish_error = None;
         if let Some(tx) = &self.publish_tx {
             let _ = tx.send((PathBuf::from(path), name));
         }
@@ -117,6 +136,9 @@ impl SitesPage {
                     do_publish = true;
                 }
             });
+            if let Some(err) = &self.publish_error {
+                crate::theme::notice(ui, crate::theme::ERR, "\u{F0026}", err);
+            }
             if crate::trust_ui::is_newcomer(&self.my_vouchers) {
                 crate::trust_ui::newcomer_hint(ui, PUBLISH_LIMIT_HINT);
             }

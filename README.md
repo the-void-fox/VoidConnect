@@ -5,7 +5,12 @@
 вносит вклад в работу сети. Внутри — общий и личный чат, обмен файлами, хостинг
 сайтов, внутренний DNS (`.void`) и система репутации.
 
-> Версия: **0.1.0** · Язык: **Rust** · Интерфейс: **egui/eframe** · Платформы: **Linux, Windows**
+> Версия: **0.2.0** · Язык: **Rust** · Интерфейс: **egui/eframe** · Платформы: **Linux, Windows**
+
+**[⬇ Скачать последнюю версию](https://github.com/the-void-fox/VoidConnect/releases/latest)** —
+AppImage и обычный бинарник для Linux, `.exe` для Windows. Установка не нужна.
+
+![Общий чат](docs/screenshots/chat.png)
 
 ---
 
@@ -13,7 +18,8 @@
 
 - [Что это такое](#что-это-такое)
 - [Интерфейс](#интерфейс)
-- [Установка и запуск](#установка-и-запуск)
+- [Скачать и запустить](#скачать-и-запустить)
+- [Сборка из исходников](#сборка-из-исходников)
 - [Быстрый старт: одна Wi-Fi / один роутер](#быстрый-старт-одна-wi-fi--один-роутер)
 - [🥿 Гайд для тапочек: своя сеть через Hamachi](#-гайд-для-тапочек-своя-сеть-через-hamachi)
 - [🥿 Гайд для тапочек: своя сеть через Radmin VPN](#-гайд-для-тапочек-своя-сеть-через-radmin-vpn)
@@ -68,9 +74,48 @@ Void Connect объединяет несколько компьютеров в *
 Внизу — строка статуса: режим сети (Local / LAN), число узлов, ваш адрес и
 предупреждение, если входящие порты закрыты.
 
+| Личные сообщения (E2E) | Граф сети |
+|---|---|
+| ![Личные сообщения](docs/screenshots/dm.png) | ![Граф сети](docs/screenshots/graph.png) |
+
+| Хранилище |
+|---|
+| ![Хранилище](docs/screenshots/storage.png) |
+
+Интерфейс — тёмная монохромная тема «Void» (белый акцент, как у логотипа);
+масштаб меняется на ходу: **Ctrl +** / **Ctrl −**.
+
 ---
 
-## Установка и запуск
+## Скачать и запустить
+
+Готовые сборки — на странице **[Releases](https://github.com/the-void-fox/VoidConnect/releases/latest)**:
+
+| Файл | Для чего |
+|---|---|
+| `void-connect-<версия>-x86_64.AppImage` | Linux, один файл со значком: `chmod +x` и запустить |
+| `void-connect-<версия>-linux-x86_64` | Linux, обычный бинарник: `chmod +x` и запустить |
+| `void-connect-<версия>-windows-x86_64.exe` | Windows 10/11, запускается сразу |
+| `SHA256SUMS.txt` | контрольные суммы файлов |
+
+```bash
+chmod +x void-connect-*-x86_64.AppImage
+./void-connect-*-x86_64.AppImage
+```
+
+- **Linux:** нужна glibc 2.35 или новее (Ubuntu 22.04+, Debian 12+, Fedora 36+,
+  Arch). Если AppImage жалуется на FUSE — установите `libfuse2` или запустите
+  с ключом `--appimage-extract-and-run`. На NixOS: `appimage-run`.
+- **Windows:** файл не подписан, поэтому SmartScreen может показать «Windows
+  защитила ваш компьютер» — нажмите «Подробнее» → «Выполнить в любом случае».
+  При первом запуске разрешите доступ в сеть в окне брандмауэра.
+
+Сборки делает GitHub Actions из исходников этого репозитория
+([`.github/workflows/release.yml`](.github/workflows/release.yml)).
+
+---
+
+## Сборка из исходников
 
 Проект собирается через **Nix** (всё окружение описано в [`shell.nix`](shell.nix)),
 но подойдёт и обычный toolchain Rust + системные библиотеки.
@@ -91,12 +136,15 @@ RUST_LOG=info cargo run -p void-ui
 cargo run -p void-ui -- Vasya 7700
 ```
 
-> Без Nix понадобятся: Rust (stable), а также `libX11/libxcb`, `wayland`,
-> `libGL`, `gtk3`, `pkg-config` — полный список см. в [`shell.nix`](shell.nix).
+> Без Nix понадобятся Rust (stable) и `pkg-config`; на Ubuntu/Debian —
+> `sudo apt install libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev`
+> (то же ставит CI, см. [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
-### Вариант Б. Готовый бинарник
+### Вариант Б. Свои сборки через Makefile
 
-В репозитории есть [`Makefile`](Makefile) для сборки переносимых артефактов:
+Готовые файлы проще взять в [Releases](#скачать-и-запустить). Собрать самому
+можно через [`Makefile`](Makefile) (бинарник, собранный на NixOS, запустится
+только на NixOS — переносимые сборки делает CI на Ubuntu):
 
 ```bash
 nix-shell
@@ -559,3 +607,16 @@ ui/            Графический интерфейс (egui/eframe) → би�
 - [x] Графический интерфейс (egui) + сборка под Linux/Windows
 - [x] Полноценное распределённое кэширование чужих сайтов (докачка по запросу + зеркалирование)
 - [x] NAT-traversal: UPnP для всех узлов + публикация внешнего адреса через bootstrap (relay как fallback)
+- [x] Сеть доверия: поручительства, приветствия, лимиты по доверию
+- [x] Граф сети с картой соединений
+- [x] Тема «Void», релизы через GitHub Actions
+- [ ] Сайты переживают перезапуск узла (сейчас реестр сайтов в памяти)
+
+---
+
+## Сторонние ресурсы
+
+- Шрифт [Inter](https://rsms.me/inter/) — SIL Open Font License 1.1
+  ([`ui/src/assets/fonts/Inter-LICENSE.txt`](ui/src/assets/fonts/Inter-LICENSE.txt)).
+- [Fira Code](https://github.com/tonsky/FiraCode) с иконками
+  [Nerd Fonts](https://www.nerdfonts.com/) — SIL OFL 1.1 / MIT.

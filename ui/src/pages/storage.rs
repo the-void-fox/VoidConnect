@@ -76,6 +76,8 @@ pub struct StoragePage {
     pub storage_files: Option<Arc<Mutex<Vec<StorageFileInfo>>>>,
     /// Поле ввода пути к публикуемому файлу.
     pub publish_path: String,
+    /// Почему последняя публикация не ушла (путь не найден и т. п.).
+    publish_error: Option<String>,
     /// file_id файлов, для которых мы запросили скачивание (пока не завершено).
     pub downloading: HashSet<String>,
     /// Папка скачанных файлов (для действия «Открыть»).
@@ -238,6 +240,18 @@ impl StoragePage {
     fn publish_current(&mut self) {
         let path = self.publish_path.trim().to_string();
         if path.is_empty() { return; }
+        // Проверяем здесь: ошибка backend дошла бы только до лога. Путь в поле
+        // оставляем — его можно поправить.
+        let p = std::path::Path::new(&path);
+        if !p.is_file() {
+            self.publish_error = Some(if p.is_dir() {
+                format!("Это папка, а не файл: {path}. Папку со страницами можно опубликовать как сайт.")
+            } else {
+                format!("Файл не найден: {path}")
+            });
+            return;
+        }
+        self.publish_error = None;
         if let Some(tx) = &self.publish_tx {
             let _ = tx.send(PathBuf::from(path));
         }
@@ -354,11 +368,14 @@ impl StoragePage {
                 do_publish = true;
             }
         });
-        if crate::trust_ui::is_newcomer(&self.my_vouchers) {
-            crate::trust_ui::newcomer_hint(ui, crate::pages::sites::PUBLISH_LIMIT_HINT);
-        }
         if do_publish {
             self.publish_current();
+        }
+        if let Some(err) = &self.publish_error {
+            crate::theme::notice(ui, crate::theme::ERR, "\u{F0026}", err);
+        }
+        if crate::trust_ui::is_newcomer(&self.my_vouchers) {
+            crate::trust_ui::newcomer_hint(ui, crate::pages::sites::PUBLISH_LIMIT_HINT);
         }
 
         ui.add_space(8.0);
@@ -372,7 +389,19 @@ impl StoragePage {
         let search_lower = self.search.trim().to_lowercase();
         let groups = self.build_groups(&search_lower);
 
-        let avail_h = ui.available_height() - 40.0;
+        // Нижняя строка закреплена внизу; таблицу ограничиваем до неё сами
+        // (виджеты сверху-вниз панель внизу не учитывают).
+        let footer = egui::TopBottomPanel::bottom("storage_footer")
+            .frame(Frame::none())
+            .show_separator_line(false)
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                self.footer(ui);
+            });
+        let avail_h = (footer.response.rect.min.y - ui.cursor().min.y - 4.0).max(0.0);
         let mut action: Option<(usize, RowAction)> = None;
 
         if groups.is_empty() {
@@ -399,7 +428,7 @@ impl StoragePage {
                             icon, g.name, g.indices.len(), human_size(g.total_size),
                         );
                         let title_rt = if g.is_mine {
-                            RichText::new(title).strong().color(egui::Color32::from_rgb(110, 175, 235))
+                            RichText::new(title).strong().color(crate::theme::TEXT_STRONG)
                         } else {
                             RichText::new(title).strong()
                         };
@@ -407,18 +436,24 @@ impl StoragePage {
                             .id_source(format!("owner_folder_{}", g.key))
                             .default_open(g.is_mine || !search_lower.is_empty())
                             .show(ui, |ui| {
+                                // В узком окне прячем «Чанки» и «Сиды» (прогресс виден в статусе).
                                 let inner_w = ui.available_width();
-                                let col_name_w =
-                                    (inner_w - fixed_width - total_spacing - 24.0).max(120.0);
+                                let wide = inner_w >= fixed_width + total_spacing + 24.0 + 160.0;
+                                let (fixed, gaps) = if wide {
+                                    (fixed_width, total_spacing)
+                                } else {
+                                    (fixed_width - COL_CHUNKS - COL_SEEDS, total_spacing - 2.0 * spacing_x)
+                                };
+                                let col_name_w = (inner_w - fixed - gaps - 24.0).max(100.0);
                                 Frame::none()
                                     .inner_margin(egui::Margin::symmetric(6.0, 4.0))
                                     .fill(ui.visuals().widgets.noninteractive.bg_fill)
-                                    .show(ui, |ui| { Self::table_header(ui, col_name_w); });
+                                    .show(ui, |ui| { Self::table_header(ui, col_name_w, wide); });
                                 ui.add_space(2.0);
                                 for (row_i, &idx) in g.indices.iter().enumerate() {
                                     let file = &self.files[idx];
                                     let frame_fill = if row_i % 2 == 0 {
-                                        ui.visuals().extreme_bg_color
+                                        ui.visuals().faint_bg_color
                                     } else {
                                         egui::Color32::TRANSPARENT
                                     };
@@ -427,7 +462,7 @@ impl StoragePage {
                                         .fill(frame_fill)
                                         .show(ui, |ui| {
                                             ui.set_min_height(ROW_H);
-                                            Self::table_row(ui, idx, file, &mut action, col_name_w);
+                                            Self::table_row(ui, idx, file, &mut action, col_name_w, wide);
                                         });
                                 }
                             });
@@ -630,10 +665,10 @@ impl StoragePage {
             }
         }
 
-        // === Статус-строка ===
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
+    }
+
+    /// Нижняя строка: сколько файлов, раздаётся, загружается, ждёт.
+    fn footer(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let total = self.files.len();
             let seeding = self.files.iter().filter(|f| f.seeding_by_me).count();
@@ -658,7 +693,7 @@ impl StoragePage {
         });
     }
 
-    fn table_header(ui: &mut egui::Ui, col_name_w: f32) {
+    fn table_header(ui: &mut egui::Ui, col_name_w: f32, wide: bool) {
         ui.horizontal(|ui| {
             // Иконка
             ui.allocate_ui(egui::vec2(COL_ICON, HEADER_H), |ui| {
@@ -681,20 +716,22 @@ impl StoragePage {
                     ui.add(Label::new(RichText::new("Размер").strong().size(12.0)).wrap(false));
                 });
             });
-            // Чанки
-            ui.allocate_ui(egui::vec2(COL_CHUNKS, HEADER_H), |ui| {
-                ui.set_width(COL_CHUNKS);
-                ui.centered_and_justified(|ui| {
-                    ui.add(Label::new(RichText::new("Чанки").strong().size(12.0)).wrap(false));
+            if wide {
+                // Чанки
+                ui.allocate_ui(egui::vec2(COL_CHUNKS, HEADER_H), |ui| {
+                    ui.set_width(COL_CHUNKS);
+                    ui.centered_and_justified(|ui| {
+                        ui.add(Label::new(RichText::new("Чанки").strong().size(12.0)).wrap(false));
+                    });
                 });
-            });
-            // Сиды
-            ui.allocate_ui(egui::vec2(COL_SEEDS, HEADER_H), |ui| {
-                ui.set_width(COL_SEEDS);
-                ui.centered_and_justified(|ui| {
-                    ui.add(Label::new(RichText::new("Сиды").strong().size(12.0)).wrap(false));
+                // Сиды
+                ui.allocate_ui(egui::vec2(COL_SEEDS, HEADER_H), |ui| {
+                    ui.set_width(COL_SEEDS);
+                    ui.centered_and_justified(|ui| {
+                        ui.add(Label::new(RichText::new("Сиды").strong().size(12.0)).wrap(false));
+                    });
                 });
-            });
+            }
             // Статус
             ui.allocate_ui(egui::vec2(COL_STATUS, HEADER_H), |ui| {
                 ui.set_width(COL_STATUS);
@@ -722,6 +759,7 @@ fn table_row(
         file: &FileEntry,
         action: &mut Option<(usize, RowAction)>,
         col_name_w: f32,
+        wide: bool,
     ) {
         let icon = file_icon(&file.name);
 
@@ -764,27 +802,29 @@ fn table_row(
                     ui.label(RichText::new(&file.size).size(12.0).color(ui.visuals().weak_text_color()));
                 });
             });
-            // Чанки + прогресс
-            ui.allocate_ui(egui::vec2(COL_CHUNKS, ROW_H), |ui| {
-                ui.set_width(COL_CHUNKS);
-                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT).with_cross_justify(true), |ui| {
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(format!("{}/{}", file.chunks, file.chunks_total)).size(11.0).color(ui.visuals().weak_text_color()));
-                    let progress = if file.chunks_total > 0 {
-                        file.chunks as f32 / file.chunks_total as f32
-                    } else {
-                        0.0
-                    };
-                    ui.add(ProgressBar::new(progress).desired_width(COL_CHUNKS - 8.0).desired_height(3.0));
+            // Чанки + прогресс, сиды — только в широком окне
+            if wide {
+                ui.allocate_ui(egui::vec2(COL_CHUNKS, ROW_H), |ui| {
+                    ui.set_width(COL_CHUNKS);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT).with_cross_justify(true), |ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(format!("{}/{}", file.chunks, file.chunks_total)).size(11.0).color(ui.visuals().weak_text_color()));
+                        let progress = if file.chunks_total > 0 {
+                            file.chunks as f32 / file.chunks_total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(ProgressBar::new(progress).desired_width(COL_CHUNKS - 8.0).desired_height(3.0));
+                    });
                 });
-            });
-            // Сиды
-            ui.allocate_ui(egui::vec2(COL_SEEDS, ROW_H), |ui| {
-                ui.set_width(COL_SEEDS);
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new(format!("{}", file.seeders)).size(12.0).color(ui.visuals().weak_text_color()));
+                // Сиды
+                ui.allocate_ui(egui::vec2(COL_SEEDS, ROW_H), |ui| {
+                    ui.set_width(COL_SEEDS);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new(format!("{}", file.seeders)).size(12.0).color(ui.visuals().weak_text_color()));
+                    });
                 });
-            });
+            }
             // Статус
             ui.allocate_ui(egui::vec2(COL_STATUS, ROW_H), |ui| {
                 ui.set_width(COL_STATUS);
