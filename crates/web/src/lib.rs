@@ -222,6 +222,39 @@ mod tests {
         assert!(missing.contains("404"), "ожидался 404, получено: {missing}");
     }
 
+    /// У каждого сайта свой адрес `<имя>.localhost`: корень — его index, ссылки
+    /// от корня — его файлы. Чужой Host (DNS rebinding) получает отказ.
+    #[tokio::test]
+    async fn serve_by_host_name() {
+        let (_sdir, mgr) = storage(3).await;
+        let site_dir = tempfile::tempdir().unwrap();
+        write_sample_site(site_dir.path());
+        let registry = SiteRegistry::new();
+        registry.register(publish_site(&mgr, site_dir.path(), "blog", &kp(3)).await.unwrap()).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = router(registry, mgr, peers);
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let port = addr.port();
+        let index = http_get_host(addr, "/", &format!("blog.localhost:{port}")).await;
+        assert!(index.contains("<h1>Hello Void</h1>"), "корень — index сайта: {index}");
+        let css = http_get_host(addr, "/css/style.css", &format!("blog.localhost:{port}")).await;
+        assert!(css.contains("color:red"), "путь от корня — файл сайта: {css}");
+        let zone = http_get_host(addr, "/", "blog.void.localhost").await;
+        assert!(zone.contains("<h1>Hello Void</h1>"), "и с зоной .void: {zone}");
+        let unknown = http_get_host(addr, "/", "nope.localhost").await;
+        assert!(unknown.contains("404"), "неизвестный сайт — 404: {unknown}");
+
+        let rebinding = http_get_host(addr, "/blog", &format!("evil.example:{port}")).await;
+        assert!(rebinding.contains("403"), "чужой Host — отказ: {rebinding}");
+        let fallback = http_get_host(addr, "/blog/", &format!("127.0.0.1:{port}")).await;
+        assert!(fallback.contains("<h1>Hello Void</h1>"), "запасной адрес работает: {fallback}");
+    }
+
     /// Фаза 2: сквозная раздача ЧУЖОГО сайта. Узел A публикует сайт и поднимает
     /// chunk-сервер. Узел B знает сайт и манифесты файлов (как по сети), но
     /// чанков локально нет. HTTP-сервер B по запросу докачивает файлы у A и
@@ -301,10 +334,13 @@ mod tests {
 
     /// Минимальный HTTP/1.1 GET через сырой TCP (без сторонних http-клиентов).
     async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        http_get_host(addr, path, "localhost").await
+    }
+
+    async fn http_get_host(addr: std::net::SocketAddr, path: &str, host: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            path
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();

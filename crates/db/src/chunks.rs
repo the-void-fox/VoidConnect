@@ -209,6 +209,19 @@ pub async fn get_chunk_owners(pool: &DbPool, chunk_hash: &str) -> Result<Vec<Str
     Ok(rows.into_iter().map(|r| r.peer_key).collect())
 }
 
+/// Все записи «чанк → владелец» (для загрузки индекса при запуске). Рантайм-
+/// запрос (без `query!`-макроса, чтобы не перегенерировать `.sqlx`-кэш).
+pub async fn get_all_chunk_owners(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT chunk_hash, peer_key FROM chunk_owners")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("chunk_hash"), r.get::<String, _>("peer_key")))
+        .collect())
+}
+
 /// Удаляет узел из владельцев всех чанков (например при бане или дисконнекте).
 pub async fn remove_peer_chunks(pool: &DbPool, peer_key: &str) -> Result<()> {
     sqlx::query!(

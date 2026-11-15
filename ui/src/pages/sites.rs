@@ -191,7 +191,7 @@ impl SitesPage {
                                     ui.label(
                                         RichText::new("мой")
                                             .small()
-                                            .color(egui::Color32::from_rgb(80, 180, 100)),
+                                            .color(crate::theme::OK),
                                     );
                                 }
                             });
@@ -204,6 +204,13 @@ impl SitesPage {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                             );
+                            ui.label(
+                                RichText::new(&site.url)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(crate::theme::TEXT_FAINT),
+                            )
+                            .on_hover_text("Адрес сайта в браузере (только на этом компьютере)");
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -215,7 +222,7 @@ impl SitesPage {
                                 && ui
                                     .add(Button::new(
                                         RichText::new("\u{F05E8}  Удалить")
-                                            .color(egui::Color32::from_rgb(220, 80, 60)),
+                                            .color(crate::theme::ERR),
                                     ))
                                     .on_hover_text(
                                         "Удалить сайт: освободить домен .void и стереть файлы. \
@@ -232,7 +239,7 @@ impl SitesPage {
                                     if ui
                                         .add(Button::new(
                                             RichText::new("\u{F05E0}  В кэше")
-                                                .color(egui::Color32::from_rgb(80, 180, 100)),
+                                                .color(crate::theme::OK),
                                         ))
                                         .on_hover_text("Перестать кэшировать (удалит локальную копию)")
                                         .clicked()
@@ -283,7 +290,7 @@ impl SitesPage {
                                 ui.label(
                                     RichText::new("мой")
                                         .small()
-                                        .color(egui::Color32::from_rgb(80, 180, 100)),
+                                        .color(crate::theme::OK),
                                 );
                             }
                             let detail = match &d.ip {

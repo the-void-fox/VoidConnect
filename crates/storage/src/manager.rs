@@ -77,9 +77,23 @@ impl StorageManager {
             .collect();
         index.bulk_load(entries).await;
 
+        // И владельцев чужих чанков, известных с прошлого запуска: без этого после
+        // перезапуска чужие файлы и сайты не докачивались, пока владелец не
+        // объявит файл заново. Владельцев не в сети отсеивает список активных
+        // пиров при скачивании.
+        let remote: Vec<(String, NodeId)> = db_chunks::get_all_chunk_owners(&pool)
+            .await?
+            .into_iter()
+            .filter(|(_, key)| key != my_id.as_str())
+            .map(|(hash, key)| (hash, NodeId(key)))
+            .collect();
+        let remote_count = remote.len();
+        index.bulk_load(remote).await;
+
         info!(
-            "StorageManager ready: {} local chunks loaded",
-            local_chunks.len()
+            "StorageManager ready: {} local chunks, {} remote owner records loaded",
+            local_chunks.len(),
+            remote_count,
         );
 
         Ok(StorageManager {
@@ -188,6 +202,18 @@ impl StorageManager {
 
     /// Строит манифест файла из локальной БД — для рассылки объявления другим
     /// узлам. Возвращает `None`, если файл неизвестен.
+    /// Файлы, которые у нас есть целиком (раздаём): после перезапуска их снова
+    /// объявляют сети, чтобы соседи узнали, что у нас можно докачать.
+    pub async fn seeded_files(&self) -> Result<Vec<String>, StorageError> {
+        let mut out = Vec::new();
+        for file in db_chunks::list_files(&self.pool).await? {
+            if db_chunks::local_completion(&self.pool, &file.file_id).await? >= 1.0 {
+                out.push(file.file_id);
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn file_manifest(&self, file_id: &str) -> Result<Option<FileManifest>, StorageError> {
         let Some(file) = db_chunks::get_file(&self.pool, file_id).await? else {
             return Ok(None);
@@ -691,6 +717,30 @@ mod tests {
         let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
         let mgr = StorageManager::new(pool.clone(), store, kp(seed)).await.unwrap();
         (dir, pool, mgr)
+    }
+
+    /// Владельцы чужих чанков переживают перезапуск: индекс загружается из БД,
+    /// иначе файл нельзя докачать, пока владелец не объявит его заново.
+    #[tokio::test]
+    async fn remote_owners_survive_restart() {
+        let (_seed_dir, _seed_pool, seeder) = make_node(1).await;
+        let path = _seed_dir.path().join("data.bin");
+        std::fs::write(&path, sample_content()).unwrap();
+        let file_id = seeder.publish_file(&path).await.unwrap();
+        let manifest = seeder.file_manifest(&file_id).await.unwrap().unwrap();
+        assert_eq!(seeder.seeded_files().await.unwrap(), vec![file_id.clone()]);
+
+        let (dir, pool, leecher) = make_node(2).await;
+        leecher.handle_manifest(&manifest).await.unwrap();
+        let hash = manifest.chunks[0].hash.clone();
+        assert_eq!(leecher.index.get_owners(&hash).await, vec![node(1)]);
+        assert!(leecher.seeded_files().await.unwrap().is_empty(), "чанков у нас нет — не раздаём");
+        drop(leecher);
+
+        // «Перезапуск»: новый менеджер на той же БД.
+        let store = ChunkStore::new(dir.path().join("chunks")).await.unwrap();
+        let restarted = StorageManager::new(pool, store, kp(2)).await.unwrap();
+        assert_eq!(restarted.index.get_owners(&hash).await, vec![node(1)]);
     }
 
     /// ~600 КБ → 3 чанка (256K + 256K + остаток).

@@ -1699,7 +1699,8 @@ async fn backend_main(
 
 /// Запускает фоновые задачи сайтов: локальный HTTP-сервер раздачи (с докачкой
 /// файлов чужих сайтов по запросу), публикацию каталогов как сайтов с рассылкой
-/// по сети и обнаружение чужих сайтов через relay чата. Реестр in-memory.
+/// по сети и обнаружение чужих сайтов через relay чата. Свои и зеркалируемые
+/// сайты сохраняются на диск (`sites.json`) и восстанавливаются при запуске.
 #[allow(clippy::too_many_arguments)]
 fn start_site_tasks(
     manager:    StorageManager,
@@ -1713,11 +1714,15 @@ fn start_site_tasks(
     sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
     mut mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
 ) {
-    let registry = SiteRegistry::new();
     let my_key = my_id.as_str().to_string();
 
     // Набор зеркалируемых (кэшируемых нами) сайтов — переживает перезапуск.
-    let mirrored: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(load_mirrored_sites()));
+    let mirrored_set = load_mirrored_sites();
+    // Свои и зеркалируемые сайты с прошлого запуска — сразу в реестр, ДО запуска
+    // задач: иначе первый же refresh_sites сохранил бы пустой реестр поверх файла.
+    let restored = sites_to_keep(load_saved_sites(&saved_sites_path()), &my_key, &mirrored_set);
+    let registry = SiteRegistry::with_sites(restored.clone());
+    let mirrored: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(mirrored_set));
     // Клоны для задачи зеркалирования (создаём до того, как оригиналы уедут в
     // другие задачи ниже).
     let mirror_reg   = registry.clone();
@@ -1807,11 +1812,22 @@ fn start_site_tasks(
     let pub_chat = chat.clone();
     let pub_mirror = Arc::clone(&mirrored);
     tokio::spawn(async move {
+        // Восстановленные с диска сайты — снова в сеть (чат раздаёт известные
+        // сайты и новым соседям). Без этого свой сайт после перезапуска
+        // пропадал, а имя .void указывало в пустоту.
+        if !restored.is_empty() {
+            tracing::info!("Восстановлено сайтов с диска: {}", restored.len());
+            for manifest in restored {
+                pub_chat.announce_site(manifest).await;
+            }
+            refresh_sites(&registry, &my_key, http_port, &pub_mirror, &sites_out).await;
+        }
+
         while let Some((dir, name)) = publish_site_rx.recv().await {
             match publish_site(&manager, &dir, &name, &pub_kp).await {
                 Ok(manifest) => {
-                    tracing::info!("Опубликован сайт '{}' ({} файлов) → http://127.0.0.1:{}/{}",
-                        manifest.name, manifest.entries.len(), http_port, manifest.name);
+                    tracing::info!("Опубликован сайт '{}' ({} файлов) → http://{}.localhost:{}/",
+                        manifest.name, manifest.entries.len(), manifest.name, http_port);
                     // Объявляем каждый файл сайта (мульти-сидинг + докачка у пиров).
                     for entry in &manifest.entries {
                         if let Ok(Some(fm)) = manager.file_manifest(&entry.file_id).await {
@@ -1819,6 +1835,17 @@ fn start_site_tasks(
                         }
                     }
                     let site_name = manifest.name.clone();
+                    // Обновление своего сайта: файлы прошлой версии, которых нет в
+                    // новой, больше никому не нужны — стираем, чтобы не копились.
+                    if let Some(old) = registry.get(&site_name).await {
+                        if old.owner.as_str() == my_key {
+                            for entry in &old.entries {
+                                if !manifest.entries.iter().any(|e| e.file_id == entry.file_id) {
+                                    let _ = manager.delete_file(&entry.file_id).await;
+                                }
+                            }
+                        }
+                    }
                     registry.register(manifest.clone()).await;
                     // Объявляем сайт сети.
                     pub_chat.announce_site(manifest).await;
@@ -1963,7 +1990,45 @@ fn save_mirrored_sites(set: &HashSet<String>) {
     }
 }
 
-/// Обновляет снимок списка сайтов для GUI из реестра.
+/// Путь к файлу с манифестами своих и зеркалируемых сайтов.
+fn saved_sites_path() -> PathBuf {
+    crate::profile_store::profile_dir().join("sites.json")
+}
+
+/// Сохранённые манифесты сайтов (пусто, если файла нет или он испорчен).
+fn load_saved_sites(path: &std::path::Path) -> Vec<void_core::site::SiteManifest> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Сохраняет манифесты атомарно (временный файл + rename): обрыв посреди
+/// записи не оставит полупустой файл.
+fn save_sites(path: &std::path::Path, sites: &[void_core::site::SiteManifest]) {
+    let Ok(json) = serde_json::to_string_pretty(sites) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Какие сайты хранить на диске: свои и те, что мы зеркалируем.
+fn sites_to_keep(
+    all: Vec<void_core::site::SiteManifest>,
+    my_key: &str,
+    mirrored: &HashSet<String>,
+) -> Vec<void_core::site::SiteManifest> {
+    let mut keep: Vec<_> = all
+        .into_iter()
+        .filter(|m| m.owner.as_str() == my_key || mirrored.contains(&m.name))
+        .collect();
+    keep.sort_by(|a, b| a.name.cmp(&b.name));
+    keep
+}
+
+/// Обновляет снимок списка сайтов для GUI из реестра и сохраняет свои и
+/// зеркалируемые сайты на диск (вызывается после каждого изменения реестра).
 async fn refresh_sites(
     registry: &SiteRegistry,
     my_key: &str,
@@ -1972,8 +2037,11 @@ async fn refresh_sites(
     out: &Arc<Mutex<Vec<SiteInfo>>>,
 ) {
     let mset = { mirrored.lock().unwrap().clone() };
-    let infos: Vec<SiteInfo> = registry.list().await.into_iter().map(|m| SiteInfo {
-        url:         format!("http://127.0.0.1:{}/{}", http_port, m.name),
+    let all = registry.list().await;
+    save_sites(&saved_sites_path(), &sites_to_keep(all.clone(), my_key, &mset));
+    let infos: Vec<SiteInfo> = all.into_iter().map(|m| SiteInfo {
+        // Свой поддомен localhost — свой origin у каждого сайта (см. void_web::server).
+        url:         format!("http://{}.localhost:{}/", m.name, http_port),
         dns_name:    m.dns_name(),
         file_count:  m.entries.len(),
         size_bytes:  m.total_size(),
@@ -2054,6 +2122,33 @@ fn start_storage_tasks(
                 }
                 Err(e) => tracing::warn!("Публикация не удалась ({}): {}", path.display(), e),
             }
+        }
+    });
+
+    // После перезапуска снова объявляем файлы, которые раздаём целиком. Чат
+    // запоминает манифесты и передаёт их новым соседям: так узнают, что у нас
+    // можно докачать (раньше до новой публикации нас никто не находил).
+    let re_mgr = manager.clone();
+    let re_chat = chat.clone();
+    let re_removed = Arc::clone(&removed_files);
+    tokio::spawn(async move {
+        match re_mgr.seeded_files().await {
+            Ok(files) => {
+                let mut announced = 0;
+                for fid in files {
+                    if re_removed.lock().unwrap().contains(&fid) {
+                        continue; // удалён голосованием — не раздаём
+                    }
+                    if let Ok(Some(fm)) = re_mgr.file_manifest(&fid).await {
+                        re_chat.announce_file(fm).await;
+                        announced += 1;
+                    }
+                }
+                if announced > 0 {
+                    tracing::info!("Снова объявлено раздаваемых файлов: {}", announced);
+                }
+            }
+            Err(e) => tracing::warn!("Не удалось перечислить раздаваемые файлы: {}", e),
         }
     });
 
@@ -2245,8 +2340,17 @@ fn start_storage_tasks(
                     (m.file_id, live_count)
                 })
                 .collect();
+            // Файлы сайтов показываем на странице «Сайты», а не россыпью
+            // index.html / style.css в хранилище.
+            let site_files: HashSet<String> = snap_chat.get_sites().await
+                .into_iter()
+                .flat_map(|m| m.entries.into_iter().map(|e| e.file_id))
+                .collect();
             let mut out = Vec::with_capacity(files.len());
             for f in files {
+                if site_files.contains(&f.file_id) {
+                    continue;
+                }
                 let progress = manager.download_progress(&f.file_id).await.unwrap_or(0.0);
                 let is_mine  = f.owner_key == my_key;
                 let seeders  = seeders.get(&f.file_id).copied()
@@ -2683,5 +2787,45 @@ mod tests {
         assert_eq!(next_vouch_kind(Some(&rec(Greeter, false)), Personal, true), Some(Greeter), "отзыв приветствия");
         assert_eq!(next_vouch_kind(Some(&rec(Personal, true)), Personal, true), None, "отзывать нечего");
         assert_eq!(next_vouch_kind(Some(&rec(Personal, true)), Greeter, false), Some(Greeter), "после отзыва — можно");
+    }
+
+    fn site(name: &str, owner: u32, created_at: i64) -> void_core::site::SiteManifest {
+        void_core::site::SiteManifest {
+            site_id: format!("{name}-{created_at}"),
+            name: name.into(),
+            owner: n(owner),
+            entries: vec![void_core::site::SiteEntry {
+                path: "index.html".into(), file_id: "f".repeat(64), size_bytes: 10,
+            }],
+            created_at,
+            signature: Some("sig".into()),
+        }
+    }
+
+    #[test]
+    fn saved_sites_keep_only_mine_and_mirrored() {
+        let me = n(1);
+        let mirrored: HashSet<String> = ["cached".to_string()].into();
+        let all = vec![site("mine", 1, 5), site("cached", 2, 6), site("foreign", 3, 7)];
+        let keep = sites_to_keep(all, me.as_str(), &mirrored);
+        let names: Vec<&str> = keep.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["cached", "mine"], "чужие незеркалируемые не храним");
+    }
+
+    #[test]
+    fn saved_sites_roundtrip_and_survive_garbage() {
+        let dir = std::env::temp_dir().join(format!("void-sites-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sites.json");
+
+        assert!(load_saved_sites(&path).is_empty(), "нет файла — пустой список");
+        let sites = vec![site("blog", 1, 10), site("docs", 1, 11)];
+        save_sites(&path, &sites);
+        assert_eq!(load_saved_sites(&path), sites, "подпись и поля сохраняются как есть");
+        assert!(!path.with_extension("json.tmp").exists(), "временный файл переименован");
+
+        std::fs::write(&path, "{не json").unwrap();
+        assert!(load_saved_sites(&path).is_empty(), "испорченный файл не роняет запуск");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

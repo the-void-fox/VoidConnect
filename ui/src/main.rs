@@ -27,7 +27,8 @@ fn main() -> eframe::Result<()> {
                 .add_directive("warn".parse().unwrap())
                 .add_directive("void_discovery=info".parse().unwrap())
                 .add_directive("void_chat=info".parse().unwrap())
-                .add_directive("void_ui=info".parse().unwrap()),
+                .add_directive("void_connect=info".parse().unwrap())
+                .add_directive("void_storage=info".parse().unwrap()),
         )
         .init();
 
