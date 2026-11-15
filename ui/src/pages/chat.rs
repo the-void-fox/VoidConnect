@@ -312,6 +312,7 @@ impl ChatPage {
                     .id(egui::Id::new("chat_peer_profile_popup"))
                     .collapsible(false)
                     .resizable(false)
+                    .vscroll(true) // профиль выше окна приложения — иначе кнопки внизу недоступны
                     .default_width(320.0)
                     .show(ui.ctx(), |ui| {
                         let rep = self.peer_score(&sel_id);

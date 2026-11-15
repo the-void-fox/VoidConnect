@@ -222,12 +222,17 @@ pub enum TrustCmd {
     Unblock(NodeId),
 }
 
+/// Карта соединений сети: узел → его соседи (см. `void_chat::topology`).
+pub type TopologyMap = HashMap<NodeId, Vec<NodeId>>;
+
 /// Подробности сети доверия для GUI: кого я поприветствовал и что мой узел
 /// видел за узлами (подсказка «когда освоится по поведению»).
 #[derive(Default, Clone)]
 pub struct TrustDetails {
     pub greeted: HashSet<NodeId>,
     pub activity: HashMap<NodeId, void_trust::store::Activity>,
+    /// Действующие поручительства (кто → за кого, вид) — для графа сети.
+    pub vouches: Vec<(NodeId, NodeId, void_trust::VouchKind)>,
 }
 
 /// Сеть доверия: подпись своих поручительств, приём чужих (пересылаем дальше
@@ -409,7 +414,11 @@ impl TrustService {
             .map(|v| v.subject.clone())
             .collect();
         let activity = void_trust::store::activity(&self.pool).await.unwrap_or_default();
-        *self.details.lock().unwrap() = TrustDetails { greeted, activity };
+        let active = vouches.iter()
+            .filter(|v| !v.revoked)
+            .map(|v| (v.voucher.clone(), v.subject.clone(), v.kind))
+            .collect();
+        *self.details.lock().unwrap() = TrustDetails { greeted, activity, vouches: active };
         let mut blocked: HashSet<NodeId> = self.blocklist.lock().unwrap().iter()
             .filter(|(_, until)| **until > now)
             .map(|(id, _)| id.clone())
@@ -684,6 +693,8 @@ pub struct BackendHandle {
     pub trust_details: Arc<Mutex<TrustDetails>>,
     /// Сколько живых связей у общего чата (0 — сообщения пока никуда не уходят).
     pub chat_links: Arc<AtomicUsize>,
+    /// Карта соединений сети: узел → его соседи (из рассылки списков соседей).
+    pub topology: Arc<Mutex<TopologyMap>>,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
     /// командами `TrustCmd::{Allow, Block, Unblock}`).
     pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
@@ -801,6 +812,8 @@ pub fn start_backend(
     let trust_details_bg = Arc::clone(&trust_details);
     let chat_links = Arc::new(AtomicUsize::new(0));
     let chat_links_bg = Arc::clone(&chat_links);
+    let topology: Arc<Mutex<TopologyMap>> = Arc::new(Mutex::new(HashMap::new()));
+    let topology_bg = Arc::clone(&topology);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -825,7 +838,7 @@ pub fn start_backend(
                 blocklist_bg, voted_channels_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg,
                 trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg, trust_details_bg,
-                chat_links_bg,
+                chat_links_bg, topology_bg,
             ).await;
         });
     });
@@ -879,6 +892,7 @@ pub fn start_backend(
         dm_access,
         trust_details,
         chat_links,
+        topology,
     }
 }
 
@@ -931,6 +945,7 @@ async fn backend_main(
     dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
     trust_details: Arc<Mutex<TrustDetails>>,
     chat_links: Arc<AtomicUsize>,
+    topology_out: Arc<Mutex<TopologyMap>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1424,6 +1439,7 @@ async fn backend_main(
     // Задача: периодически снимаем peer_list и профили для GUI, снимок
     // качества раздачи и жалоб.
     let snap_links = Arc::clone(&chat_links);
+    let snap_topology = Arc::clone(&topology_out);
     let pl       = peer_list.clone();
     let chat_p   = chat.clone();
     let rep_snap = reputation.clone();
@@ -1447,6 +1463,7 @@ async fn backend_main(
             let peers = pl.all().await;
             *peers_out.lock().unwrap() = peers.clone();
             snap_links.store(chat_p.link_count().await, Ordering::Relaxed);
+            *snap_topology.lock().unwrap() = chat_p.topology().await;
             let profiles = chat_p.get_profiles().await;
             {
                 let mut map = profiles_out.lock().unwrap();

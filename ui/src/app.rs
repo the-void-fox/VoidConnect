@@ -138,6 +138,7 @@ impl VoidApp {
         graph.reports = Some(std::sync::Arc::clone(&backend.reports));
         graph.blocklist = Some(std::sync::Arc::clone(&backend.blocklist));
         graph.trust = Some(trust);
+        graph.topology = Some(std::sync::Arc::clone(&backend.topology));
 
         // Инициализируем страницу личных сообщений
         let mut private = PrivatePage::default();

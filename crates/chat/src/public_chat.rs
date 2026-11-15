@@ -44,6 +44,7 @@ use void_network::rate_limit::RateLimiter;
 use void_network::conn_guard::ConnLimiter;
 use void_network::secure::{self, Channel, NoiseIdentity};
 
+use crate::topology::{LinkSet, Topology, MAX_NEIGHBORS, TOPOLOGY_TTL_MS};
 use crate::trust_limits::{AuthorTier, Kind, TierFn, TierLimits};
 
 /// Потолок размера одного пакета на проводе. Поднят до 16 МиБ, чтобы вмещать
@@ -90,6 +91,12 @@ const LINK_MAX_DROPS: u32 = 2000;
 const LIVE_WINDOW_SECS: i64 = 120;
 /// Интервал между пингами для обнаружения "тихой" потери соединения.
 const PING_INTERVAL_SECS: u64 = 15;
+/// Свой список соседей рассылаем раз в столько (иначе он устареет у других)…
+const LINKS_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// …и после изменения связей — с паузой, чтобы собрать пачку изменений.
+const LINKS_DEBOUNCE: Duration = Duration::from_secs(3);
+/// Список «из будущего» дальше этого не принимаем: он не устарел бы никогда.
+const LINKS_MAX_SKEW_MS: i64 = 5 * 60 * 1000;
 
 // ─── Протокол ────────────────────────────────────────────────────────────────
 
@@ -123,6 +130,9 @@ pub enum ChatPacket {
     /// пересылает сам: дальше его отправляет backend, если запись изменила его
     /// базу — иначе на каждой новой связи весь граф заново обходил бы сеть.
     Vouch { signed: SignedMessage },
+    /// Подписанный список соседей узла (карта соединений сети, см.
+    /// [`crate::topology`]).
+    Links { signed: SignedMessage },
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -262,6 +272,10 @@ struct PublicChatInner {
     /// Последние DNS-записи по (имя, подписант) — передаются новой связи, чтобы
     /// новичок узнал имена, даже не соединённый напрямую с их владельцами.
     dns_cache:   Mutex<HashMap<(String, String), (i64, SignedMessage)>>,
+    /// Карта соединений сети: списки соседей узлов (и наш собственный).
+    topology:    Mutex<Topology>,
+    /// Связи изменились — разослать наш список соседей.
+    links_changed: Notify,
 }
 
 impl PublicChat {
@@ -314,6 +328,8 @@ impl PublicChat {
                 seen_gossip:       Mutex::new(HashSet::new()),
                 seen_gossip_order: Mutex::new(VecDeque::with_capacity(GOSSIP_DEDUP_WINDOW)),
                 dns_cache:   Mutex::new(HashMap::new()),
+                topology:    Mutex::new(Topology::default()),
+                links_changed: Notify::new(),
             }),
         }
     }
@@ -824,6 +840,61 @@ impl PublicChat {
         self.forward(ChatPacket::Vouch { signed }, except).await;
     }
 
+    // ─── Карта соединений ─────────────────────────────────────────────────────
+
+    /// Свежая карта соединений: узел → его соседи (наш список — тоже здесь).
+    pub async fn topology(&self) -> HashMap<NodeId, Vec<NodeId>> {
+        self.inner.topology.lock().await.snapshot(Utc::now().timestamp_millis())
+    }
+
+    /// Рассылает наш список соседей и кладёт его в свою карту.
+    async fn announce_links(&self) {
+        let mut neighbors: Vec<NodeId> = self.inner.links.lock().await.keys().cloned().collect();
+        neighbors.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        neighbors.truncate(MAX_NEIGHBORS);
+        let me = self.inner.my_peer.id.clone();
+        let signed = {
+            let mut topo = self.inner.topology.lock().await;
+            let prev = topo.get(&me).map_or(0, |s| s.updated_at);
+            let set = LinkSet {
+                node_id: me,
+                neighbors,
+                updated_at: Utc::now().timestamp_millis().max(prev + 1),
+            };
+            let Some(signed) = set.sign(&self.inner.signing_kp) else { return };
+            topo.apply(set, signed.clone());
+            signed
+        };
+        self.first_seen_gossip(&signed).await;
+        self.forward(ChatPacket::Links { signed }, None).await;
+    }
+
+    /// Входящий список соседей: только более новый, не «из будущего», в
+    /// пределах лимита по доверию к узлу; изменившееся — дальше соседям.
+    async fn handle_links(&self, signed: SignedMessage, src: Option<&NodeId>) {
+        if !self.first_seen_gossip(&signed).await {
+            return;
+        }
+        let Some(set) = LinkSet::from_signed(&signed) else { return };
+        let now = Utc::now().timestamp_millis();
+        if set.node_id == self.inner.my_peer.id
+            || now - set.updated_at > TOPOLOGY_TTL_MS
+            || set.updated_at - now > LINKS_MAX_SKEW_MS
+        {
+            return; // свой список знаем сами; устаревший и «из будущего» — мимо
+        }
+        if self.inner.topology.lock().await.get(&set.node_id).is_some_and(|s| s.updated_at >= set.updated_at) {
+            return;
+        }
+        if src.is_some() && !self.admit(&set.node_id, Kind::Links) {
+            self.unsee_gossip(&signed).await;
+            return;
+        }
+        if self.inner.topology.lock().await.apply(set, signed.clone()) {
+            self.forward(ChatPacket::Links { signed }, src).await;
+        }
+    }
+
     /// Отправляет поручительства одному соседу (например, при новой связи).
     /// Через очередь связи с ожиданием места — граф может быть большим.
     pub async fn push_vouches(&self, peer: &NodeId, vouches: Vec<SignedMessage>) {
@@ -857,8 +928,25 @@ pub async fn start_public_chat(
     let c = chat.clone();
     tokio::spawn(async move { mesh_manager(c).await; });
 
+    let c = chat.clone();
+    tokio::spawn(async move { links_announcer(c).await; });
+
     info!("Public chat started on port {}", chat_port);
     Ok(ChatHandle { chat })
+}
+
+/// Рассылает наш список соседей: после изменения связей (с паузой, чтобы
+/// собрать пачку) и раз в [`LINKS_REFRESH`] — иначе он устареет у других.
+async fn links_announcer(chat: PublicChat) {
+    let mut refresh = tokio::time::interval(LINKS_REFRESH);
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {}
+            _ = chat.inner.links_changed.notified() => tokio::time::sleep(LINKS_DEBOUNCE).await,
+        }
+        chat.announce_links().await;
+        chat.inner.topology.lock().await.prune(Utc::now().timestamp_millis());
+    }
 }
 
 // ─── TCP-сервер (входящие связи) ─────────────────────────────────────────────
@@ -997,6 +1085,7 @@ async fn run_link(
         name, short(&peer_id), if initiated_by_me { "исходящая" } else { "входящая" }
     );
     let _ = chat.inner.link_tx.send(peer_id.clone());
+    chat.inner.links_changed.notify_one();
 
     let (mut rd, mut wr) = tokio::io::split(stream);
 
@@ -1049,6 +1138,7 @@ async fn run_link(
     let mut links = chat.inner.links.lock().await;
     if links.get(&peer_id).is_some_and(|l| l.id == link_id) {
         links.remove(&peer_id);
+        chat.inner.links_changed.notify_one();
     }
     info!("Связь с {} ({}) закрыта", name, short(&peer_id));
 }
@@ -1131,6 +1221,7 @@ async fn read_loop<R: AsyncReadExt + Unpin>(
                 chat.handle_vote_gossip(VoteGossip::Digest(items), src).await
             }
             ChatPacket::Vouch { signed } => chat.handle_vouch(signed, &peer).await,
+            ChatPacket::Links { signed } => chat.handle_links(signed, src).await,
             ChatPacket::Ping => {
                 let _ = tx.try_send(ChatPacket::Pong);
             }
@@ -1206,6 +1297,11 @@ impl PublicChat {
             self.inner.dns_cache.lock().await.values()
                 .map(|(_, signed)| ChatPacket::DnsAnnounce { signed: signed.clone() }),
         );
+        out.extend(
+            self.inner.topology.lock().await.signed_fresh(Utc::now().timestamp_millis())
+                .into_iter()
+                .map(|signed| ChatPacket::Links { signed }),
+        );
         out
     }
 
@@ -1256,7 +1352,8 @@ fn gossip_signature(pkt: &ChatPacket) -> Option<&SignedMessage> {
         | ChatPacket::ProposalAnnounce { signed }
         | ChatPacket::VoteAnnounce { signed }
         | ChatPacket::SiteRevoke { signed }
-        | ChatPacket::Vouch { signed } => Some(signed),
+        | ChatPacket::Vouch { signed }
+        | ChatPacket::Links { signed } => Some(signed),
         _ => None,
     }
 }
@@ -1594,6 +1691,8 @@ impl ChatHandle {
     pub fn subscribe_vouches(&self) -> broadcast::Receiver<VouchGossip> { self.chat.inner.vouch_tx.subscribe() }
     /// Новые связи с соседями.
     pub fn subscribe_links(&self) -> broadcast::Receiver<NodeId> { self.chat.inner.link_tx.subscribe() }
+    /// Карта соединений сети: узел → его соседи (см. [`crate::topology`]).
+    pub async fn topology(&self) -> HashMap<NodeId, Vec<NodeId>> { self.chat.topology().await }
     /// Уровень авторов по сети доверия — для лимитов частоты (см. [`crate::trust_limits`]).
     pub fn set_author_tiers(&self, tiers: TierFn) { self.chat.set_author_tiers(tiers) }
     pub async fn relay_vouch(&self, signed: SignedMessage, except: Option<&NodeId>) {
@@ -2766,5 +2865,31 @@ mod tests {
         }
         let got = collect_texts(&mut rx_a, 1500).await;
         assert_eq!(got.iter().filter(|t| t.starts_with("reply")).count(), 8, "{got:?}");
+    }
+
+    /// Карта соединений: в цепочке A–B–C узел C узнаёт связь A–B через B,
+    /// и она подтверждена обоими концами.
+    #[tokio::test]
+    async fn topology_spreads_along_chain() {
+        let (ka, a) = mesh_peer(1);
+        let (kb, b) = mesh_peer(2);
+        let (kc, c) = mesh_peer(3);
+        let _node_b = start_mesh_node(kb, &b, &[]).await;
+        let _node_a = start_mesh_node(ka, &a, &[&b]).await;
+        let node_c = start_mesh_node(kc, &c, &[&b]).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let map = node_c.topology().await;
+            let es = crate::topology::edges(&map, &c.id);
+            let has = |x: &NodeId, y: &NodeId| {
+                es.iter().any(|e| e.confirmed && ((&e.a == x && &e.b == y) || (&e.a == y && &e.b == x)))
+            };
+            if has(&a.id, &b.id) && has(&b.id, &c.id) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "C не узнал карту: {map:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }
