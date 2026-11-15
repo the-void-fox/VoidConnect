@@ -28,8 +28,10 @@ const REST_SPEED: f32 = 0.05;
 pub struct Layout {
     pos: HashMap<NodeId, Pos2>,
     vel: HashMap<NodeId, Vec2>,
-    /// Закреплённые пользователем (перетащенные) и якорь — не двигаются.
+    /// Закреплённые пользователем (через меню) и якорь — не двигаются.
     pinned: HashSet<NodeId>,
+    /// Узел, который сейчас тащат мышью: стоит под курсором, пока не отпустят.
+    held: Option<NodeId>,
     moving: bool,
 }
 
@@ -42,6 +44,9 @@ impl Layout {
         self.pos.retain(|id, _| keep.contains(id));
         self.vel.retain(|id, _| keep.contains(id));
         self.pinned.retain(|id| keep.contains(id));
+        if self.held.as_ref().is_some_and(|h| !keep.contains(h)) {
+            self.held = None;
+        }
         if !self.pos.contains_key(anchor) && keep.contains(anchor) {
             self.pos.insert(anchor.clone(), Pos2::ZERO);
             self.pinned.insert(anchor.clone());
@@ -93,7 +98,7 @@ impl Layout {
         }
         let mut speed = 0.0;
         for (i, id) in nodes.iter().enumerate() {
-            if self.pinned.contains(id) {
+            if self.pinned.contains(id) || self.held.as_ref() == Some(id) {
                 self.vel.remove(id);
                 continue;
             }
@@ -120,16 +125,36 @@ impl Layout {
         self.pos.get(id).copied().unwrap_or(Pos2::ZERO)
     }
 
-    /// Перетаскивание: ставит узел и закрепляет его; соседи подстраиваются.
+    /// Перетаскивание: узел стоит под курсором, соседи подстраиваются. После
+    /// [`Self::release`] он снова движется вместе с графом, если не закреплён.
     pub fn drag_to(&mut self, id: &NodeId, p: Pos2) {
         self.pos.insert(id.clone(), p);
-        self.pinned.insert(id.clone());
+        self.held = Some(id.clone());
         self.moving = true;
     }
 
-    /// Открепляет узел — он снова движется вместе с графом.
-    pub fn unpin(&mut self, id: &NodeId) {
-        self.pinned.remove(id);
+    /// Узел отпустили.
+    pub fn release(&mut self) {
+        self.held = None;
+        self.moving = true;
+    }
+
+    /// Закрепляет узел на его месте.
+    pub fn pin(&mut self, id: &NodeId) {
+        self.pinned.insert(id.clone());
+    }
+
+    /// Открепляет узел — он снова движется вместе с графом. Якорь не открепить.
+    pub fn unpin(&mut self, id: &NodeId, anchor: &NodeId) {
+        if id != anchor {
+            self.pinned.remove(id);
+            self.moving = true;
+        }
+    }
+
+    /// Открепляет все узлы, кроме якоря.
+    pub fn unpin_all(&mut self, anchor: &NodeId) {
+        self.pinned.retain(|id| id == anchor);
         self.moving = true;
     }
 
@@ -187,9 +212,8 @@ mod tests {
         let mut l = Layout::default();
         l.sync(&nodes, &[], &nodes[0]);
         l.drag_to(&nodes[1], Pos2::new(5.0, 5.0));
-        l.unpin(&nodes[1]);
         l.drag_to(&nodes[2], Pos2::new(5.0, 5.0));
-        l.unpin(&nodes[2]);
+        l.release();
         settle(&mut l, &nodes, &[]);
         for id in &nodes {
             let p = l.pos(id);
@@ -199,14 +223,47 @@ mod tests {
     }
 
     #[test]
-    fn dragged_node_stays_pinned_and_removed_nodes_forgotten() {
+    fn dragged_node_is_released_but_pinned_node_stays() {
         let nodes: Vec<NodeId> = (0..3).map(n).collect();
         let mut l = Layout::default();
         l.sync(&nodes, &[], &nodes[0]);
-        l.drag_to(&nodes[1], Pos2::new(300.0, 0.0));
+
+        // Перетащили и отпустили — узел не закреплён, гравитация тянет обратно.
+        l.drag_to(&nodes[1], Pos2::new(600.0, 0.0));
+        for _ in 0..5 {
+            l.step(&nodes, &[]);
+        }
+        assert_eq!(l.pos(&nodes[1]), Pos2::new(600.0, 0.0), "пока держат — на месте");
+        l.release();
         settle(&mut l, &nodes, &[]);
-        assert_eq!(l.pos(&nodes[1]), Pos2::new(300.0, 0.0));
+        assert!(l.pos(&nodes[1]).x < 500.0, "отпущенный узел вернулся в граф");
+        assert!(!l.is_pinned(&nodes[1]));
+
+        // Закрепили через меню — стоит, пока не открепят.
+        l.drag_to(&nodes[1], Pos2::new(600.0, 0.0));
+        l.release();
+        l.pin(&nodes[1]);
+        settle(&mut l, &nodes, &[]);
+        assert_eq!(l.pos(&nodes[1]), Pos2::new(600.0, 0.0));
+        l.unpin(&nodes[1], &nodes[0]);
+        settle(&mut l, &nodes, &[]);
+        assert!(l.pos(&nodes[1]).x < 500.0);
+
+        // Якорь не открепляется ни по одному, ни «все».
+        l.unpin(&nodes[0], &nodes[0]);
+        l.unpin_all(&nodes[0]);
+        assert!(l.is_pinned(&nodes[0]));
+    }
+
+    #[test]
+    fn removed_nodes_are_forgotten() {
+        let nodes: Vec<NodeId> = (0..3).map(n).collect();
+        let mut l = Layout::default();
+        l.sync(&nodes, &[], &nodes[0]);
+        l.drag_to(&nodes[2], Pos2::new(300.0, 0.0));
+        l.pin(&nodes[2]);
         l.sync(&nodes[..2], &[], &nodes[0]);
-        assert!(l.bounds().is_some_and(|(lo, hi)| hi.x <= 300.0 && lo.x >= -1.0));
+        assert!(!l.is_pinned(&nodes[2]));
+        assert!(l.bounds().is_some_and(|(_, hi)| hi.x < 300.0));
     }
 }

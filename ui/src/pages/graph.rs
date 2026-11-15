@@ -2,14 +2,14 @@
 //! узлу в глазах моего узла.
 //!
 //! Соединения берутся из карты соединений (списки соседей, которые узлы
-//! рассылают о себе, см. `void_chat::topology`): сплошная линия — связь
-//! подтверждена обоими концами, пунктир — заявлена одним. Поручительства —
-//! стрелки от поручителя: личное сплошное, приветствие пунктиром.
+//! рассылают о себе, см. `void_chat::topology`): серая сплошная линия — связь
+//! подтверждена обоими концами, пунктир — заявлена одним. Поручительство
+//! заменяет серую линию пары зелёной: личное — сплошная, приветствие — пунктир.
 //!
 //! Как в Obsidian: раскладка «физикой» ([`super::graph_layout`]), колесо —
-//! масштаб, перетаскивание фона — сдвиг, узел можно перетащить (закрепится,
-//! двойной щелчок открепляет), наведение подсвечивает соседей, щелчок
-//! открывает профиль.
+//! масштаб, перетаскивание фона — сдвиг, узел можно потаскать, наведение
+//! подсвечивает соседей, щелчок открывает профиль, правая кнопка — меню узла
+//! (закрепить, профиль, написать).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -32,17 +32,16 @@ const LABELS_ZOOM: f32 = 0.75;
 
 const LINK_COLOR: Color32 = Color32::from_rgb(150, 160, 190);
 const VOUCH_COLOR: Color32 = Color32::from_rgb(80, 190, 110);
-const GREET_COLOR: Color32 = Color32::from_rgb(170, 160, 120);
 const ME_COLOR: Color32 = Color32::from_rgb(80, 140, 255);
 const MATCH_COLOR: Color32 = Color32::from_rgb(240, 200, 60);
 
-/// Связь на графе.
+/// Поручительство между парой узлов (в любую сторону).
 #[derive(Clone, Copy, PartialEq)]
-enum EdgeKind {
-    /// Соединение в сети; `confirmed` — его называют оба конца.
-    Link { confirmed: bool },
-    /// Поручительство (стрелка от поручителя); `greeter` — приветствие.
-    Vouch { greeter: bool },
+enum VouchLine {
+    /// Хотя бы одно личное поручительство — сплошная линия.
+    Personal,
+    /// Только приветствия — пунктир.
+    Greeter,
 }
 
 struct GNode {
@@ -53,10 +52,21 @@ struct GNode {
     reported: bool,
 }
 
+/// Пара узлов на графе: соединение и/или поручительство. Одна линия на пару —
+/// поручительство рисуется вместо соединения.
 struct GEdge {
     a: usize,
     b: usize,
-    kind: EdgeKind,
+    /// Соединение в сети; `true` — его называют оба конца.
+    link: Option<bool>,
+    vouch: Option<VouchLine>,
+}
+
+impl GEdge {
+    /// Сила пружины в раскладке: соединение тянет сильнее, чем одно доверие.
+    fn spring(&self) -> f32 {
+        if self.link.is_some() { 1.0 } else { 0.5 }
+    }
 }
 
 /// Что показывать.
@@ -104,6 +114,8 @@ pub struct Graph {
     filters: Filters,
     search:  String,
     drag:    Option<Drag>,
+    /// Для чего открыто меню правой кнопки: узел или фон (`None`).
+    menu_target: Option<NodeId>,
 }
 
 impl Graph {
@@ -120,6 +132,7 @@ impl Graph {
             filters: Filters { links: true, unconfirmed: false, vouches: true, online_only: false },
             search: String::new(),
             drag: None,
+            menu_target: None,
         }
     }
 
@@ -252,22 +265,35 @@ impl Graph {
         }).collect();
         drop(trust);
 
-        let mut edges = Vec::new();
+        // Одна запись на пару узлов (без учёта направления).
+        let mut pairs: HashMap<(usize, usize), GEdge> = HashMap::new();
+        fn pair(pairs: &mut HashMap<(usize, usize), GEdge>, a: usize, b: usize) -> &mut GEdge {
+            let key = (a.min(b), a.max(b));
+            pairs.entry(key).or_insert(GEdge { a: key.0, b: key.1, link: None, vouch: None })
+        }
         if self.filters.links {
             for e in void_chat::topology::edges(&topo, &self.my_id) {
                 if !e.confirmed && !self.filters.unconfirmed {
                     continue;
                 }
                 if let (Some(&a), Some(&b)) = (index.get(&e.a), index.get(&e.b)) {
-                    edges.push(GEdge { a, b, kind: EdgeKind::Link { confirmed: e.confirmed } });
+                    let edge = pair(&mut pairs, a, b);
+                    edge.link = Some(edge.link.unwrap_or(false) || e.confirmed);
                 }
             }
         }
         for (v, s, kind) in &vouches {
             if let (Some(&a), Some(&b)) = (index.get(v), index.get(s)) {
-                edges.push(GEdge { a, b, kind: EdgeKind::Vouch { greeter: *kind == VouchKind::Greeter } });
+                let edge = pair(&mut pairs, a, b);
+                if *kind != VouchKind::Greeter {
+                    edge.vouch = Some(VouchLine::Personal);
+                } else if edge.vouch.is_none() {
+                    edge.vouch = Some(VouchLine::Greeter);
+                }
             }
         }
+        let mut edges: Vec<GEdge> = pairs.into_values().collect();
+        edges.sort_by_key(|e| (e.a, e.b)); // порядок отрисовки не мигает между кадрами
         (nodes, edges)
     }
 
@@ -413,8 +439,8 @@ impl Graph {
         });
         ui.label(
             egui::RichText::new(
-                "Колесо — масштаб, перетаскивание фона — сдвиг. Узел можно перетащить — он \
-                 закрепится; двойной щелчок открепляет. Щелчок — профиль.",
+                "Колесо — масштаб, перетаскивание фона — сдвиг, узлы можно двигать. \
+                 Щелчок — профиль, правая кнопка — закрепить и другие действия.",
             )
             .small()
             .color(ui.visuals().weak_text_color()),
@@ -425,9 +451,7 @@ impl Graph {
 
         let (nodes, edges) = self.build();
         let ids: Vec<NodeId> = nodes.iter().map(|n| n.id.clone()).collect();
-        let springs: Vec<(usize, usize, f32)> = edges.iter()
-            .map(|e| (e.a, e.b, if matches!(e.kind, EdgeKind::Link { .. }) { 1.0 } else { 0.5 }))
-            .collect();
+        let springs: Vec<(usize, usize, f32)> = edges.iter().map(|e| (e.a, e.b, e.spring())).collect();
         self.layout.sync(&ids, &springs, &self.my_id);
         self.layout.step(&ids, &springs);
 
@@ -474,14 +498,18 @@ impl Graph {
             if nodes[i].id == self.my_id { (ME_R * zoom).clamp(8.0, 34.0) } else { (NODE_R * zoom).clamp(6.0, 28.0) }
         };
         let screen: Vec<Pos2> = ids.iter().map(|id| to_screen(self.layout.pos(id))).collect();
-        let hovered = pointer.and_then(|p| {
+        let node_at = |p: Pos2| {
             (0..nodes.len())
                 .filter(|&i| (screen[i] - p).length() <= radius(i) + 3.0)
                 .min_by(|&a, &b| (screen[a] - p).length().total_cmp(&(screen[b] - p).length()))
-        });
+        };
+        let hovered = pointer.and_then(node_at);
 
         if resp.drag_started() {
-            self.drag = Some(match hovered {
+            // Узел — тот, на котором нажали: к началу перетаскивания курсор уже
+            // мог уйти с него (быстрый рывок), и тогда сдвигался бы весь граф.
+            let pressed = ui.input(|i| i.pointer.press_origin()).and_then(node_at);
+            self.drag = Some(match pressed {
                 Some(i) => Drag::Node(nodes[i].id.clone()),
                 None => Drag::Pan,
             });
@@ -498,14 +526,16 @@ impl Graph {
             }
         }
         if resp.drag_stopped() {
+            if matches!(self.drag, Some(Drag::Node(_))) {
+                self.layout.release();
+            }
             self.drag = None;
         }
-        if resp.double_clicked() {
-            if let Some(i) = hovered {
-                self.layout.unpin(&nodes[i].id);
-            }
-        } else if resp.clicked() {
+        if resp.clicked() {
             self.selected = hovered.map(|i| nodes[i].id.clone()).filter(|id| *id != self.my_id);
+        }
+        if resp.secondary_clicked() {
+            self.menu_target = hovered.map(|i| nodes[i].id.clone());
         }
 
         // Подсветка: наведённый узел и его соседи; остальные тускнеют.
@@ -519,37 +549,32 @@ impl Graph {
         });
         let is_lit = |i: usize| lit.as_ref().is_none_or(|s| s.contains(&i));
 
-        // ── Связи ───────────────────────────────────────────────────────────
+        // ── Связи: одна линия на пару, поручительство вместо соединения ──────
         for e in &edges {
             let k = if hovered.is_none() || hovered == Some(e.a) || hovered == Some(e.b) { 1.0 } else { 0.15 };
             let (pa, pb) = (screen[e.a], screen[e.b]);
-            let dir = (pb - pa).normalized();
-            match e.kind {
-                EdgeKind::Link { confirmed: true } => {
-                    let mine = nodes[e.a].id == self.my_id || nodes[e.b].id == self.my_id;
+            let mine = nodes[e.a].id == self.my_id || nodes[e.b].id == self.my_id;
+            match (e.vouch, e.link) {
+                (Some(VouchLine::Personal), _) => {
+                    let w: f32 = if mine { 2.5 } else { 2.0 };
+                    painter.line_segment([pa, pb], Stroke::new(w, faded(VOUCH_COLOR, 0.85 * k)));
+                }
+                (Some(VouchLine::Greeter), _) => {
+                    let w: f32 = if mine { 2.0 } else { 1.6 };
+                    painter.extend(egui::Shape::dashed_line(
+                        &[pa, pb], Stroke::new(w, faded(VOUCH_COLOR, 0.8 * k)), 6.0, 4.0,
+                    ));
+                }
+                (None, Some(true)) => {
                     let w: f32 = if mine { 2.0 } else { 1.5 };
                     painter.line_segment([pa, pb], Stroke::new(w, faded(LINK_COLOR, 0.7 * k)));
                 }
-                EdgeKind::Link { confirmed: false } => {
+                (None, Some(false)) => {
                     painter.extend(egui::Shape::dashed_line(
                         &[pa, pb], Stroke::new(1.0_f32, faded(LINK_COLOR, 0.35 * k)), 4.0, 4.0,
                     ));
                 }
-                EdgeKind::Vouch { greeter } => {
-                    // Сдвиг вбок: стрелка не закрывает соединение той же пары, а
-                    // встречные поручительства (A→B и B→A) идут рядом.
-                    let side = dir.rot90() * 4.0;
-                    let start = pa + dir * radius(e.a) + side;
-                    let end = pb - dir * (radius(e.b) + 2.0) + side;
-                    let color = faded(if greeter { GREET_COLOR } else { VOUCH_COLOR }, 0.8 * k);
-                    let stroke = Stroke::new(1.3_f32, color);
-                    if greeter {
-                        painter.extend(egui::Shape::dashed_line(&[start, end - dir * 8.0], stroke, 4.0, 3.0));
-                        painter.arrow(end - dir * 8.0, dir * 8.0, stroke);
-                    } else {
-                        painter.arrow(start, end - start, stroke);
-                    }
-                }
+                (None, None) => {}
             }
         }
 
@@ -603,8 +628,9 @@ impl Graph {
                 "Ищем узлы в сети…", egui::FontId::proportional(14.0), Color32::from_gray(120));
         }
 
-        // Подсказка у наведённого узла.
-        if let Some(h) = hovered {
+        // Подсказка у курсора (не поверх открытого меню и не во время перетаскивания).
+        let tip_allowed = resp.hovered() && self.drag.is_none() && !resp.context_menu_opened();
+        if let Some(h) = hovered.filter(|_| tip_allowed) {
             let node = &nodes[h];
             let state = if node.id == self.my_id {
                 "это вы".to_string()
@@ -612,14 +638,68 @@ impl Graph {
                 format!("{} · {}", trust_label(node), if node.online { "в сети" } else { "не в сети" })
             };
             let pinned = if self.layout.is_pinned(&node.id) && node.id != self.my_id { " · закреплён" } else { "" };
-            resp.clone().on_hover_text(format!("{}\n{state}{pinned}", node.name));
+            egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new("graph_node_tip"), |ui| {
+                ui.label(egui::RichText::new(&node.name).strong());
+                ui.label(format!("{state}{pinned}"));
+            });
         }
 
         self.paint_legend(&painter, rect, nodes.len(), edges.len());
 
+        let mut fit_now = false;
+        resp.context_menu(|ui| fit_now = self.context_menu(ui, &nodes));
+        if fit_now {
+            self.fit(rect);
+        }
+
         if self.layout.is_moving() || self.drag.is_some() {
             ui.ctx().request_repaint();
         }
+    }
+
+    /// Меню правой кнопки: для узла — закрепить, профиль, написать; для фона —
+    /// вписать и открепить все. Возвращает `true`, если надо вписать граф.
+    fn context_menu(&mut self, ui: &mut egui::Ui, nodes: &[GNode]) -> bool {
+        let target = self.menu_target.as_ref().and_then(|id| nodes.iter().find(|n| n.id == *id));
+        let Some(node) = target.filter(|n| n.id != self.my_id) else {
+            if let Some(me) = target {
+                ui.label(egui::RichText::new(&me.name).strong());
+                ui.separator();
+            }
+            let fit = ui.button("\u{F0293}  Вписать граф").clicked();
+            let any_pinned = nodes.iter().any(|n| n.id != self.my_id && self.layout.is_pinned(&n.id));
+            if ui.add_enabled(any_pinned, egui::Button::new("\u{F0404}  Открепить все")).clicked() {
+                self.layout.unpin_all(&self.my_id);
+                ui.close_menu();
+            }
+            if fit {
+                ui.close_menu();
+            }
+            return fit;
+        };
+        let id = node.id.clone();
+        ui.label(egui::RichText::new(&node.name).strong());
+        ui.separator();
+        if self.layout.is_pinned(&id) {
+            if ui.button("\u{F0404}  Открепить").clicked() {
+                self.layout.unpin(&id, &self.my_id);
+                ui.close_menu();
+            }
+        } else if ui.button("\u{F0403}  Закрепить здесь").clicked() {
+            self.layout.pin(&id);
+            ui.close_menu();
+        }
+        // Профиль и личка — только если про узел есть что показать.
+        let known = self.peers.iter().any(|p| p.id == id) || self.profiles.contains_key(&id);
+        if ui.add_enabled(known, egui::Button::new("\u{F0009}  Профиль")).clicked() {
+            self.selected = Some(id.clone());
+            ui.close_menu();
+        }
+        if ui.add_enabled(known, egui::Button::new("\u{F0361}  Написать")).clicked() {
+            self.pending_dm = Some(id);
+            ui.close_menu();
+        }
+        false
     }
 
     /// Легенда в углу: цвета доверия, виды связей, счётчики.
@@ -628,18 +708,21 @@ impl Graph {
         let text = Color32::from_gray(170);
         let mut y = rect.bottom() - 12.0;
         let x = rect.left() + 12.0;
-        /// Образец в легенде: кружок узла, линия соединения, стрелка (пунктиром — приветствие).
-        enum Sample { Ring, Line, Arrow, DashedArrow }
-        let rows: [(Color32, &str, Sample); 8] = [
+        /// Образец в легенде: кружок узла, линия, пунктир.
+        enum Sample { Ring, Line, Dashed }
+        let mut rows: Vec<(Color32, &str, Sample)> = vec![
             (Color32::from_rgb(80, 190, 110), "проверен лично", Sample::Ring),
             (Color32::from_rgb(120, 170, 220), "через знакомых", Sample::Ring),
             (Color32::from_rgb(170, 160, 120), "освоившийся", Sample::Ring),
             (Color32::from_gray(120), "незнакомец", Sample::Ring),
             (Color32::from_rgb(220, 140, 60), "под жалобами", Sample::Ring),
             (LINK_COLOR, "соединение", Sample::Line),
-            (VOUCH_COLOR, "поручительство", Sample::Arrow),
-            (GREET_COLOR, "приветствие", Sample::DashedArrow),
         ];
+        if self.filters.unconfirmed {
+            rows.push((LINK_COLOR, "не подтверждено", Sample::Dashed));
+        }
+        rows.push((VOUCH_COLOR, "поручительство", Sample::Line));
+        rows.push((VOUCH_COLOR, "приветствие", Sample::Dashed));
         for (color, label, sample) in rows.iter().rev() {
             let (a, b) = (Pos2::new(x - 4.0, y), Pos2::new(x + 9.0, y));
             let stroke = Stroke::new(2.0_f32, *color);
@@ -650,10 +733,8 @@ impl Graph {
                 Sample::Line => {
                     painter.line_segment([a, b], stroke);
                 }
-                Sample::Arrow => painter.arrow(a, b - a, stroke),
-                Sample::DashedArrow => {
-                    painter.extend(egui::Shape::dashed_line(&[a, b - Vec2::new(5.0, 0.0)], stroke, 3.0, 2.0));
-                    painter.arrow(b - Vec2::new(5.0, 0.0), Vec2::new(5.0, 0.0), stroke);
+                Sample::Dashed => {
+                    painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 3.0, 2.0));
                 }
             }
             painter.text(Pos2::new(x + 16.0, y), egui::Align2::LEFT_CENTER, *label, font.clone(), text);
