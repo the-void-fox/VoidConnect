@@ -4,6 +4,7 @@ use egui::menu;
 use void_core::identity::NodeId;
 
 use crate::backend::BackendHandle;
+use crate::theme;
 use crate::pages::{
     chat::ChatPage,
     private::PrivatePage,
@@ -221,13 +222,18 @@ impl eframe::App for VoidApp {
         self.poll_dm_status();
         self.refresh_peers();
 
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            menu::bar(ui, |ui| { self.show_top_bar(ui); });
-        });
+        let bar_frame = |m: egui::Margin| egui::Frame::none().fill(theme::BG_SIDE).inner_margin(m);
+
+        egui::TopBottomPanel::top("menu")
+            .frame(bar_frame(egui::Margin::symmetric(10.0, 5.0)))
+            .show(ctx, |ui| {
+                menu::bar(ui, |ui| { self.show_top_bar(ui); });
+            });
 
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(200.0)
+            .exact_width(216.0)
+            .frame(bar_frame(egui::Margin::symmetric(12.0, 14.0)))
             .show(ctx, |ui| { self.show_sidebar(ui); });
 
         let peer_count = self.peer_count;
@@ -238,14 +244,18 @@ impl eframe::App for VoidApp {
         let my_addr    = format!("{} ({}:{})",
             self.profile.name, self.backend.my_ip, self.backend.base_port);
         egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(26.0)
+            .exact_height(28.0)
+            .frame(bar_frame(egui::Margin::symmetric(10.0, 0.0)))
             .show(ctx, |ui| {
                 crate::widgets::status_bar::show_status_bar(
                     ui, peer_count, &my_addr, local_mode, public_mode, has_bootstrap, reachable,
                 );
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central = egui::Frame::none()
+            .fill(theme::BG)
+            .inner_margin(egui::Margin { left: 22.0, right: 22.0, top: 14.0, bottom: 12.0 });
+        egui::CentralPanel::default().frame(central).show(ctx, |ui| {
             match self.current_page {
                 Page::Chat    => {
                     self.chat.show(ui);
@@ -316,7 +326,7 @@ impl VoidApp {
             for msg in history {
                 let is_me = msg.from.as_str() == self.backend.my_id_full;
                 let time = chrono::DateTime::from_timestamp(msg.timestamp, 0)
-                    .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%H:%M").to_string())
+                    .map(|dt: chrono::DateTime<chrono::Utc>| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
                     .unwrap_or_default();
                 self.chat.receive_message(crate::pages::chat::ChatMessage {
                     author:  msg.from_name.clone(),
@@ -345,7 +355,7 @@ impl VoidApp {
             }
 
             let time = chrono::DateTime::from_timestamp(msg.timestamp, 0)
-                .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%H:%M").to_string())
+                .map(|dt: chrono::DateTime<chrono::Utc>| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
                 .unwrap_or_default();
 
             self.chat.receive_message(crate::pages::chat::ChatMessage {
@@ -444,74 +454,68 @@ impl VoidApp {
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
-        let pad = 12.0;
-        ui.add_space(pad);
-
-        ui.vertical_centered(|ui| {
-            ui.heading("󰋙 Void Connect");
+        // ── Логотип ──────────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("\u{F02D9}").size(22.0).color(theme::ACCENT));
+            ui.label(
+                egui::RichText::new("Void Connect")
+                    .font(egui::FontId::new(17.0, theme::semibold()))
+                    .color(theme::TEXT_STRONG),
+            );
         });
+        ui.add_space(14.0);
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        // ── Карточка профиля: аватар + имя (клик → страница профиля) ──────────
+        // ── Карточка профиля: аватар + имя (щелчок → страница профиля) ──────
         let avatar = self.profile.avatar_png.clone();
         let my_name = self.profile.name.clone();
         let id_short = self.backend.my_id_short.clone();
-        let card = ui.horizontal(|ui| {
-            ui.add_space(pad);
-            crate::avatar::show_avatar(ui, avatar.as_deref(), &my_name, ui.visuals().hyperlink_color, 40.0);
-            ui.add_space(8.0);
-            ui.vertical(|ui| {
-                ui.add_space(3.0);
-                ui.label(egui::RichText::new(&my_name).strong());
-                ui.label(egui::RichText::new(&id_short).small().weak().monospace());
-            });
-        }).response.interact(egui::Sense::click());
-        if card.clicked() {
-            self.current_page = Page::Profile;
-        }
-        card.on_hover_text("Открыть профиль");
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(12.0);
-
-        let btn_w = ui.available_width() - pad * 2.0;
-        ui.horizontal(|ui| {
-            ui.add_space(pad);
-            ui.vertical(|ui| {
-                self.nav_button(ui, Page::Chat,    btn_w);
+        let (rect, card) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::click());
+        let fill = if card.hovered() { theme::SURFACE_2 } else { theme::SURFACE };
+        ui.painter().rect(rect, egui::Rounding::same(theme::R_CARD), fill, egui::Stroke::new(1.0_f32, theme::BORDER));
+        ui.allocate_ui_at_rect(rect.shrink2(egui::vec2(10.0, 9.0)), |ui| {
+            ui.horizontal_centered(|ui| {
+                crate::avatar::show_avatar(ui, avatar.as_deref(), &my_name, theme::SURFACE_3, 38.0);
                 ui.add_space(4.0);
-                self.nav_button(ui, Page::Private, btn_w);
-                ui.add_space(4.0);
-                self.nav_button(ui, Page::Storage, btn_w);
-                ui.add_space(4.0);
-                self.nav_button(ui, Page::Sites,   btn_w);
-                ui.add_space(4.0);
-                self.nav_button(ui, Page::Votes,   btn_w);
-                ui.add_space(4.0);
-                self.nav_button(ui, Page::Graph,   btn_w);
-
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                self.nav_button(ui, Page::Profile, btn_w);
+                ui.vertical(|ui| {
+                    ui.add_space(1.0);
+                    ui.label(
+                        egui::RichText::new(&my_name)
+                            .font(egui::FontId::new(14.0, theme::semibold()))
+                            .color(theme::TEXT_STRONG),
+                    );
+                    ui.label(egui::RichText::new(&id_short).size(11.0).monospace().color(theme::TEXT_FAINT));
+                });
             });
         });
-    }
-
-    fn nav_button(&mut self, ui: &mut egui::Ui, page: Page, width: f32) {
-        let is_selected = self.current_page == page;
-        let text = format!("{} {}", page.icon(), page.label());
-        let btn  = egui::Button::new(text)
-            .min_size(egui::vec2(width, 32.0))
-            .selected(is_selected);
-        if ui.add(btn).clicked() {
-            self.current_page = page;
+        if card.on_hover_text("Открыть профиль").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.current_page = Page::Profile;
         }
+
+        ui.add_space(18.0);
+        ui.label(egui::RichText::new("РАЗДЕЛЫ").size(10.5).color(theme::TEXT_FAINT));
+        ui.add_space(2.0);
+        for page in [Page::Chat, Page::Private, Page::Storage, Page::Sites, Page::Votes, Page::Graph] {
+            if theme::nav_item(ui, page.icon().trim(), page.label(), self.current_page == page).clicked() {
+                self.current_page = page;
+            }
+            ui.add_space(1.0);
+        }
+
+        // Профиль и настройки — внизу панели.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            if theme::nav_item(ui, "\u{F0493}", "Настройки", self.show_settings).clicked() {
+                self.show_settings = true;
+                self.settings_saved = false;
+            }
+            ui.add_space(1.0);
+            let page = Page::Profile;
+            if theme::nav_item(ui, page.icon().trim(), page.label(), self.current_page == page).clicked() {
+                self.current_page = page;
+            }
+            ui.add_space(6.0);
+            ui.separator();
+        });
     }
 
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -545,24 +549,12 @@ impl VoidApp {
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Индикатор должен отражать реальное наличие связи, а не быть зашитым.
-            let (dot, label, color, hint) = if self.peer_count > 0 {
-                (
-                    "●",
-                    "В сети",
-                    egui::Color32::from_rgb(80, 200, 80),
-                    format!("Известно узлов: {}", self.peer_count),
-                )
+            let (label, color, hint) = if self.peer_count > 0 {
+                ("В сети", theme::OK, format!("Известно узлов: {}", self.peer_count))
             } else {
-                (
-                    "○",
-                    "Нет связи",
-                    egui::Color32::from_rgb(180, 130, 60),
-                    "Ни одного узла не обнаружено.".to_string(),
-                )
+                ("Нет связи", theme::WARN, "Ни одного узла не обнаружено.".to_string())
             };
-            ui.label(egui::RichText::new(format!("{} {}", dot, label)).color(color))
-                .on_hover_text(hint);
-            ui.add_space(8.0);
+            theme::status_pill(ui, color, label).on_hover_text(hint);
         });
     }
 
@@ -635,12 +627,8 @@ impl VoidApp {
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
-        egui::Window::new("\u{F0493}  Настройки")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
+        theme::dialog(ctx, "\u{F0493}  Настройки", &mut open)
             .default_width(440.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Чат").strong().size(15.0));
@@ -733,7 +721,7 @@ impl VoidApp {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button("\u{F0193}  Сохранить").clicked() {
+                    if ui.add(theme::primary_button("\u{F0193}  Сохранить")).clicked() {
                         self.settings.bootstrap_nodes = self.settings_bootstrap_input
                             .lines()
                             .flat_map(|l| l.split(','))
@@ -882,12 +870,8 @@ impl VoidApp {
 
     fn show_about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_about;
-        egui::Window::new("\u{F02FC}  О программе")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
+        theme::dialog(ctx, "\u{F02FC}  О программе", &mut open)
             .default_width(380.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.vertical_centered(|ui| {
@@ -912,7 +896,7 @@ impl VoidApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("\u{F02D1}").color(egui::Color32::from_rgb(220, 90, 90)),
+                        egui::RichText::new("\u{F02D1}").color(theme::ERR),
                     );
                     ui.label(
                         egui::RichText::new("Сделано с любовью к децентрализации.")
@@ -925,14 +909,13 @@ impl VoidApp {
 
     fn show_docs_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_docs;
-        egui::Window::new("\u{F0BC8}  Документация — быстрый старт")
-            .open(&mut open)
-            .collapsible(false)
+        let docs_h = theme::max_window_height(ctx) - 60.0;
+        theme::dialog(ctx, "\u{F0BC8}  Документация — быстрый старт", &mut open)
+            .vscroll(false) // своя прокрутка внутри
             .resizable(true)
             .default_width(470.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(docs_h.min(440.0)).show(ui, |ui| {
                     ui.add_space(4.0);
 
                     ui.label(egui::RichText::new("В одной локальной сети").strong().size(14.0));

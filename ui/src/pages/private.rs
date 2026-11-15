@@ -2,18 +2,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use egui::{Button, Frame, ScrollArea, TextEdit};
+use egui::{Frame, ScrollArea, TextEdit};
 
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
 use void_chat::private_chat::{DmSendCmd, IncomingDm};
 use void_crypto::keys::EncryptionKeypair;
+use crate::theme;
 use crate::widgets::peer_popup::status_colors;
 use crate::backend::{DeliveryState, TrustCmd};
 use crate::dm_access::DmAccess;
 
 /// Цвет папки «Запросы».
-const REQUEST_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 70);
+const REQUEST_COLOR: egui::Color32 = theme::WARN;
 
 /// Где беседа: во «Входящих», в «Запросах» или узел заблокирован мной.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,29 +257,25 @@ impl PrivatePage {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let line_height          = ui.text_style_height(&egui::TextStyle::Body);
         let max_input_lines      = 4;
-        let input_scroll_height  = line_height * max_input_lines as f32 + 12.0;
-        let input_area_total     = input_scroll_height + 32.0;
-        let header_height        = 60.0;
-        let messages_height      = (ui.available_height() - header_height - input_area_total).max(100.0);
+        let input_scroll_height  = line_height * max_input_lines as f32 + 16.0;
 
         egui::SidePanel::left("private_sidebar")
             .resizable(false)
-            .exact_width(200.0)
+            .exact_width(210.0)
+            .frame(Frame::none().inner_margin(egui::Margin { left: 0.0, right: 12.0, top: 0.0, bottom: 0.0 }))
             .show_inside(ui, |ui| {
                 self.show_sidebar(ui);
             });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            self.show_chat(ui, messages_height, input_scroll_height);
-        });
+        egui::CentralPanel::default()
+            .frame(Frame::none().inner_margin(egui::Margin { left: 16.0, right: 0.0, top: 0.0, bottom: 0.0 }))
+            .show_inside(ui, |ui| {
+                self.show_chat(ui, input_scroll_height);
+            });
     }
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.heading("󰌾 Диалоги");
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
+        theme::page_header(ui, "\u{F033E}", "Диалоги", None);
 
         // Заблокированные мной в списке не показываем.
         let folders: Vec<Folder> = self.conversations.iter().map(|c| self.folder(&c.peer_id)).collect();
@@ -286,9 +283,9 @@ impl PrivatePage {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new("Нет диалогов.\nОткрой профиль пира и\nнажми «Начать беседу».")
+                    egui::RichText::new("Нет диалогов.\nОткройте профиль узла\nи нажмите «Начать беседу».")
                         .small()
-                        .color(ui.visuals().weak_text_color()),
+                        .color(theme::TEXT_DIM),
                 );
             });
             return;
@@ -335,51 +332,66 @@ impl PrivatePage {
         let status       = self.peer_profiles.get(&peer_id)
             .map(|p| p.status.clone());
 
+        // Наведение берём из прошлого кадра: размер строки к этому моменту неизвестен.
+        let hover_id = ui.id().with(("conv_click", i));
+        let hovered = ui.ctx().read_response(hover_id).is_some_and(|r| r.hovered());
         let frame_fill = if is_selected {
-            ui.visuals().widgets.active.bg_fill
+            theme::SURFACE_3
+        } else if hovered {
+            theme::SURFACE_2
         } else {
             egui::Color32::TRANSPARENT
         };
 
         let frame = Frame::none()
-            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+            .rounding(egui::Rounding::same(theme::R_WIDGET))
             .fill(frame_fill);
 
         let resp = frame.show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 // Аватар пира (или цветной кружок с буквой, как запасной).
-                let (fill, _) = status_colors(status.as_deref());
-                crate::avatar::show_avatar(ui, avatar_b64.as_deref(), &peer_name, fill, 30.0);
+                let corner = ui.cursor().min + egui::vec2(28.0, 28.0);
+                crate::avatar::show_avatar(ui, avatar_b64.as_deref(), &peer_name, theme::SURFACE_3, 32.0);
+                ui.painter().circle(
+                    corner, 4.5, status_colors(status.as_deref()).1,
+                    egui::Stroke::new(2.0_f32, if is_selected { theme::SURFACE_3 } else { theme::BG }),
+                );
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.vertical(|ui| {
                     ui.set_min_width(0.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&peer_name).strong().size(13.0));
+                        ui.label(
+                            egui::RichText::new(&peer_name)
+                                .font(egui::FontId::new(13.5, theme::semibold()))
+                                .color(theme::TEXT_STRONG),
+                        );
                         if unread > 0 {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{}", unread))
-                                        .small().strong()
-                                        .color(ui.visuals().hyperlink_color),
-                                );
+                                // Счётчик непрочитанных — белая «таблетка».
+                                egui::Frame::none()
+                                    .fill(theme::ACCENT)
+                                    .rounding(egui::Rounding::same(9.0))
+                                    .inner_margin(egui::Margin::symmetric(6.0, 1.0))
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new(unread.to_string()).size(11.0).color(theme::BG));
+                                    });
                             });
                         }
                     });
-                    ui.label(
-                        egui::RichText::new(&last_msg).small()
-                            .color(ui.visuals().weak_text_color()),
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&last_msg).size(12.0).color(theme::TEXT_DIM))
+                            .truncate(true),
                     );
                 });
             });
         });
 
-        let clicked = ui.interact(
-            resp.response.rect,
-            ui.id().with(("conv_click", i)),
-            egui::Sense::click(),
-        ).clicked();
+        let clicked = ui.interact(resp.response.rect, hover_id, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked();
 
         if clicked {
             self.selected = i;
@@ -390,20 +402,22 @@ impl PrivatePage {
         ui.add_space(2.0);
     }
 
-    fn show_chat(&mut self, ui: &mut egui::Ui, messages_height: f32, input_scroll_height: f32) {
+    fn show_chat(&mut self, ui: &mut egui::Ui, input_scroll_height: f32) {
         if self.conversations.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
+                ui.add_space((ui.available_height() / 2.0 - 60.0).max(20.0));
+                ui.label(egui::RichText::new("\u{F033E}").size(34.0).color(theme::TEXT_FAINT));
+                ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("󰌾  Нет активных диалогов")
-                        .size(18.0)
-                        .color(ui.visuals().weak_text_color()),
+                    egui::RichText::new("Нет активных диалогов")
+                        .font(egui::FontId::new(16.0, theme::semibold()))
+                        .color(theme::TEXT_DIM),
                 );
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("Нажми на пира в «Общем чате» или «Графе сети»\nи выбери «Начать беседу».")
+                    egui::RichText::new("Нажмите на узел в «Общем чате» или «Графе сети»\nи выберите «Начать беседу».")
                         .small()
-                        .color(ui.visuals().weak_text_color()),
+                        .color(theme::TEXT_FAINT),
                 );
             });
             return;
@@ -418,50 +432,46 @@ impl PrivatePage {
         let peer_name = self.conversations[selected].peer_name.clone();
         let peer_id   = self.conversations[selected].peer_id.clone();
         let peer_avatar = self.peer_profiles.get(&peer_id).and_then(|p| p.avatar_png.clone());
-        let peer_status = self.peer_profiles.get(&peer_id).map(|p| p.status.clone());
         let my_avatar   = self.my_avatar.clone();
         let folder      = self.folder(&peer_id);
         let has_incoming = self.conversations[selected].messages.iter().any(|m| !m.is_me);
 
-        // Заголовок: имя + признак шифрования
+        // Заголовок: аватар, имя, признак шифрования.
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.heading(format!("󰭹 {}", peer_name));
-            ui.add_space(8.0);
+            crate::avatar::show_avatar(ui, peer_avatar.as_deref(), &peer_name, theme::SURFACE_3, 30.0);
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(&peer_name)
+                    .font(egui::FontId::new(18.0, theme::semibold()))
+                    .color(theme::TEXT_STRONG),
+            );
+            ui.add_space(6.0);
             let has_key = self.peer_profiles.get(&peer_id)
                 .and_then(|p| p.enc_pubkey.as_ref())
                 .is_some();
             if has_key {
-                ui.label(
-                    egui::RichText::new("󰌾 E2E")
-                        .small()
-                        .color(egui::Color32::from_rgb(80, 200, 80)),
-                );
+                theme::status_pill(ui, theme::OK, "\u{F033E} E2E")
+                    .on_hover_text("Сообщения шифруются сквозным шифрованием: прочитать их может только собеседник");
             } else {
-                ui.label(
-                    egui::RichText::new("󰔛 ожидание ключа…")
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                );
+                theme::status_pill(ui, theme::TEXT_FAINT, "ожидание ключа…");
             }
         });
         ui.add_space(8.0);
         ui.separator();
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         // Запрос от незнакомца или заблокированный узел: решение — над перепиской.
-        let banner_top = ui.cursor().top();
         match folder {
             Folder::Request => {
-                ui.label(
-                    egui::RichText::new(
-                        "\u{F02FC}  Запрос от узла вне вашей сети доверия. Примите — его сообщения \
-                         пойдут во «Входящие» и вы сможете ответить. Отклоните — узел будет \
-                         заблокирован.")
-                        .color(REQUEST_COLOR),
+                theme::notice(
+                    ui, REQUEST_COLOR, "\u{F02FC}",
+                    "Запрос от узла вне вашей сети доверия. Примите — его сообщения пойдут во \
+                     «Входящие» и вы сможете ответить. Отклоните — узел будет заблокирован.",
                 );
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("\u{F012C}  Принять").clicked() {
+                    if ui.add(theme::primary_button("\u{F012C}  Принять")).clicked() {
                         self.send_trust(TrustCmd::Allow(peer_id.clone()));
                     }
                     if ui.button("\u{F0156}  Отклонить").clicked() {
@@ -471,33 +481,51 @@ impl PrivatePage {
                 ui.add_space(8.0);
             }
             Folder::Blocked => {
-                ui.label(
-                    egui::RichText::new(
-                        "\u{F00AD}  Вы заблокировали этот узел: его личные сообщения и сообщения \
-                         в общем чате не показываются.")
-                        .color(egui::Color32::from_rgb(220, 80, 60)),
+                theme::notice(
+                    ui, theme::ERR, "\u{F00AD}",
+                    "Вы заблокировали этот узел: его личные сообщения и сообщения в общем чате \
+                     не показываются.",
                 );
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 if ui.button("Разблокировать").clicked() {
                     self.send_trust(TrustCmd::Unblock(peer_id.clone()));
                 }
                 ui.add_space(8.0);
             }
             Folder::Inbox if !has_incoming => {
-                ui.label(
-                    egui::RichText::new(
-                        "\u{F02FC}  Собеседник вам ещё не писал. Если вы для него незнакомец, \
-                         сообщения лягут к нему в «Запросы»: он увидит первые 5 и решит, принять \
-                         ли. Пока он не ответил, к сообщениям прикладывается «марка работы» — \
-                         первое за день уходит на несколько секунд дольше.")
-                        .small()
-                        .color(REQUEST_COLOR),
+                theme::notice(
+                    ui, REQUEST_COLOR, "\u{F02FC}",
+                    "Собеседник вам ещё не писал. Если вы для него незнакомец, сообщения лягут к \
+                     нему в «Запросы»: он увидит первые 5 и решит, принять ли. Пока он не ответил, \
+                     к сообщениям прикладывается «марка работы» — первое за день уходит на \
+                     несколько секунд дольше.",
                 );
                 ui.add_space(8.0);
             }
             Folder::Inbox => {}
         }
-        let messages_height = (messages_height - (ui.cursor().top() - banner_top)).max(80.0);
+
+        // Проверяем доступность отправки
+        let can_send = self.peer_profiles.get(&peer_id)
+            .and_then(|p| p.enc_pubkey.as_ref())
+            .is_some()
+            && self.peers.iter().any(|p| p.id == peer_id)
+            && self.dm_sender.is_some()
+            && folder == Folder::Inbox;
+
+        // Поле ввода закреплено внизу; высоту переписки ограничиваем до него сами
+        // (виджеты сверху-вниз панель внизу не учитывают).
+        let mut should_send = false;
+        let input_panel = egui::TopBottomPanel::bottom("private_input_panel")
+            .frame(Frame::none())
+            .show_separator_line(false)
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                ui.add_space(10.0);
+                self.input_row(ui, input_scroll_height, folder, can_send, &mut should_send);
+                ui.add_space(2.0);
+            });
+        let messages_height = (input_panel.response.rect.min.y - ui.cursor().min.y).max(0.0);
 
         // Область сообщений
         if self.conversations[selected].messages.is_empty() {
@@ -505,7 +533,7 @@ impl PrivatePage {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("Нет сообщений. Начните диалог!")
-                            .color(ui.visuals().weak_text_color()),
+                            .color(theme::TEXT_DIM),
                     );
                 });
             });
@@ -531,11 +559,8 @@ impl PrivatePage {
                             may_drop: is_me && !has_incoming && own > crate::dm_access::MAX_REQUEST_MSGS,
                         };
                         let sender = if is_me { self.my_name.clone() } else { peer_name.clone() };
-                        let (avatar, fill) = if is_me {
-                            (my_avatar.as_deref(), ui.visuals().hyperlink_color)
-                        } else {
-                            (peer_avatar.as_deref(), status_colors(peer_status.as_deref()).0)
-                        };
+                        let avatar = if is_me { my_avatar.as_deref() } else { peer_avatar.as_deref() };
+                        let fill = theme::SURFACE_3;
                         render_message(ui, &text, &time, is_me, &sender, avatar, fill, status);
                         ui.add_space(8.0);
                     }
@@ -554,67 +579,48 @@ impl PrivatePage {
                 (offset + viewport) >= (content - 75.0);
         }
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        // Поле ввода + кнопка
-        let line_count  = self.input.lines().count().clamp(1, 4);
-        let mut should_send = false;
-
-        // Проверяем доступность отправки
-        let can_send = self.peer_profiles.get(&peer_id)
-            .and_then(|p| p.enc_pubkey.as_ref())
-            .is_some()
-            && self.peers.iter().any(|p| p.id == peer_id)
-            && self.dm_sender.is_some()
-            && folder == Folder::Inbox;
-
-        ui.horizontal(|ui| {
-            let btn_w   = 100.0;
-            let spacing = ui.spacing().item_spacing.x + 20.0;
-            let avail_w = ui.available_width() - btn_w - spacing;
-
-            ui.allocate_ui(egui::vec2(avail_w, input_scroll_height), |ui| {
-                ScrollArea::vertical()
-                    .id_source("private_input_scroll")
-                    .max_height(input_scroll_height)
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui: &mut egui::Ui| {
-                        let hint = match folder {
-                            Folder::Request => "Примите запрос, чтобы ответить",
-                            Folder::Blocked => "Узел заблокирован",
-                            Folder::Inbox if can_send => "Введите сообщение… (Enter — отправить)",
-                            Folder::Inbox => "Ожидание подключения пира…",
-                        };
-                        let te = TextEdit::multiline(&mut self.input)
-                            .hint_text(hint)
-                            .desired_width(avail_w - 8.0)
-                            .desired_rows(line_count);
-
-                        let resp = ui.add_enabled(can_send, te);
-                        if resp.has_focus() {
-                            let (enter, shift) = ui.input(|i| {
-                                (i.key_pressed(egui::Key::Enter), i.modifiers.shift)
-                            });
-                            if enter && !shift {
-                                if self.input.ends_with('\n') { self.input.pop(); }
-                                should_send = true;
-                            }
-                        }
-                    });
-            });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(can_send, Button::new("󰒊 Отправить").min_size(egui::vec2(btn_w, 36.0))).clicked() {
-                    should_send = true;
-                }
-            });
-        });
-
         if should_send {
             self.send_message();
         }
+    }
+
+    /// Строка ввода: поле (растёт до 4 строк) и главная кнопка «Отправить».
+    fn input_row(&mut self, ui: &mut egui::Ui, max_h: f32, folder: Folder, can_send: bool, should_send: &mut bool) {
+        let line_count = self.input.lines().count().clamp(1, 4);
+        ui.horizontal(|ui| {
+            let btn_w = 118.0;
+            let field_w = ui.available_width() - btn_w - ui.spacing().item_spacing.x;
+            ScrollArea::vertical()
+                .id_source("private_input_scroll")
+                .max_height(max_h)
+                .max_width(field_w)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let hint = match folder {
+                        Folder::Request => "Примите запрос, чтобы ответить",
+                        Folder::Blocked => "Узел заблокирован",
+                        Folder::Inbox if can_send => "Сообщение…",
+                        Folder::Inbox => "Собеседник не в сети…",
+                    };
+                    let te = TextEdit::multiline(&mut self.input)
+                        .hint_text(hint)
+                        .desired_width(field_w)
+                        .desired_rows(line_count)
+                        .margin(egui::vec2(10.0, 8.0));
+                    let resp = ui.add_enabled(can_send, te);
+                    if resp.has_focus() {
+                        let (enter, shift) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+                        if enter && !shift {
+                            if self.input.ends_with('\n') { self.input.pop(); }
+                            *should_send = true;
+                        }
+                    }
+                });
+            let send = theme::primary_button("\u{F048A}  Отправить").min_size(egui::vec2(btn_w, 36.0));
+            if ui.add_enabled(can_send && !self.input.trim().is_empty(), send).clicked() {
+                *should_send = true;
+            }
+        });
     }
 }
 
@@ -731,14 +737,11 @@ fn render_message(
     status: MsgStatus,
 ) {
     let MsgStatus { delivery, may_drop } = status;
-    let bubble = Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(8.0))
-        .outer_margin(egui::Margin::symmetric(4.0, 2.0))
-        .fill(if is_me {
-            ui.visuals().widgets.active.bg_fill
-        } else {
-            ui.visuals().extreme_bg_color
-        });
+    let bubble = Frame::none()
+        .fill(if is_me { theme::SURFACE_3 } else { theme::SURFACE })
+        .stroke(if is_me { egui::Stroke::NONE } else { egui::Stroke::new(1.0_f32, theme::BORDER) })
+        .rounding(egui::Rounding::same(theme::R_CARD))
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0));
 
     ui.horizontal_top(|ui| {
         if is_me { ui.add_space(40.0); }
@@ -750,12 +753,9 @@ fn render_message(
             bubble.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(sender).strong()
-                            .color(if is_me {
-                                ui.visuals().strong_text_color()
-                            } else {
-                                ui.visuals().hyperlink_color
-                            }),
+                        egui::RichText::new(sender)
+                            .font(egui::FontId::new(13.5, theme::semibold()))
+                            .color(theme::TEXT_STRONG),
                     );
                     ui.add_space(8.0);
                     ui.label(
@@ -768,9 +768,9 @@ fn render_message(
                             DeliveryState::Sending =>
                                 ("󰔟", ui.visuals().weak_text_color(), "Отправляется…"),
                             DeliveryState::Delivered =>
-                                ("󰄬", egui::Color32::from_rgb(80, 180, 80), "Доставлено на узел собеседника"),
+                                ("󰄬", theme::OK, "Доставлено на узел собеседника"),
                             DeliveryState::Failed =>
-                                ("󰀪", egui::Color32::from_rgb(210, 90, 70), "Не доставлено"),
+                                ("󰀪", theme::ERR, "Не доставлено"),
                         };
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new(glyph).small().color(color))
@@ -783,7 +783,6 @@ fn render_message(
                                             он увидит только первые 5 сообщений, пока не примет запрос.");
                     }
                 });
-                ui.add_space(4.0);
                 ui.label(text);
             });
         });

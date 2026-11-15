@@ -14,7 +14,7 @@ use void_trust::{TrustInfo, TrustMap};
 use crate::backend::{TrustCmd, TrustDetails};
 
 /// Цвет подсказок «вы пока новичок».
-pub const NEWCOMER_HINT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(200, 160, 70);
+pub const NEWCOMER_HINT: eframe::egui::Color32 = crate::theme::WARN;
 
 /// За нас никто не поручился — для других узлов мы незнакомец.
 pub fn is_newcomer(my_vouchers: &Option<Arc<AtomicUsize>>) -> bool {
@@ -23,7 +23,7 @@ pub fn is_newcomer(my_vouchers: &Option<Arc<AtomicUsize>>) -> bool {
 
 /// Подсказка новичку: почему другие узлы могут не принять действие.
 pub fn newcomer_hint(ui: &mut eframe::egui::Ui, text: &str) {
-    ui.label(eframe::egui::RichText::new(format!("\u{F0026}  {text}")).small().color(NEWCOMER_HINT));
+    crate::theme::notice(ui, NEWCOMER_HINT, "\u{F0026}", text);
 }
 
 /// Доступ к снимку доверия backend (общий для страниц).

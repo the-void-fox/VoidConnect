@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use egui::{Button, Frame, RichText, ScrollArea};
+use egui::{Frame, RichText, ScrollArea};
 use tokio::sync::mpsc::UnboundedSender;
 
 use void_core::identity::NodeId;
@@ -76,10 +76,10 @@ impl VotesPage {
         let can_vote = true;
 
         ui.horizontal(|ui| {
-            ui.heading("\u{F0C30} Голосования");
+            crate::theme::page_header(ui, "\u{F0C30}", "Голосования", None);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(can_propose, Button::new(" \u{F0415} Создать"))
+                    .add_enabled(can_propose, crate::theme::primary_button("\u{F0415}  Создать"))
                     .on_disabled_hover_text("Сначала кто-то должен поручиться за вас")
                     .clicked()
                 {
@@ -166,7 +166,7 @@ impl VotesPage {
                 ui.separator();
                 let ready = self.create_ready();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(ready, Button::new("Создать")).clicked() {
+                    if ui.add_enabled(ready, crate::theme::primary_button("Создать")).clicked() {
                         if let Some(kind) = self.build_kind() {
                             if let Some(tx) = &self.propose_tx {
                                 let _ = tx.send(kind);

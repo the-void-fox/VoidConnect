@@ -142,9 +142,11 @@ pub fn show_peer_profile(
 
     // Avatar + name/status row
     ui.horizontal(|ui| {
-        let (fill, _) = status_colors(Some(status));
+        let (_, dot) = status_colors(Some(status));
         let avatar = profile.and_then(|p| p.avatar_png.as_deref());
-        crate::avatar::show_avatar(ui, avatar, name, fill, 56.0);
+        let corner = ui.cursor().min + egui::vec2(48.0, 48.0);
+        crate::avatar::show_avatar(ui, avatar, name, crate::theme::SURFACE_3, 56.0);
+        ui.painter().circle(corner, 6.0, dot, egui::Stroke::new(2.5_f32, crate::theme::SURFACE_2));
 
         ui.add_space(12.0);
         ui.vertical(|ui| {
@@ -373,8 +375,8 @@ pub fn show_peer_profile(
     ui.separator();
     ui.add_space(6.0);
 
-    let btn = egui::Button::new("󰭹  Начать беседу")
-        .min_size(egui::vec2(ui.available_width(), 32.0));
+    let btn = crate::theme::primary_button("󰭹  Начать беседу")
+        .min_size(egui::vec2(ui.available_width(), 34.0));
     let resp = ui.add_enabled(peer.is_some() || profile.is_some(), btn);
     let clicked = resp.clicked();
     if resp.hovered() && !has_dm_key {

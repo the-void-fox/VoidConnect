@@ -20,6 +20,7 @@ use void_core::peer::{PeerInfo, PeerProfile};
 use void_trust::{TrustLevel, VouchKind};
 
 use super::graph_layout::Layout;
+use crate::theme;
 use crate::widgets::peer_popup::{show_peer_profile, status_colors};
 
 /// Больше узлов не рисуем: сначала свой, свои соседи и узлы в сети.
@@ -30,10 +31,15 @@ const ME_R: f32 = 22.0;
 /// С этого масштаба подписаны все узлы (ниже — только подсвеченные).
 const LABELS_ZOOM: f32 = 0.75;
 
-const LINK_COLOR: Color32 = Color32::from_rgb(150, 160, 190);
-const VOUCH_COLOR: Color32 = Color32::from_rgb(80, 190, 110);
-const ME_COLOR: Color32 = Color32::from_rgb(80, 140, 255);
-const MATCH_COLOR: Color32 = Color32::from_rgb(240, 200, 60);
+const LINK_COLOR: Color32 = Color32::from_rgb(0x80, 0x86, 0x90);
+const VOUCH_COLOR: Color32 = theme::OK;
+const ME_COLOR: Color32 = theme::ACCENT;
+const MATCH_COLOR: Color32 = theme::WARN;
+/// Обводка по доверию (кроме «проверен лично» — [`theme::OK`], «через
+/// знакомых» — [`theme::INFO`], «заблокирован» — [`theme::ERR`]).
+const SETTLED_COLOR: Color32 = Color32::from_rgb(0xB8, 0xA9, 0x7A);
+const REPORTED_COLOR: Color32 = Color32::from_rgb(0xE0, 0x86, 0x4E);
+const STRANGER_COLOR: Color32 = Color32::from_rgb(0x6B, 0x71, 0x7C);
 
 /// Поручительство между парой узлов (в любую сторону).
 #[derive(Clone, Copy, PartialEq)]
@@ -317,7 +323,7 @@ impl Graph {
             self.selected = None;
             return;
         }
-        let mut close_popup = false;
+        let mut close_popup = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let mut start_dm = false;
         let mut report_reason = None;
         let mut vouch_action = None;
@@ -327,6 +333,7 @@ impl Graph {
             .collapsible(false)
             .resizable(false)
             .vscroll(true) // профиль выше окна приложения — иначе кнопки внизу недоступны
+            .max_height(crate::theme::max_window_height(ctx))
             .default_width(320.0)
             .show(ctx, |ui| {
                 let rep = self.peer_score(&sel_id);
@@ -382,14 +389,14 @@ impl Graph {
 /// Цвет обводки узла — доверие к нему в моих глазах.
 fn trust_color(node: &GNode) -> Color32 {
     if node.reported {
-        return Color32::from_rgb(220, 140, 60);
+        return REPORTED_COLOR;
     }
     match node.level {
-        Some(TrustLevel::Verified) => Color32::from_rgb(80, 190, 110),
-        Some(TrustLevel::Trusted)  => Color32::from_rgb(120, 170, 220),
-        Some(TrustLevel::Settled)  => Color32::from_rgb(170, 160, 120),
-        Some(TrustLevel::Blocked)  => Color32::from_rgb(220, 80, 60),
-        _                          => Color32::from_gray(120),
+        Some(TrustLevel::Verified) => theme::OK,
+        Some(TrustLevel::Trusted)  => theme::INFO,
+        Some(TrustLevel::Settled)  => SETTLED_COLOR,
+        Some(TrustLevel::Blocked)  => theme::ERR,
+        _                          => STRANGER_COLOR,
     }
 }
 
@@ -412,9 +419,7 @@ fn faded(c: Color32, k: f32) -> Color32 {
 
 impl Graph {
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.heading("\u{F1049} Граф сети");
-        ui.add_space(6.0);
+        crate::theme::page_header(ui, "\u{F1049}", "Граф сети", None);
 
         // ── Панель: поиск, фильтры, «вписать» ────────────────────────────────
         let mut fit = false;
@@ -584,13 +589,16 @@ impl Graph {
             let r = radius(i);
             let k = if is_lit(i) { 1.0 } else { 0.25 };
             let is_me = node.id == self.my_id;
-            let fill = if !node.online {
-                Color32::from_gray(70)
-            } else if is_me {
-                Color32::from_rgb(40, 90, 200)
+            // Монохром: свой узел белый, остальные серые (не в сети — темнее);
+            // статус пира — точка внизу справа, доверие — цвет обводки.
+            let (fill, letter) = if is_me {
+                (theme::TEXT_STRONG, theme::BG)
+            } else if node.online {
+                (theme::SURFACE_3, theme::TEXT_STRONG)
             } else {
-                status_colors(self.profiles.get(&node.id).map(|p| p.status.as_str())).0
+                (Color32::from_rgb(0x15, 0x17, 0x1B), theme::TEXT_FAINT)
             };
+            painter.circle_filled(pos, r, theme::BG); // подложка: приглушённый узел не просвечивает
             if let Some((_, tex)) = self.avatar_tex.get(&node.id) {
                 crate::avatar::paint_circle_avatar(&painter, tex.id(), pos, r);
                 if k < 1.0 || !node.online {
@@ -602,12 +610,19 @@ impl Graph {
                     .map(|c| c.to_uppercase().to_string())
                     .unwrap_or_else(|| "?".into());
                 painter.text(pos, egui::Align2::CENTER_CENTER, initial,
-                    egui::FontId::proportional(r * 0.9), faded(Color32::WHITE, k));
+                    egui::FontId::new(r * 0.85, theme::semibold()), faded(letter, k));
             }
             let ring = if is_me { ME_COLOR } else { trust_color(node) };
             painter.circle_stroke(pos, r, Stroke::new(2.5_f32, faded(ring, k)));
             if matches.contains(&i) {
                 painter.circle_stroke(pos, r + 4.0, Stroke::new(2.0_f32, MATCH_COLOR));
+            }
+            if node.online && !is_me {
+                let status = status_colors(self.profiles.get(&node.id).map(|p| p.status.as_str())).1;
+                painter.circle(
+                    pos + Vec2::splat(r * 0.72), (r * 0.24).max(3.0),
+                    faded(status, k), Stroke::new(2.0_f32, theme::BG),
+                );
             }
             if self.layout.is_pinned(&node.id) && !is_me {
                 painter.circle_filled(pos + Vec2::new(r * 0.75, -r * 0.75), 3.0, faded(MATCH_COLOR, k));
@@ -619,13 +634,13 @@ impl Graph {
                 || lit.as_ref().is_some_and(|s| s.contains(&i));
             if labeled {
                 painter.text(pos + Vec2::new(0.0, r + 8.0), egui::Align2::CENTER_CENTER,
-                    &node.name, egui::FontId::proportional(11.0), faded(Color32::from_gray(210), k));
+                    &node.name, egui::FontId::proportional(11.5), faded(theme::TEXT, k));
             }
         }
 
         if nodes.len() <= 1 {
             painter.text(rect.center() + Vec2::new(0.0, 60.0), egui::Align2::CENTER_CENTER,
-                "Ищем узлы в сети…", egui::FontId::proportional(14.0), Color32::from_gray(120));
+                "Ищем узлы в сети…", egui::FontId::proportional(14.0), theme::TEXT_DIM);
         }
 
         // Подсказка у курсора (не поверх открытого меню и не во время перетаскивания).
@@ -705,17 +720,17 @@ impl Graph {
     /// Легенда в углу: цвета доверия, виды связей, счётчики.
     fn paint_legend(&self, painter: &egui::Painter, rect: egui::Rect, nodes: usize, edges: usize) {
         let font = egui::FontId::proportional(11.0);
-        let text = Color32::from_gray(170);
+        let text = theme::TEXT_DIM;
         let mut y = rect.bottom() - 12.0;
         let x = rect.left() + 12.0;
         /// Образец в легенде: кружок узла, линия, пунктир.
         enum Sample { Ring, Line, Dashed }
         let mut rows: Vec<(Color32, &str, Sample)> = vec![
-            (Color32::from_rgb(80, 190, 110), "проверен лично", Sample::Ring),
-            (Color32::from_rgb(120, 170, 220), "через знакомых", Sample::Ring),
-            (Color32::from_rgb(170, 160, 120), "освоившийся", Sample::Ring),
-            (Color32::from_gray(120), "незнакомец", Sample::Ring),
-            (Color32::from_rgb(220, 140, 60), "под жалобами", Sample::Ring),
+            (theme::OK, "проверен лично", Sample::Ring),
+            (theme::INFO, "через знакомых", Sample::Ring),
+            (SETTLED_COLOR, "освоившийся", Sample::Ring),
+            (STRANGER_COLOR, "незнакомец", Sample::Ring),
+            (REPORTED_COLOR, "под жалобами", Sample::Ring),
             (LINK_COLOR, "соединение", Sample::Line),
         ];
         if self.filters.unconfirmed {

@@ -313,11 +313,7 @@ impl StoragePage {
         self.sync_from_backend();
 
         // === Заголовок ===
-        ui.add_space(8.0);
-        ui.heading("\u{F02CA} Хранилище");
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+        crate::theme::page_header(ui, "\u{F02CA}", "Хранилище", Some("Файлы, которыми делятся узлы сети"));
 
         // === Поиск ===
         ui.add(
@@ -354,7 +350,7 @@ impl StoragePage {
                 }
             }
             let enabled = self.publish_tx.is_some() && !self.publish_path.trim().is_empty();
-            if ui.add_enabled(enabled, Button::new("󰐕  Опубликовать").min_size(egui::vec2(pub_w, 28.0))).clicked() {
+            if ui.add_enabled(enabled, crate::theme::primary_button("󰐕  Опубликовать").min_size(egui::vec2(pub_w, 28.0))).clicked() {
                 do_publish = true;
             }
         });

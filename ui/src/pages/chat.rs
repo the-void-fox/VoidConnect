@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use eframe::egui;
-use egui::{Button, Frame, ScrollArea, TextEdit};
+use egui::{Frame, ScrollArea, TextEdit};
 use void_chat::trust_limits::NEWCOMERS_CHANNEL;
 use void_core::identity::NodeId;
 use void_core::peer::{PeerInfo, PeerProfile};
 use void_trust::TrustLevel;
+use crate::theme;
 use crate::widgets::peer_popup::{status_colors, show_peer_profile};
 
 /// Каналы («доски») общего чата: (id, иконка Nerd Font, название).
@@ -57,9 +58,9 @@ struct OwnPace {
 }
 
 /// Метка сообщения незнакомца.
-const NEWCOMER_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 70);
+const NEWCOMER_COLOR: egui::Color32 = theme::WARN;
 /// Метка сообщения узла под жалобами.
-const REPORTED_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 120, 60);
+const REPORTED_COLOR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x86, 0x4E);
 
 /// Как показать сообщение (по доверию к автору).
 #[derive(Default, Clone, Copy)]
@@ -224,7 +225,7 @@ impl ChatPage {
     /// Подсказка под полем ввода: почему сообщение может не дойти.
     fn input_note(&self) -> Option<(String, egui::Color32)> {
         if let Some(e) = &self.send_error {
-            return Some((e.clone(), egui::Color32::from_rgb(220, 90, 70)));
+            return Some((e.clone(), theme::ERR));
         }
         if self.chat_links.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0) {
             return Some((
@@ -307,12 +308,16 @@ impl ChatPage {
             let peer    = self.peers.iter().find(|p| p.id == sel_id).cloned();
             let profile = self.profiles.get(&sel_id).cloned();
 
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_popup = true;
+            }
             if peer.is_some() || profile.is_some() {
                 egui::Window::new("Профиль участника")
                     .id(egui::Id::new("chat_peer_profile_popup"))
                     .collapsible(false)
                     .resizable(false)
                     .vscroll(true) // профиль выше окна приложения — иначе кнопки внизу недоступны
+                    .max_height(crate::theme::max_window_height(ui.ctx()))
                     .default_width(320.0)
                     .show(ui.ctx(), |ui| {
                         let rep = self.peer_score(&sel_id);
@@ -371,9 +376,7 @@ impl ChatPage {
 
         let line_height        = ui.text_style_height(&egui::TextStyle::Body);
         let max_input_lines    = 4;
-        let input_scroll_h     = line_height * max_input_lines as f32 + 12.0;
-        let input_area_total_h = input_scroll_h + 32.0;
-        ui.add_space(8.0);
+        let input_scroll_h     = line_height * max_input_lines as f32 + 16.0;
         // Заголовок = текущий канал («доска»). Имя ищем и среди проголосованных.
         let (ch_icon, ch_name) = self
             .all_channels()
@@ -385,12 +388,15 @@ impl ChatPage {
                 (i.to_string(), n)
             });
         ui.horizontal(|ui| {
-            ui.heading(format!("{}  {}", ch_icon, ch_name));
+            ui.label(egui::RichText::new(&ch_icon).size(20.0).color(theme::TEXT_DIM));
             ui.label(
-                egui::RichText::new("· общий чат").color(ui.visuals().weak_text_color()),
+                egui::RichText::new(&ch_name)
+                    .font(egui::FontId::new(20.0, theme::semibold()))
+                    .color(theme::TEXT_STRONG),
             );
+            ui.label(egui::RichText::new("· общий чат").color(theme::TEXT_DIM));
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
         // Панель каналов («доски» в духе форчана): встроенные + добавленные
         // голосованием.
@@ -411,24 +417,24 @@ impl ChatPage {
         ui.separator();
         ui.add_space(4.0);
 
-        let weak = ui.visuals().weak_text_color();
         if self.current_channel == NEWCOMERS_CHANNEL {
             ui.label(
                 egui::RichText::new(
                     "Канал для знакомства: здесь пишут и те, за кого ещё никто не поручился.")
-                    .small().color(weak),
+                    .small().color(theme::TEXT_DIM),
             );
             ui.add_space(4.0);
         } else if self.my_vouchers.as_ref().is_some_and(|n| n.load(Ordering::Relaxed) == 0) {
-            ui.label(
-                egui::RichText::new(
-                    "\u{F02FC}  За вас ещё никто не поручился, поэтому другие узлы пропускают \
-                     ваши сообщения в этот канал не чаще раза в 30 секунд. В канале «Новички» \
-                     такого лимита нет. Чтобы его снять, сверьте код безопасности со знакомым \
-                     и попросите его поручиться за вас.")
-                    .small().color(NEWCOMER_COLOR),
+            theme::notice(
+                ui,
+                NEWCOMER_COLOR,
+                "\u{F02FC}",
+                "За вас ещё никто не поручился, поэтому другие узлы пропускают ваши сообщения \
+                 в этот канал не чаще раза в 30 секунд. В канале «Новички» такого лимита нет. \
+                 Чтобы его снять, сверьте код безопасности со знакомым и попросите его \
+                 поручиться за вас.",
             );
-            ui.add_space(4.0);
+            ui.add_space(6.0);
         }
 
         // Высоту области сообщений считаем здесь — после панели каналов, чтобы
@@ -438,8 +444,25 @@ impl ChatPage {
             // Обратный отсчёт до следующего сообщения — обновляем раз в секунду.
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
-        let note_h = if input_note.is_some() { line_height + 6.0 } else { 0.0 };
-        let messages_h = (ui.available_height() - input_area_total_h - note_h).max(100.0);
+        // Поле ввода закреплено внизу, сообщения занимают остальное место — при
+        // любой высоте окна ничего не вылезает за край страницы.
+        let mut should_send = false;
+        let input_panel = egui::TopBottomPanel::bottom("chat_input_panel")
+            .frame(Frame::none())
+            .show_separator_line(false)
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                ui.add_space(10.0);
+                if let Some((note, color)) = &input_note {
+                    ui.label(egui::RichText::new(note).small().color(*color));
+                    ui.add_space(6.0);
+                }
+                self.input_row(ui, input_scroll_h, &mut should_send);
+                ui.add_space(2.0);
+            });
+        // Панель сдвигает только курсор, а виджеты сверху-вниз смотрят на нижний
+        // край всей области — высоту сообщений ограничиваем сами.
+        let messages_h = (input_panel.response.rect.min.y - ui.cursor().min.y).max(0.0);
 
         // Есть ли сообщения в текущем канале (для заглушки пустого состояния).
         let channel_has_msgs = self.messages.iter().any(|m| m.channel == self.current_channel);
@@ -470,6 +493,8 @@ impl ChatPage {
         let level_of = |m: &ChatMessage| m.from_id.as_ref().and_then(|id| levels.get(id)).map(|l| l.0);
         let reported = |m: &ChatMessage| m.from_id.as_ref().and_then(|id| levels.get(id)).is_some_and(|l| l.1);
 
+        // Отступ заглушки пустого канала — до середины области сообщений.
+        let empty_pad = (messages_h / 2.0 - 30.0).max(0.0);
         let scroll_out = ScrollArea::vertical()
             .id_source("chat_messages_scroll")
             .max_height(messages_h)
@@ -477,7 +502,7 @@ impl ChatPage {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if !channel_has_msgs {
-                    ui.add_space(messages_h / 2.0 - 20.0);
+                    ui.add_space(empty_pad);
                     ui.vertical_centered(|ui| {
                         ui.label(
                             egui::RichText::new(format!(
@@ -538,54 +563,42 @@ impl ChatPage {
         let content_h      = scroll_out.content_size.y;
         self.was_at_bottom = (scroll_offset + viewport_h) >= (content_h - 50.0);
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        if let Some((note, color)) = &input_note {
-            ui.label(egui::RichText::new(note).small().color(*color));
-            ui.add_space(6.0);
-        }
-
-        let mut should_send = false;
-        let line_count      = self.input.lines().count().clamp(1, 4);
-
-        ui.horizontal(|ui| {
-            let btn_w   = 90.0;
-            let spacing = ui.spacing().item_spacing.x + 20.0;
-            let avail_w = ui.available_width() - btn_w - spacing;
-
-            ui.allocate_ui(egui::vec2(avail_w, input_scroll_h), |ui| {
-                ScrollArea::vertical()
-                    .id_source("input_scroll")
-                    .max_height(input_scroll_h)
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui: &mut egui::Ui| {
-                        let te = TextEdit::multiline(&mut self.input)
-                            .hint_text("Введите сообщение...")
-                            .desired_width(avail_w - 8.0)
-                            .desired_rows(line_count);
-                        let resp = ui.add(te);
-                        if resp.has_focus() {
-                            let (enter, shift) = ui.input(|i| {
-                                (i.key_pressed(egui::Key::Enter), i.modifiers.shift)
-                            });
-                            if enter && !shift {
-                                if self.input.ends_with('\n') { self.input.pop(); }
-                                should_send = true;
-                            }
-                        }
-                    });
-            });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_sized([btn_w, 36.0], Button::new("󰒊 Отправить")).clicked() {
-                    should_send = true;
-                }
-            });
-        });
-
         if should_send { self.send_message(); }
+    }
+
+    /// Строка ввода: многострочное поле (растёт до 4 строк, дальше прокрутка)
+    /// и главная кнопка «Отправить». Enter отправляет, Shift+Enter — перенос.
+    fn input_row(&mut self, ui: &mut egui::Ui, max_h: f32, should_send: &mut bool) {
+        let line_count = self.input.lines().count().clamp(1, 4);
+        ui.horizontal(|ui| {
+            let btn_w = 118.0;
+            let field_w = ui.available_width() - btn_w - ui.spacing().item_spacing.x;
+            ScrollArea::vertical()
+                .id_source("input_scroll")
+                .max_height(max_h)
+                .max_width(field_w)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let resp = ui.add(
+                        TextEdit::multiline(&mut self.input)
+                            .hint_text("Сообщение…")
+                            .desired_width(field_w)
+                            .desired_rows(line_count)
+                            .margin(egui::vec2(10.0, 8.0)),
+                    );
+                    if resp.has_focus() {
+                        let (enter, shift) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+                        if enter && !shift {
+                            if self.input.ends_with('\n') { self.input.pop(); }
+                            *should_send = true;
+                        }
+                    }
+                });
+            let send = theme::primary_button("\u{F048A}  Отправить").min_size(egui::vec2(btn_w, 36.0));
+            if ui.add_enabled(!self.input.trim().is_empty(), send).clicked() {
+                *should_send = true;
+            }
+        });
     }
 
     fn render_message(
@@ -626,33 +639,24 @@ impl ChatPage {
                 .and_then(|id| profiles.get(id))
                 .and_then(|p| p.avatar_png.as_deref())
         };
-        let avatar_fill = if msg.is_me {
-            ui.visuals().hyperlink_color
-        } else {
-            status_colors(status).0
-        };
-
-        // Name color: status-tinted for others, default for self
-        let name_color = if msg.is_me {
-            ui.visuals().strong_text_color()
-        } else {
-            let (_, stroke) = status_colors(status);
-            stroke
-        };
-
-        let bubble = Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(8.0))
-            .outer_margin(egui::Margin::symmetric(4.0, 2.0))
-            .fill(if msg.is_me {
-                ui.visuals().widgets.active.bg_fill
-            } else {
-                ui.visuals().extreme_bg_color
-            });
+        // Монохром: имена и аватары нейтральные, статус автора — точка у аватара.
+        let name_color = theme::TEXT_STRONG;
+        let bubble = Frame::none()
+            .fill(if msg.is_me { theme::SURFACE_3 } else { theme::SURFACE })
+            .stroke(if msg.is_me { egui::Stroke::NONE } else { egui::Stroke::new(1.0_f32, theme::BORDER) })
+            .rounding(egui::Rounding::same(theme::R_CARD))
+            .inner_margin(egui::Margin::symmetric(12.0, 8.0));
 
         ui.horizontal_top(|ui| {
-            crate::avatar::show_avatar(ui, avatar_b64, &display_name, avatar_fill, 28.0);
-            ui.add_space(6.0);
+            const AVATAR: f32 = 30.0;
+            let corner = ui.cursor().min + egui::vec2(AVATAR - 4.0, AVATAR - 4.0);
+            crate::avatar::show_avatar(ui, avatar_b64, &display_name, theme::SURFACE_3, AVATAR);
+            if !msg.is_me {
+                ui.painter().circle(corner, 4.5, status_colors(status).1, egui::Stroke::new(2.0_f32, theme::BG));
+            }
+            ui.add_space(4.0);
             ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width() * 0.88);
                 bubble.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if !msg.is_me {
@@ -660,7 +664,7 @@ impl ChatPage {
                             let resp = ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&display_name)
-                                        .strong()
+                                        .font(egui::FontId::new(13.5, theme::semibold()))
                                         .color(name_color)
                                 )
                                 .sense(egui::Sense::click())
@@ -674,7 +678,9 @@ impl ChatPage {
                             resp.on_hover_text("Нажмите, чтобы посмотреть профиль");
                         } else {
                             ui.label(
-                                egui::RichText::new(&display_name).strong().color(name_color)
+                                egui::RichText::new(&display_name)
+                                    .font(egui::FontId::new(13.5, theme::semibold()))
+                                    .color(name_color)
                             );
                         }
 
@@ -723,7 +729,6 @@ impl ChatPage {
                             }
                         }
                     });
-                    ui.add_space(4.0);
                     if fold == Some(true) {
                         let what = if reported { "Сообщение узла под жалобами" } else { "Сообщение незнакомца" };
                         let show = egui::RichText::new(format!("{what} свёрнуто — показать"))

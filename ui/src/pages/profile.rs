@@ -81,11 +81,8 @@ impl ProfilePage {
         // Авто-отправка профиля если изменилось имя/описание/статус
         self.maybe_send_profile();
 
-        ui.add_space(8.0);
-        ui.heading("\u{F0009} Профиль");
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(16.0);
+        crate::theme::page_header(ui, "\u{F0009}", "Профиль", Some("Так вас видят другие узлы"));
+        ui.add_space(4.0);
 
         if self.bootstrap {
             ui.label(
@@ -142,7 +139,7 @@ impl ProfilePage {
         // ── Аватар + основная инфо ──────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                let fill = ui.visuals().hyperlink_color;
+                let fill = crate::theme::SURFACE_3;
                 crate::avatar::show_avatar(ui, self.avatar_png.as_deref(), &self.name, fill, 72.0);
                 ui.add_space(4.0);
                 if ui.add_sized([72.0, 22.0],
@@ -227,7 +224,7 @@ impl ProfilePage {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("󰆓 Сохранить и поделиться").clicked() {
+            if ui.add(crate::theme::primary_button("󰆓  Сохранить и поделиться")).clicked() {
                 self.send_profile();
             }
             ui.label(

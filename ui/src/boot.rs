@@ -101,54 +101,67 @@ impl BootApp {
     }
 
     fn show_unlock(ctx: &egui::Context, password: &mut String, error: &Option<String>) -> bool {
+        use crate::theme;
         let mut submit = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(120.0);
-                ui.heading("\u{F033E}  Void Connect");
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("Аккаунт защищён паролем")
-                        .size(16.0)
-                        .strong(),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Введите пароль, чтобы расшифровать ключи и войти.",
-                    )
-                    .color(ui.visuals().weak_text_color()),
-                );
-                ui.add_space(16.0);
-
-                let resp = ui.add(
-                    egui::TextEdit::singleline(password)
-                        .password(true)
-                        .hint_text("Пароль")
-                        .desired_width(260.0),
-                );
-                // Enter в поле = отправка.
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
-                }
-
-                ui.add_space(10.0);
-                if ui
-                    .add_sized([260.0, 32.0], egui::Button::new("\u{F0FC6}  Разблокировать"))
-                    .clicked()
-                {
-                    submit = true;
-                }
-
-                if let Some(err) = error {
-                    ui.add_space(10.0);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(theme::BG))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() / 2.0 - 190.0).max(24.0));
+                    ui.label(egui::RichText::new("\u{F02D9}").size(56.0).color(theme::ACCENT));
+                    ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(format!("\u{F0026}  {err}"))
-                            .color(egui::Color32::from_rgb(220, 80, 60)),
+                        egui::RichText::new("Void Connect")
+                            .font(egui::FontId::new(24.0, theme::semibold()))
+                            .color(theme::TEXT_STRONG),
                     );
-                }
+                    ui.add_space(20.0);
+
+                    theme::card_frame().inner_margin(egui::Margin::same(20.0)).show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("\u{F033E}  Аккаунт защищён паролем")
+                                    .font(egui::FontId::new(15.0, theme::semibold()))
+                                    .color(theme::TEXT_STRONG),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Введите пароль, чтобы расшифровать ключи и войти.")
+                                    .size(12.5)
+                                    .color(theme::TEXT_DIM),
+                            );
+                            ui.add_space(14.0);
+
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(password)
+                                    .password(true)
+                                    .hint_text("Пароль")
+                                    .margin(egui::vec2(10.0, 8.0))
+                                    .desired_width(f32::INFINITY),
+                            );
+                            // Курсор сразу в поле пароля (если фокус ни на чём другом).
+                            ui.memory_mut(|m| if m.focused().is_none() { m.request_focus(resp.id) });
+                            // Enter в поле = отправка.
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                submit = true;
+                            }
+
+                            ui.add_space(10.0);
+                            let unlock = theme::primary_button("\u{F0FC6}  Разблокировать")
+                                .min_size(egui::vec2(ui.available_width(), 36.0));
+                            if ui.add(unlock).clicked() {
+                                submit = true;
+                            }
+
+                            if let Some(err) = error {
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new(format!("\u{F0026}  {err}")).color(theme::ERR));
+                            }
+                        });
+                    });
+                });
             });
-        });
         submit
     }
 }

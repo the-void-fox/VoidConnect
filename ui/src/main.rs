@@ -9,6 +9,7 @@ mod profile_store;
 mod private_store;
 mod settings_store;
 mod sys_open;
+mod theme;
 mod trust_ui;
 mod verify_store;
 mod vote_service;
@@ -132,30 +133,16 @@ fn main() -> eframe::Result<()> {
         "Void Connect",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            theme::install(&cc.egui_ctx);
             // Загрузчики изображений (для аватарок из PNG-байтов).
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            install_fonts(&cc.egui_ctx);
-            cc.egui_ctx.set_pixels_per_point(1.5);
+            // Масштаб поверх системного (на HiDPI-экранах он уже больше 1);
+            // Ctrl+плюс / Ctrl+минус меняют его на ходу.
+            cc.egui_ctx.set_zoom_factor(1.25);
 
             Box::new(boot::BootApp::new(params))
         }),
     )
-}
-
-/// Устанавливает встроенный FiraCode Nerd Font (иконки nf-md/nf-fa) как первый
-/// в обоих семействах. Общая настройка для рабочего и заблокированного окна.
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let font_bytes = include_bytes!("assets/fonts/FiraCode.ttf").to_vec();
-    fonts.font_data.insert(
-        "FiraCode".to_owned(),
-        egui::FontData::from_owned(font_bytes),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().insert(0, "FiraCode".to_owned());
-    }
-    ctx.set_fonts(fonts);
 }
 
 /// Окно «доступ заблокирован»: бэкенд НЕ запускается (никаких сетевых/файловых
@@ -176,9 +163,8 @@ fn run_locked_ui(
         "Void Connect",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            install_fonts(&cc.egui_ctx);
-            cc.egui_ctx.set_pixels_per_point(1.4);
+            theme::install(&cc.egui_ctx);
+            cc.egui_ctx.set_zoom_factor(1.2);
             Box::new(LockedApp {
                 data_dir: data_dir.display().to_string(),
                 recorded,
@@ -210,7 +196,7 @@ impl eframe::App for LockedApp {
                 ui.label(
                     egui::RichText::new("\u{F0026}")
                         .size(46.0)
-                        .color(egui::Color32::from_rgb(220, 150, 60)),
+                        .color(theme::WARN),
                 );
                 ui.add_space(6.0);
                 ui.heading("Доступ заблокирован");
