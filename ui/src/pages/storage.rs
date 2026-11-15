@@ -63,6 +63,7 @@ impl FileStatus {
     }
 }
 
+#[derive(Default)]
 pub struct StoragePage {
     pub files: Vec<FileEntry>,
     pub search: String,
@@ -95,28 +96,6 @@ pub struct StoragePage {
     pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
-impl Default for StoragePage {
-    fn default() -> Self {
-        Self {
-            files: Vec::new(),
-            search: String::new(),
-            report_target: None,
-            publish_tx: None,
-            download_tx: None,
-            storage_files: None,
-            publish_path: String::new(),
-            downloading: HashSet::new(),
-            downloads_dir: None,
-            pending_delete: None,
-            pending_open: None,
-            peer_profiles: None,
-            my_id: None,
-            my_name: String::new(),
-            pending_report: None,
-            my_vouchers: None,
-        }
-    }
-}
 
 /// Группа файлов одного публикатора — «папка» пользователя.
 struct OwnerGroup {
@@ -855,14 +834,13 @@ fn table_row(
                                 *action = Some((idx, RowAction::Delete));
                                 ui.close_menu();
                             }
-                        } else if can_remove_local {
-                            if ui.button(RichText::new("\u{F0A7A}  Убрать мою копию")
+                        } else if can_remove_local
+                            && ui.button(RichText::new("\u{F0A7A}  Убрать мою копию")
                                 .color(egui::Color32::from_rgb(220, 160, 80))).clicked()
                             {
                                 *action = Some((idx, RowAction::RemoveLocal));
                                 ui.close_menu();
                             }
-                        }
                     });
                 });
             });

@@ -24,6 +24,7 @@
 //!   * `Register{node_id}`     — это контрольное соединение узла;
 //!   * `Open{session,from,to}` — это data-соединение инициатора A;
 //!   * `Accept{session}`       — это data-соединение принимающего B.
+//!
 //! После спаривания relay шлёт обеим сторонам `Ready` и переходит в режим
 //! двунаправленной перекачки сырых байт (`copy_bidirectional`).
 
@@ -213,12 +214,8 @@ async fn serve_control(
 
     // Читающая половина: клиент шлёт Ping/Pong; разрыв = конец соединения.
     let read_task = tokio::spawn(async move {
-        loop {
-            match read_frame(&mut rd).await {
-                Ok(_) => {} // Ping/Pong/прочее игнорируем
-                Err(_) => break,
-            }
-        }
+        // Ping/Pong/прочее игнорируем.
+        while read_frame(&mut rd).await.is_ok() {}
     });
 
     tokio::select! {
@@ -228,11 +225,10 @@ async fn serve_control(
 
     // Снимаем регистрацию (только если это всё ещё мы — не затёрли реконнектом).
     let mut reg = inner.registry.lock().await;
-    if let Some(existing) = reg.get(&node_id) {
-        if existing.is_closed() {
+    if let Some(existing) = reg.get(&node_id)
+        && existing.is_closed() {
             reg.remove(&node_id);
         }
-    }
     debug!("Relay: control for {} closed", node_id);
     Ok(())
 }

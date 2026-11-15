@@ -141,15 +141,14 @@ impl VoidApp {
         graph.topology = Some(std::sync::Arc::clone(&backend.topology));
 
         // Инициализируем страницу личных сообщений
-        let mut private = PrivatePage::default();
-        private.my_enc_kp  = Some(std::sync::Arc::clone(&backend.my_enc_kp));
-        private.my_enc_pub = backend.my_enc_kp.public_bytes();
-        private.dm_sender  = Some(backend.dm_sender.clone());
-        private.my_node_id = Some(backend.my_id_node.clone());
-        private.my_name    = backend.my_name.clone();
-        private.base_port  = backend.base_port;
-        private.access     = Some(std::sync::Arc::clone(&backend.dm_access));
-        private.trust_tx   = Some(backend.trust_tx.clone());
+        let mut private = PrivatePage {
+            my_enc_kp:  Some(std::sync::Arc::clone(&backend.my_enc_kp)),
+            dm_sender:  Some(backend.dm_sender.clone()),
+            my_name:    backend.my_name.clone(),
+            access:     Some(std::sync::Arc::clone(&backend.dm_access)),
+            trust_tx:   Some(backend.trust_tx.clone()),
+            ..PrivatePage::default()
+        };
         // Загружаем историю с диска
         private.load_history_from_disk();
 

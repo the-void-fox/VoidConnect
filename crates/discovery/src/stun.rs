@@ -81,11 +81,10 @@ pub fn parse_mapped_address(resp: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> 
                     return Some(sa); // XOR предпочтительнее — возвращаем сразу
                 }
             }
-            ATTR_MAPPED_ADDRESS => {
-                if plain.is_none() {
+            ATTR_MAPPED_ADDRESS
+                if plain.is_none() => {
                     plain = parse_plain_mapped(val);
                 }
-            }
             _ => {}
         }
         // атрибуты выровнены по 4 байта

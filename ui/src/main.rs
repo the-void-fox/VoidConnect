@@ -150,7 +150,7 @@ fn install_fonts(ctx: &egui::Context) {
     let font_bytes = include_bytes!("assets/fonts/FiraCode.ttf").to_vec();
     fonts.font_data.insert(
         "FiraCode".to_owned(),
-        egui::FontData::from_owned(font_bytes).into(),
+        egui::FontData::from_owned(font_bytes),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(family).or_default().insert(0, "FiraCode".to_owned());

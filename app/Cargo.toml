@@ -11,7 +11,6 @@ void-chat = { path = "../crates/chat" }
 
 # Зависимости из workspace
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

@@ -217,15 +217,14 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         let n = hs.read_message(&msg, &mut payload).map_err(noise_err)?;
         let remote = hs.get_remote_static().ok_or_else(|| denied("нет ключа собеседника"))?;
         let peer = verify_binding(&payload[..n], remote)?;
-        if let Some(exp) = expected {
-            if *exp != peer {
+        if let Some(exp) = expected
+            && *exp != peer {
                 return Err(denied(&format!(
                     "на том конце узел {}, ожидался {}",
                     short(&peer),
                     short(exp)
                 )));
             }
-        }
         // -> s, se + наш binding (только после проверки собеседника)
         let n = hs.write_message(&me.inner.binding, &mut out).map_err(noise_err)?;
         write_handshake_frame(&mut io, &out[..n]).await?;
@@ -485,7 +484,7 @@ mod tests {
         let (me, impostor, alice) = (identity(1), identity(2), identity(3));
         let (client, _server) =
             pair(&me, &impostor, Channel::Dm, Channel::Dm, Some(alice.node_id().clone())).await;
-        let err = client.err().expect("подмена собеседника должна быть обнаружена");
+        let err = client.expect_err("подмена собеседника должна быть обнаружена");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -511,7 +510,7 @@ mod tests {
         };
         let (client, server) = pair(&forged, &server_id, Channel::Dm, Channel::Dm, None).await;
         let _ = client;
-        let err = server.err().expect("сервер должен отклонить чужую привязку");
+        let err = server.expect_err("сервер должен отклонить чужую привязку");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 

@@ -225,6 +225,9 @@ pub enum TrustCmd {
 /// Карта соединений сети: узел → его соседи (см. `void_chat::topology`).
 pub type TopologyMap = HashMap<NodeId, Vec<NodeId>>;
 
+/// Жалобы на узлы: узел → жалобы на него.
+pub type ReportsMap = HashMap<NodeId, Vec<void_db::peers::ReportRow>>;
+
 /// Подробности сети доверия для GUI: кого я поприветствовал и что мой узел
 /// видел за узлами (подсказка «когда освоится по поведению»).
 #[derive(Default, Clone)]
@@ -641,7 +644,7 @@ pub struct BackendHandle {
     /// Снимок репутации известных узлов: NodeId → score (обновляется ~2с).
     pub peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>,
     /// Снимок жалоб на известные узлы: NodeId → список жалоб (дошедших до нас).
-    pub reports: Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>,
+    pub reports: Arc<Mutex<ReportsMap>>,
     /// Канал GUI → backend: пожаловаться на узел (target, причина).
     pub report_tx: tokio::sync::mpsc::UnboundedSender<(NodeId, ReportReason)>,
     /// Запущены ли мы в публичном (bootstrap) режиме.
@@ -720,7 +723,7 @@ pub fn start_backend(
     let chat_history:  Arc<Mutex<Option<Vec<ChatMessage>>>>     = Arc::new(Mutex::new(None));
     let storage_files: Arc<Mutex<Vec<StorageFileInfo>>>         = Arc::new(Mutex::new(Vec::new()));
     let peer_reputation: Arc<Mutex<HashMap<NodeId, f64>>>       = Arc::new(Mutex::new(HashMap::new()));
-    let reports: Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let reports: Arc<Mutex<ReportsMap>> = Arc::new(Mutex::new(HashMap::new()));
     let reachability: Arc<Mutex<void_discovery::bootstrap::Reachability>> =
         Arc::new(Mutex::new(void_discovery::bootstrap::Reachability::Unknown));
 
@@ -923,7 +926,7 @@ async fn backend_main(
     download_rx: tokio::sync::mpsc::UnboundedReceiver<DownloadCmd>,
     storage_files_out: Arc<Mutex<Vec<StorageFileInfo>>>,
     reputation_out: Arc<Mutex<HashMap<NodeId, f64>>>,
-    reports_out: Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>,
+    reports_out: Arc<Mutex<ReportsMap>>,
     mut report_rx: tokio::sync::mpsc::UnboundedReceiver<(NodeId, ReportReason)>,
     publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out: Arc<Mutex<Vec<SiteInfo>>>,
@@ -1525,7 +1528,7 @@ async fn backend_main(
 
             // Снимок жалоб на текущие узлы (для просмотра в профиле). Реже —
             // раз в ~10с, т.к. жалобы меняются нечасто. Только дошедшие до нас.
-            if tick % 5 == 0 {
+            if tick.is_multiple_of(5) {
                 if let Some(pool) = &reports_pool {
                     let mut map: HashMap<NodeId, Vec<void_db::peers::ReportRow>> = HashMap::new();
                     for id in &cur_ids {
@@ -1697,7 +1700,6 @@ async fn backend_main(
 /// Запускает фоновые задачи сайтов: локальный HTTP-сервер раздачи (с докачкой
 /// файлов чужих сайтов по запросу), публикацию каталогов как сайтов с рассылкой
 /// по сети и обнаружение чужих сайтов через relay чата. Реестр in-memory.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn start_site_tasks(
     manager:    StorageManager,
@@ -2469,7 +2471,7 @@ fn start_vote_tasks(
                         finalized: sp.closed_at.is_some(),
                     });
                 }
-                views.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                views.sort_by_key(|v| std::cmp::Reverse(v.created_at));
                 *proposals_out.lock().unwrap() = views;
             }
         });

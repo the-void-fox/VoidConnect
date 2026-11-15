@@ -1,4 +1,4 @@
-/// error.rs — единый тип ошибок крейта void-crypto.
+//! error.rs — единый тип ошибок крейта void-crypto.
 
 use thiserror::Error;
 

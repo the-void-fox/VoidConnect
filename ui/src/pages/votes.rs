@@ -33,6 +33,7 @@ impl NewKind {
     }
 }
 
+#[derive(Default)]
 pub struct VotesPage {
     // Данные из backend.
     pub proposals:     Option<Arc<Mutex<Vec<ProposalView>>>>,
@@ -55,27 +56,6 @@ pub struct VotesPage {
     channel_name: String,
 }
 
-impl Default for VotesPage {
-    fn default() -> Self {
-        Self {
-            proposals:     None,
-            propose_tx:    None,
-            vote_cast_tx:  None,
-            my_vouchers:   None,
-            peers:         None,
-            profiles:      None,
-            storage_files: None,
-            snapshot:      Vec::new(),
-            vouchers:      0,
-            show_create:   false,
-            new_kind:      NewKind::default(),
-            target_node:   String::new(),
-            target_file:   String::new(),
-            channel_id:    String::new(),
-            channel_name:  String::new(),
-        }
-    }
-}
 
 impl VotesPage {
     fn sync(&mut self) {

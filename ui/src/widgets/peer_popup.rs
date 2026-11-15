@@ -120,6 +120,7 @@ pub fn status_colors(status: Option<&str>) -> (egui::Color32, egui::Color32) {
 
 /// Показывает профиль пира. Возвращает выбранное действие (начать беседу /
 /// пожаловаться).
+#[allow(clippy::too_many_arguments)]
 pub fn show_peer_profile(
     ui:         &mut egui::Ui,
     peer:       Option<&PeerInfo>,

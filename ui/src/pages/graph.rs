@@ -98,7 +98,7 @@ pub struct Graph {
     /// Снимок репутации узлов из backend (NodeId → score).
     pub reputation: Option<Arc<Mutex<HashMap<NodeId, f64>>>>,
     /// Снимок жалоб на узлы из backend.
-    pub reports: Option<Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>>,
+    pub reports: Option<Arc<Mutex<crate::backend::ReportsMap>>>,
     /// Снимок блок-листа (забаненные голосованием).
     pub blocklist: Option<Arc<Mutex<HashMap<NodeId, i64>>>>,
     /// Сигнал в VoidApp: пожаловаться на узел (target, причина).

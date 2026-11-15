@@ -7,6 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{DnsInfo, MirrorCmd, SiteInfo};
 
+#[derive(Default)]
 pub struct SitesPage {
     /// Канал GUI → backend: опубликовать каталог как сайт (путь, имя).
     pub publish_tx:     Option<UnboundedSender<(PathBuf, String)>>,
@@ -35,24 +36,6 @@ pub const PUBLISH_LIMIT_HINT: &str =
     "Пока за вас никто не поручился, другие узлы принимают от вас не больше 10 публикаций \
      в час (файлов и сайтов вместе) — остальные они пока отбросят.";
 
-impl Default for SitesPage {
-    fn default() -> Self {
-        Self {
-            publish_tx:     None,
-            mirror_tx:      None,
-            sites:          None,
-            dns_names:      None,
-            site_http_port: 0,
-            search:         String::new(),
-            publish_path:   String::new(),
-            publish_name:   String::new(),
-            snapshot:       Vec::new(),
-            dns_snapshot:   Vec::new(),
-            confirm_delete: None,
-            my_vouchers:    None,
-        }
-    }
-}
 
 fn human_size(bytes: i64) -> String {
     let b = bytes as f64;

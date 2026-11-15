@@ -1,4 +1,4 @@
-/// keys.rs — ключевые пары для подписей (Ed25519) и шифрования (X25519).
+//! keys.rs — ключевые пары для подписей (Ed25519) и шифрования (X25519).
 
 use crate::error::CryptoError;
 use ed25519_dalek::{SigningKey, VerifyingKey};

@@ -54,12 +54,9 @@ pub struct PrivatePage {
     // Доступ к backend
     pub dm_sender:  Option<tokio::sync::mpsc::UnboundedSender<DmSendCmd>>,
     pub my_enc_kp:  Option<Arc<EncryptionKeypair>>,
-    pub my_enc_pub: [u8; 32],
-    pub my_node_id: Option<NodeId>,
     pub my_name:    String,
     /// Свой аватар (base64-PNG) — для строк собственных сообщений.
     pub my_avatar:  Option<String>,
-    pub base_port:  u16,
 
     // Актуальные данные о пирах (обновляется каждый кадр из app.rs)
     pub peers:         Vec<PeerInfo>,
@@ -79,11 +76,8 @@ impl Default for PrivatePage {
             input:         String::new(),
             dm_sender:     None,
             my_enc_kp:     None,
-            my_enc_pub:    [0u8; 32],
-            my_node_id:    None,
             my_name:       "Вы".into(),
             my_avatar:     None,
-            base_port:     7700,
             peers:         Vec::new(),
             peer_profiles: HashMap::new(),
             access:        None,
@@ -565,7 +559,7 @@ impl PrivatePage {
         ui.add_space(8.0);
 
         // Поле ввода + кнопка
-        let line_count  = self.input.lines().count().max(1).min(4);
+        let line_count  = self.input.lines().count().clamp(1, 4);
         let mut should_send = false;
 
         // Проверяем доступность отправки
@@ -725,6 +719,7 @@ struct MsgStatus {
     may_drop: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_message(
     ui: &mut egui::Ui,
     text: &str,

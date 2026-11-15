@@ -249,7 +249,7 @@ mod tests {
 
         let votes = list_votes(&pool, "prop1").await.unwrap();
         assert_eq!(votes.len(), 1);
-        assert_eq!(votes[0].choice, true, "старый голос не должен перезаписать новый");
+        assert!(votes[0].choice, "старый голос не должен перезаписать новый");
         assert_eq!(votes[0].created_at, 10);
 
         // Более новый голос (created_at=20, «против») перезаписывает.
@@ -260,7 +260,7 @@ mod tests {
 
         let votes = list_votes(&pool, "prop1").await.unwrap();
         assert_eq!(votes.len(), 1);
-        assert_eq!(votes[0].choice, false);
+        assert!(!votes[0].choice);
         assert_eq!(votes[0].created_at, 20);
     }
 

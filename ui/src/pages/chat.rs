@@ -104,7 +104,7 @@ pub struct ChatPage {
     /// Снимок репутации узлов из backend (NodeId → score).
     pub reputation: Option<Arc<Mutex<HashMap<NodeId, f64>>>>,
     /// Снимок жалоб на узлы из backend (для показа в профиле).
-    pub reports: Option<Arc<Mutex<HashMap<NodeId, Vec<void_db::peers::ReportRow>>>>>,
+    pub reports: Option<Arc<Mutex<crate::backend::ReportsMap>>>,
     /// Снимок блок-листа (забаненные голосованием): NodeId → ts истечения.
     pub blocklist: Option<Arc<Mutex<HashMap<NodeId, i64>>>>,
     /// Каналы, добавленные голосованием (мерджатся со встроенными `CHANNELS`).
@@ -548,7 +548,7 @@ impl ChatPage {
         }
 
         let mut should_send = false;
-        let line_count      = self.input.lines().count().max(1).min(4);
+        let line_count      = self.input.lines().count().clamp(1, 4);
 
         ui.horizontal(|ui| {
             let btn_w   = 90.0;

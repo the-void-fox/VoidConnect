@@ -165,15 +165,14 @@ impl StorageManager {
 
         // Подписываем манифест как публикатор — если этот контент ещё не
         // известен от другого публикатора (тот же file_id = те же байты).
-        if db_chunks::get_file_signature(&self.pool, &file_id).await?.is_none() {
-            if let Some(mut manifest) = self.file_manifest(&file_id).await? {
+        if db_chunks::get_file_signature(&self.pool, &file_id).await?.is_none()
+            && let Some(mut manifest) = self.file_manifest(&file_id).await? {
                 manifest.publisher = Some(self.my_id.clone());
                 let signed = SignedMessage::sign(manifest.signing_bytes(), &self.signing)
                     .map_err(|e| StorageError::InvalidManifest(format!("подпись: {:?}", e)))?;
                 db_chunks::save_file_signature(&self.pool, &file_id, self.my_id.as_str(), &signed.signature)
                     .await?;
             }
-        }
 
         info!(
             "Published '{}': file_id={}, {} chunks",
@@ -479,7 +478,7 @@ impl StorageManager {
     /// Возвращает список хэшей всех наших локальных чанков
     /// (для отправки объявлений другим узлам).
     pub async fn local_chunk_hashes(&self) -> Result<Vec<String>, StorageError> {
-        Ok(self.store.list_all().await?)
+        self.store.list_all().await
     }
 
     /// Регистрирует факт отключения узла — убирает его из индекса.
@@ -644,6 +643,24 @@ async fn fetch_chunk_with_fallback(
     }
 
     Err(StorageError::NoPeersForChunk(hash.to_string()))
+}
+
+/// Простое определение MIME типа по расширению файла.
+fn mime_type_from_name(name: &str) -> Option<String> {
+    let ext = name.rsplit('.').next()?.to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png"          => "image/png",
+        "gif"          => "image/gif",
+        "mp4"          => "video/mp4",
+        "mkv"          => "video/x-matroska",
+        "pdf"          => "application/pdf",
+        "zip"          => "application/zip",
+        "txt"          => "text/plain",
+        "html"         => "text/html",
+        _              => return None,
+    };
+    Some(mime.to_string())
 }
 
 // ─── Тесты ───────────────────────────────────────────────────────────────────
@@ -981,22 +998,4 @@ mod tests {
         let progress = mgr_b.download_progress(&file_id).await.unwrap();
         assert_eq!(progress, 0.0);
     }
-}
-
-/// Простое определение MIME типа по расширению файла.
-fn mime_type_from_name(name: &str) -> Option<String> {
-    let ext = name.rsplit('.').next()?.to_lowercase();
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png"          => "image/png",
-        "gif"          => "image/gif",
-        "mp4"          => "video/mp4",
-        "mkv"          => "video/x-matroska",
-        "pdf"          => "application/pdf",
-        "zip"          => "application/zip",
-        "txt"          => "text/plain",
-        "html"         => "text/html",
-        _              => return None,
-    };
-    Some(mime.to_string())
 }

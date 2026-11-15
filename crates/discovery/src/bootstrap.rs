@@ -183,14 +183,13 @@ async fn handle_bootstrap_client(
             // TCP-соединения, как его видит bootstrap), чтобы остальные пиры могли
             // подключиться к узлу напрямую (если порт открыт/проброшен) и не гонять
             // трафик через relay. Публичный (маршрутизируемый) адрес не трогаем.
-            if looks_private(peer.ip) {
-                if let Some(src) = src_ip {
+            if looks_private(peer.ip)
+                && let Some(src) = src_ip {
                     if peer.ip != src {
                         debug!("Bootstrap: внешний адрес {} → {} для {}", peer.ip, src, peer.name);
                     }
                     peer.ip = src;
                 }
-            }
             debug!("Bootstrap: registered peer {} ({}) at {}", peer.name, peer.id, peer.ip);
             probe_port = Some(peer.port);
             peer_list.upsert(peer).await;

@@ -322,11 +322,10 @@ impl PrivateChatHandle {
             let (ack_tx, ack_rx) = oneshot::channel();
             // Ok из send() лишь подтверждает постановку в очередь; доставку
             // подтверждает ack из write-задачи (фактическая запись в сокет).
-            if fwd_tx.send((pkt, ack_tx)).await.is_ok() {
-                if let Ok(true) = ack_rx.await {
+            if fwd_tx.send((pkt, ack_tx)).await.is_ok()
+                && let Ok(true) = ack_rx.await {
                     return Ok(());
                 }
-            }
             // Соединение мертво (очередь закрыта или запись не удалась) — выбрасываем
             // его из кэша и пробуем заново прямой дозвон, а выше по стеку — relay.
             self.inner.connections.lock().await.remove(&cmd.to);

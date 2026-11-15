@@ -54,6 +54,6 @@ pub fn load() -> Settings {
 /// Сохраняет настройки на диск (в папку данных).
 pub fn save(s: &Settings) -> std::io::Result<()> {
     let data = serde_json::to_string_pretty(s)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(settings_path(), data)
 }

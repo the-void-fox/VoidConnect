@@ -347,12 +347,11 @@ impl PublicChat {
     /// При превышении — дропаем пакет и сигналим backend'у (спам-страйк).
     /// Возвращает `true`, если пакет можно обрабатывать. Без лимитера — всегда `true`.
     async fn allow_packet(&self, from: &NodeId) -> bool {
-        if let Some(rl) = &self.inner.rate_limiter {
-            if !rl.check(from).await {
+        if let Some(rl) = &self.inner.rate_limiter
+            && !rl.check(from).await {
                 let _ = self.inner.spam_tx.send(from.clone());
                 return false;
             }
-        }
         true
     }
 
@@ -400,11 +399,10 @@ impl PublicChat {
         }
         let mut order = self.inner.seen_gossip_order.lock().await;
         order.push_back(signed.signature.clone());
-        if order.len() > GOSSIP_DEDUP_WINDOW {
-            if let Some(old) = order.pop_front() {
+        if order.len() > GOSSIP_DEDUP_WINDOW
+            && let Some(old) = order.pop_front() {
                 seen.remove(&old);
             }
-        }
         true
     }
 
@@ -460,11 +458,10 @@ impl PublicChat {
         }
         let mut order = self.inner.seen_order.lock().await;
         order.push_back(key);
-        if order.len() > DEDUP_WINDOW {
-            if let Some(old) = order.pop_front() {
+        if order.len() > DEDUP_WINDOW
+            && let Some(old) = order.pop_front() {
                 seen.remove(&old);
             }
-        }
         true
     }
 
@@ -606,11 +603,10 @@ impl PublicChat {
         // владельца проходит (re-publish после удаления).
         {
             let tombs = self.inner.site_tombstones.lock().await;
-            if let Some((rev, _)) = tombs.get(&incoming.name) {
-                if rev.owner == incoming.owner && incoming.created_at <= rev.revoked_at {
+            if let Some((rev, _)) = tombs.get(&incoming.name)
+                && rev.owner == incoming.owner && incoming.created_at <= rev.revoked_at {
                     return None;
                 }
-            }
         }
         let mut map = self.inner.sites.lock().await;
         match map.get(&incoming.name) {
@@ -1512,15 +1508,13 @@ impl PublicChat {
         }
 
         // Обновляем имя в PeerInfo тоже — чтобы граф и чат показывали актуальное имя
-        if !profile.name.is_empty() {
-            if let Some(mut peer) = self.inner.peer_list.get(&profile.node_id).await {
-                if peer.name != profile.name {
+        if !profile.name.is_empty()
+            && let Some(mut peer) = self.inner.peer_list.get(&profile.node_id).await
+                && peer.name != profile.name {
                     peer.name = profile.name.clone();
                     self.inner.peer_list.upsert(peer).await;
                     debug!("PeerInfo name updated via profile: {} -> {}", profile.node_id, profile.name);
                 }
-            }
-        }
 
         self.forward(ChatPacket::ProfileUpdate(profile), src).await;
     }

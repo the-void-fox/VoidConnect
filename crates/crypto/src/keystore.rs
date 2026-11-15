@@ -183,11 +183,10 @@ impl Keystore {
         // rename надёжен после fsync каталога (иначе запись каталога может не
         // дожить до диска). На Windows каталог так не открыть — пропускаем.
         #[cfg(unix)]
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = fs::File::open(parent) {
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = fs::File::open(parent) {
                 let _ = dir.sync_all();
             }
-        }
         Ok(())
     }
 
