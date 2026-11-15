@@ -1,0 +1,131 @@
+# Релиз: на тег vX.Y.Z собирает приложение на чистых машинах и выкладывает
+# GitHub Release с тремя файлами — AppImage и обычный бинарник для Linux,
+# .exe для Windows — и их SHA-256.
+#
+# Ручной запуск (Actions → Release → Run workflow) только собирает файлы и
+# прикладывает их к запуску как артефакты, без публикации — проверить сборку
+# до тега.
+#
+# Linux собирается на Ubuntu 22.04: бинарник требует glibc ≥ 2.35 (Ubuntu
+# 22.04+, Debian 12+, Fedora 36+). Сборка на NixOS для этого не годится —
+# у неё пути /nix/store в загрузчике.
+#
+# Описание релиза берётся из .github/release-notes/<тег>.md (если есть).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Системные библиотеки
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Сборка
+        run: cargo build --release --locked -p void-ui
+
+      - name: Бинарник и AppImage
+        run: |
+          VER="$(grep -m1 '^version' ui/Cargo.toml | cut -d'"' -f2)"
+          mkdir -p dist
+          strip target/release/void-connect
+          cp target/release/void-connect "dist/void-connect-$VER-linux-x86_64"
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/void-connect AppDir/usr/bin/
+          cp ui/src/assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/void-connect.png
+          cp ui/src/assets/icon.png AppDir/void-connect.png
+          cat > AppDir/void-connect.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Void Connect
+          Comment=Децентрализованная P2P-сеть: чат, файлы и сайты без сервера
+          Exec=void-connect
+          Icon=void-connect
+          Categories=Network;Chat;
+          Terminal=false
+          EOF
+          sed -i 's/^ *//' AppDir/void-connect.desktop
+          cp AppDir/void-connect.desktop AppDir/usr/share/applications/
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/void-connect" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+
+          wget -q -O appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir "dist/void-connect-$VER-x86_64.AppImage"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Сборка
+        run: cargo build --release --locked -p void-ui
+
+      - name: Файл
+        shell: bash
+        run: |
+          VER="$(grep -m1 '^version' ui/Cargo.toml | cut -d'"' -f2)"
+          mkdir -p dist
+          cp target/release/void-connect.exe "dist/void-connect-$VER-windows-x86_64.exe"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Публикация
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+          NOTES=".github/release-notes/$TAG.md"
+          if [ -f "$NOTES" ]; then
+            gh release create "$TAG" dist/* --title "Void Connect ${TAG#v}" --notes-file "$NOTES"
+          else
+            gh release create "$TAG" dist/* --title "Void Connect ${TAG#v}" --generate-notes
+          fi

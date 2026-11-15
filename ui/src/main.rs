@@ -1,3 +1,6 @@
+// В release-сборке под Windows — без чёрного окна консоли рядом с приложением.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod avatar;
 mod backend;
@@ -125,7 +128,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("Void Connect"),
+            .with_title("Void Connect")
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
@@ -145,6 +149,11 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Иконка окна и панели задач (белый шестиугольник на тёмной подложке).
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("assets/icon.png")).unwrap_or_default()
+}
+
 /// Окно «доступ заблокирован»: бэкенд НЕ запускается (никаких сетевых/файловых
 /// функций) — только сообщение о привязке аккаунта к другому устройству.
 fn run_locked_ui(
@@ -156,7 +165,8 @@ fn run_locked_ui(
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([580.0, 380.0])
             .with_min_inner_size([460.0, 300.0])
-            .with_title("Void Connect — доступ заблокирован"),
+            .with_title("Void Connect — доступ заблокирован")
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
