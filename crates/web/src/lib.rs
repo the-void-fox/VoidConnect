@@ -12,9 +12,14 @@
 //! // → http://127.0.0.1:8080/blog
 //! ```
 
+pub mod api;
+pub mod consent;
 pub mod dns;
 pub mod error;
+pub mod permissions;
+pub mod records;
 pub mod registry;
+pub mod security;
 pub mod server;
 
 use std::path::{Path, PathBuf};
@@ -30,7 +35,11 @@ use void_storage::StorageManager;
 pub use dns::DnsRegistry;
 pub use error::WebError;
 pub use registry::SiteRegistry;
-pub use server::{router, serve, PeerSnapshot};
+pub use api::{NodeView, PublicProfile, SiteApi, SiteApiParts, TrustTag};
+pub use consent::{ConsentBroker, ConsentKind, ConsentRequest};
+pub use permissions::{Permission, PermissionStore};
+pub use records::SiteRecord;
+pub use server::{router, router_with_api, serve, serve_with_api, PeerSnapshot};
 
 /// Публикует каталог как сайт: каждый файл уходит в хранилище, из путей и
 /// `file_id` собирается манифест. Имя — без зоны (`blog`, не `blog.void`).
@@ -82,10 +91,16 @@ pub async fn publish_site(
 }
 
 /// Рекурсивно собирает файлы каталога как пары (относительный путь, абсолютный путь).
+/// Файлы каталога сайта. Скрытые файлы и папки (`.git`, `.env`, `.void`)
+/// пропускаются: раньше публикация сайта из git-репозитория раздавала всей
+/// сети его историю, а `/.void/` зарезервирован за JS API.
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
             collect_files(root, &path, out)?;
         } else if path.is_file() {
@@ -161,6 +176,8 @@ mod tests {
         std::fs::write(dir.join("index.html"), b"<h1>Hello Void</h1>").unwrap();
         std::fs::create_dir_all(dir.join("css")).unwrap();
         std::fs::write(dir.join("css/style.css"), b"h1{color:red}").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/config"), b"[remote] secret").unwrap();
     }
 
     #[tokio::test]
@@ -210,16 +227,23 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // index по имени с зоной .void
-        let body = http_get(addr, "/blog.void").await;
+        let body = http_get_host(addr, "/", "blog.void.localhost").await;
         assert!(body.contains("<h1>Hello Void</h1>"), "ожидался index сайта, получено: {body}");
+        // Страница несёт CSP и прочие заголовки защиты.
+        assert!(body.contains("content-security-policy: default-src 'self'"), "нет CSP: {body}");
+        assert!(body.contains("x-content-type-options: nosniff"));
 
         // конкретный файл
-        let css = http_get(addr, "/blog/css/style.css").await;
+        let css = http_get_host(addr, "/css/style.css", "blog.localhost").await;
         assert!(css.contains("color:red"), "ожидался css, получено: {css}");
 
         // несуществующая страница → 404
-        let missing = http_get(addr, "/blog/nope.js").await;
+        let missing = http_get_host(addr, "/nope.js", "blog.localhost").await;
         assert!(missing.contains("404"), "ожидался 404, получено: {missing}");
+
+        // Скрытые файлы каталога не публикуются, /.void/ — не файлы сайта.
+        let hidden = http_get_host(addr, "/.git/config", "blog.localhost").await;
+        assert!(hidden.contains("404"), "скрытые файлы не раздаются: {hidden}");
     }
 
     /// У каждого сайта свой адрес `<имя>.localhost`: корень — его index, ссылки
@@ -251,8 +275,13 @@ mod tests {
 
         let rebinding = http_get_host(addr, "/blog", &format!("evil.example:{port}")).await;
         assert!(rebinding.contains("403"), "чужой Host — отказ: {rebinding}");
-        let fallback = http_get_host(addr, "/blog/", &format!("127.0.0.1:{port}")).await;
-        assert!(fallback.contains("<h1>Hello Void</h1>"), "запасной адрес работает: {fallback}");
+        // Общий адрес (один origin на все сайты) только перенаправляет.
+        let fallback = http_get_host(addr, "/blog/css/style.css", &format!("127.0.0.1:{port}")).await;
+        assert!(fallback.starts_with("HTTP/1.1 308"), "перенаправление: {fallback}");
+        assert!(
+            fallback.contains(&format!("location: http://blog.localhost:{port}/css/style.css")),
+            "на адрес сайта: {fallback}"
+        );
     }
 
     /// Фаза 2: сквозная раздача ЧУЖОГО сайта. Узел A публикует сайт и поднимает
@@ -318,7 +347,7 @@ mod tests {
         // на случай медленного старта серверов; сломанная докачка не пройдёт ни одну.
         let mut body = String::new();
         for _ in 0..5 {
-            body = http_get(addr, "/remote.void").await;
+            body = http_get_host(addr, "/", "remote.localhost").await;
             if body.contains("<h1>Hello Void</h1>") {
                 break;
             }
@@ -333,10 +362,6 @@ mod tests {
     }
 
     /// Минимальный HTTP/1.1 GET через сырой TCP (без сторонних http-клиентов).
-    async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
-        http_get_host(addr, path, "localhost").await
-    }
-
     async fn http_get_host(addr: std::net::SocketAddr, path: &str, host: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!(

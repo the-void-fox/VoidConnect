@@ -46,6 +46,11 @@ pub fn avatar_hash(b64: &str) -> u64 {
     h
 }
 
+/// Аватар из сети безопасен для показа (размер и стороны в пределах).
+pub fn is_safe_avatar(b64: &str) -> bool {
+    checked_avatar_bytes(b64).is_some()
+}
+
 /// Декодирует base64 аватара из сети и проверяет размер файла и размеры
 /// картинки по заголовку (без распаковки пикселей). `None` — отбросить.
 fn checked_avatar_bytes(b64: &str) -> Option<Vec<u8>> {

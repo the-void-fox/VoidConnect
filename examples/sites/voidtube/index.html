@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoidTube</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="/.void/sdk.js"></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <a class="logo" href="#/">
+      <span class="logo-mark">▶</span>
+      <span>VoidTube</span>
+    </a>
+    <nav>
+      <a href="#/" data-nav="feed">Лента</a>
+      <a href="#/upload" data-nav="upload">Загрузить</a>
+    </nav>
+    <div id="account" class="account"></div>
+  </header>
+
+  <main id="view" class="view"></main>
+
+  <footer class="foot">
+    Видео хранятся у участников сети Void Connect, без сервера.
+    <span id="site-owner"></span>
+  </footer>
+</body>
+</html>

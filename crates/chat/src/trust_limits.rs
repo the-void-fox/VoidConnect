@@ -51,6 +51,8 @@ pub(crate) enum Kind {
     Report,
     /// Список соседей узла (карта соединений).
     Links,
+    /// Запись общих данных сайта (комментарий, лайк, публикация).
+    SiteRecord,
 }
 
 impl Kind {
@@ -91,6 +93,8 @@ fn author_rate(tier: AuthorTier, kind: Kind) -> Option<Rate> {
         (Stranger, Proposal) => return None,
         (_, Proposal | Vote | Report) => per(1.0, MIN, 2.0),
         (_, Links) => per(1.0, MIN, 3.0),
+        (Stranger, SiteRecord) => per(10.0, MIN, 20.0),
+        (_, SiteRecord) => per(1.0, 1.0, 60.0),
     })
 }
 
@@ -110,6 +114,7 @@ fn shared_rate(tier: AuthorTier, kind: Kind) -> Option<(&'static str, Rate)> {
         (Stranger, NewcomersMessage) => Some(("strangers/newcomers", per(10.0, 1.0, 20.0))),
         (Stranger, Message) => Some(("strangers/chat", per(2.0, 1.0, 10.0))),
         (Settled, Message | NewcomersMessage) => Some(("settled/chat", per(10.0, 1.0, 30.0))),
+        (Stranger, SiteRecord) => Some(("strangers/sites", per(5.0, 1.0, 30.0))),
         _ => None,
     }
 }

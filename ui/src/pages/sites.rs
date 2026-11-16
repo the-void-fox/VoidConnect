@@ -32,6 +32,8 @@ pub struct SitesPage {
     pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Открытый системный диалог выбора каталога (в фоновом потоке).
     pick_job: crate::bg::Job<Option<PathBuf>>,
+    /// Разрешения сайтов (JS API) — показ и отзыв.
+    pub permissions: Option<void_web::PermissionStore>,
 }
 
 /// Новичку другие узлы принимают не больше 10 публикаций в час (лимит по
@@ -95,7 +97,7 @@ impl SitesPage {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         self.sync();
 
-        crate::theme::page_header(ui, "\u{F059F}", "Сайты", Some("Статические сайты внутри сети по адресам .void"));
+        crate::theme::page_header(ui, "\u{F059F}", "Сайты", Some("Сайты и веб-приложения внутри сети по адресам .void"));
 
         // ── Публикация сайта ────────────────────────────────────────────────
         let mut do_publish = false;
@@ -165,6 +167,7 @@ impl SitesPage {
         let mut open_url: Option<String> = None;
         let mut mirror_action: Option<MirrorCmd> = None;
         let mut request_delete: Option<String> = None;
+        let mut revoke: Option<String> = None;
 
         ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             if self.snapshot.is_empty() {
@@ -214,6 +217,28 @@ impl SitesPage {
                                     .color(crate::theme::TEXT_FAINT),
                             )
                             .on_hover_text("Адрес сайта в браузере (только на этом компьютере)");
+                            // Что пользователь разрешил сайту через JS API.
+                            let granted = self.permissions.as_ref().map(|p| p.of(&site.name)).unwrap_or_default();
+                            if !granted.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    let names: Vec<&str> = granted.iter().map(|p| match p {
+                                        void_web::Permission::Identity => "знает, кто вы",
+                                        void_web::Permission::Publish => "публикует от вашего имени",
+                                    }).collect();
+                                    ui.label(
+                                        RichText::new(format!("\u{F0483}  Доступ: {}", names.join(" · ")))
+                                            .small()
+                                            .color(crate::theme::INFO),
+                                    );
+                                    if ui
+                                        .small_button("Отозвать")
+                                        .on_hover_text("Сайт снова должен будет спросить разрешение")
+                                        .clicked()
+                                    {
+                                        revoke = Some(site.name.clone());
+                                    }
+                                });
+                            }
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -314,6 +339,9 @@ impl SitesPage {
 
         if let Some(url) = open_url {
             Self::open(&url);
+        }
+        if let (Some(site), Some(perms)) = (revoke, &self.permissions) {
+            perms.revoke_all(&site);
         }
         if let Some(cmd) = mirror_action {
             if let Some(tx) = &self.mirror_tx {

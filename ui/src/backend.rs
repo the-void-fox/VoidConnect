@@ -55,6 +55,8 @@ pub struct SiteInfo {
     pub is_mirrored: bool,
     /// Локальный URL для открытия в браузере.
     pub url:        String,
+    /// Владелец (подписал манифест).
+    pub owner:      NodeId,
 }
 
 /// Запись внутреннего DNS (.void) — снимок для GUI.
@@ -701,6 +703,8 @@ pub struct BackendHandle {
     /// Номер снимка пиров/профилей: растёт, когда бэкенд обновил `peers` и
     /// `peer_profiles`. UI копирует их только при смене номера, а не каждый кадр.
     pub snapshot_gen: Arc<AtomicU64>,
+    /// JS API сайтов: выданные разрешения и вопросы к пользователю.
+    pub site_access: crate::site_api::SiteAccess,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
     /// командами `TrustCmd::{Allow, Block, Unblock}`).
     pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
@@ -822,6 +826,8 @@ pub fn start_backend(
     let topology_bg = Arc::clone(&topology);
     let snapshot_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let snapshot_gen_bg = Arc::clone(&snapshot_gen);
+    let site_access = crate::site_api::SiteAccess::load(&data_dir);
+    let site_access_bg = site_access.clone();
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -846,7 +852,7 @@ pub fn start_backend(
                 blocklist_bg, voted_channels_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg,
                 trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg, trust_details_bg,
-                chat_links_bg, topology_bg, snapshot_gen_bg,
+                chat_links_bg, topology_bg, snapshot_gen_bg, site_access_bg,
             ).await;
         });
     });
@@ -902,6 +908,7 @@ pub fn start_backend(
         chat_links,
         topology,
         snapshot_gen,
+        site_access,
     }
 }
 
@@ -956,6 +963,7 @@ async fn backend_main(
     chat_links: Arc<AtomicUsize>,
     topology_out: Arc<Mutex<TopologyMap>>,
     snapshot_gen: Arc<AtomicU64>,
+    site_access: crate::site_api::SiteAccess,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1149,6 +1157,8 @@ async fn backend_main(
     let mut initial_profile = PeerProfile::new(my_peer.id.clone(), my_peer.name.clone());
     initial_profile.enc_pubkey = Some(enc_pub_hex.clone());
     initial_profile.is_bootstrap = bootstrap;
+    // Свой профиль для JS API сайтов (имя/аватар — с разрешения пользователя).
+    let my_profile: Arc<Mutex<Option<PeerProfile>>> = Arc::new(Mutex::new(Some(initial_profile.clone())));
     chat.set_profile(initial_profile).await;
 
     // ── Внутренний DNS зоны .void ─────────────────────────────────────────────
@@ -1345,11 +1355,13 @@ async fn backend_main(
     // Задача: обновление профиля из GUI → включаем enc_pubkey, отправляем
     let chat_profile = chat.clone();
     let enc_pub_hex2 = enc_pub_hex.clone();
+    let my_profile_upd = Arc::clone(&my_profile);
     tokio::spawn(async move {
         while let Some(mut profile) = profile_rx.recv().await {
             // Всегда включаем наш enc_pubkey и bootstrap-флаг в рассылаемый профиль
             profile.enc_pubkey = Some(enc_pub_hex2.clone());
             profile.is_bootstrap = bootstrap;
+            *my_profile_upd.lock().unwrap() = Some(profile.clone());
             chat_profile.set_profile(profile).await;
         }
     });
@@ -1445,6 +1457,8 @@ async fn backend_main(
     // Снимок активных пиров для HTTP-сервера сайтов (докачка файлов чужих
     // сайтов по запросу). Клонируем до того, как peers_out уедет в задачу ниже.
     let sites_peers = Arc::clone(&peers_out);
+    // Профили других узлов — для JS API сайтов (клон до move в задачу снимков).
+    let api_profiles = Arc::clone(&profiles_out);
 
     // Задача: периодически снимаем peer_list и профили для GUI, снимок
     // качества раздачи и жалоб.
@@ -1677,11 +1691,36 @@ async fn backend_main(
                         proposals_out, blocklist_out, voted_channels_out,
                         Arc::clone(&removed_files),
                     );
+                    // JS API сайтов: профили, записи, загрузки (см. site_api).
+                    let (record_out, record_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (file_out, file_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (record_events, _) = tokio::sync::broadcast::channel(256);
+                    let site_api = void_web::SiteApi::new(void_web::SiteApiParts {
+                        node: Arc::new(crate::site_api::BackendNodeView {
+                            my_id: my_peer.id.clone(),
+                            my_profile: Arc::clone(&my_profile),
+                            fallback_name: my_peer.name.clone(),
+                            profiles: Arc::clone(&api_profiles),
+                            trust: Arc::clone(&trust_snapshot),
+                        }),
+                        signing: Arc::clone(&site_kp),
+                        db: Some(pool.clone()),
+                        record_out,
+                        events: record_events.clone(),
+                        permissions: site_access.permissions.clone(),
+                        consent: site_access.consent.clone(),
+                        uploads_dir: data_dir.join("uploads"),
+                        file_out,
+                    });
+                    crate::site_api::start_site_data_tasks(
+                        chat.clone(), pool.clone(), manager.clone(), Arc::clone(&trust_snapshot),
+                        crate::site_api::SiteDataChannels { record_rx, file_rx, events: record_events },
+                    );
                     // Сайты: HTTP-сервер + публикация + обнаружение по сети.
                     start_site_tasks(
                         manager.clone(), my_peer.id.clone(), site_http_port,
                         chat.clone(), Arc::clone(&sites_peers), dns.clone(),
-                        site_kp, publish_site_rx, sites_out, mirror_rx,
+                        site_kp, publish_site_rx, sites_out, mirror_rx, Some(site_api),
                     );
                     start_storage_tasks(
                         manager, pool, chat.clone(), peer_list.clone(),
@@ -1721,6 +1760,7 @@ fn start_site_tasks(
     mut publish_site_rx: tokio::sync::mpsc::UnboundedReceiver<(PathBuf, String)>,
     sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
     mut mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
+    site_api:   Option<void_web::SiteApi>,
 ) {
     let my_key = my_id.as_str().to_string();
 
@@ -1751,7 +1791,7 @@ fn start_site_tasks(
         // Только loopback: страницы сайтов нужны своему браузеру. Открытый в сеть
         // порт позволял бы любому заставить узел скачивать произвольные файлы.
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], http_port));
-        if let Err(e) = void_web::serve(addr, srv_reg, srv_mgr, peers).await {
+        if let Err(e) = void_web::serve_with_api(addr, srv_reg, srv_mgr, peers, site_api).await {
             tracing::error!("Site HTTP server failed on {}: {}", http_port, e);
         }
     });
@@ -2076,6 +2116,7 @@ async fn refresh_sites(
         size_bytes:  m.total_size(),
         is_mine:     m.owner.as_str() == my_key,
         is_mirrored: mset.contains(&m.name),
+        owner:       m.owner,
         name:        m.name,
     }).collect();
     *out.lock().unwrap() = infos;

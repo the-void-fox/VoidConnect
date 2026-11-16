@@ -12,6 +12,8 @@ mod pages;
 mod profile_store;
 mod private_store;
 mod settings_store;
+mod site_api;
+mod site_consent;
 mod sys_open;
 mod theme;
 mod trust_ui;

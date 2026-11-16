@@ -87,6 +87,8 @@ pub struct VoidApp {
     pw_job:           crate::bg::Job<Result<&'static str, String>>,
     /// Один раз спросить, публиковать ли старые локальные отметки «проверен».
     trust_prompt:     bool,
+    /// Вопросы сайтов (JS API) к пользователю.
+    consent_ui:       crate::site_consent::ConsentUi,
 }
 
 impl VoidApp {
@@ -176,6 +178,7 @@ impl VoidApp {
         sites.sites          = Some(std::sync::Arc::clone(&backend.sites));
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
+        sites.permissions    = Some(backend.site_access.permissions.clone());
 
         // Страница голосований: снимок предложений + каналы создания/голоса.
         let mut votes = VotesPage::default();
@@ -210,6 +213,7 @@ impl VoidApp {
             pw_msg: None,
             pw_job: crate::bg::Job::default(),
             trust_prompt,
+            consent_ui: Default::default(),
             show_settings: false,
             show_about: false,
             show_docs: false,
@@ -296,6 +300,7 @@ impl eframe::App for VoidApp {
         });
 
         self.show_dialogs(ctx);
+        self.show_site_consent(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
@@ -585,6 +590,20 @@ impl VoidApp {
             };
             theme::status_pill(ui, color, label).on_hover_text(hint);
         });
+    }
+
+    /// Вопрос сайта к пользователю (разрешение, публикация файла) — поверх
+    /// всего окна. Снимки копируем только пока вопрос открыт.
+    fn show_site_consent(&mut self, ctx: &egui::Context) {
+        let broker = self.backend.site_access.consent.clone();
+        self.consent_ui.attach(ctx, &broker);
+        if broker.pending().is_empty() {
+            return;
+        }
+        let sites = self.backend.sites.lock().unwrap().clone();
+        let profiles = self.backend.peer_profiles.lock().unwrap().clone();
+        let trust = self.backend.trust.lock().unwrap().clone();
+        self.consent_ui.show(ctx, &broker, &sites, &profiles, &trust, &self.backend.my_id_node);
     }
 
     // ── Окна из меню ──────────────────────────────────────────────────────────

@@ -36,7 +36,7 @@ use void_core::dns::{normalize_name, DnsRecord};
 use void_core::identity::NodeId;
 use void_core::manifest::FileManifest;
 use void_core::peer::{PeerInfo, PeerProfile};
-use void_core::site::{SiteManifest, SiteRevocation};
+use void_core::site::{SiteDigestItem, SiteManifest, SiteRevocation};
 use void_crypto::keys::SigningKeypair;
 use void_crypto::sign::SignedMessage;
 use void_discovery::PeerList;
@@ -133,6 +133,15 @@ pub enum ChatPacket {
     /// Подписанный список соседей узла (карта соединений сети, см.
     /// [`crate::topology`]).
     Links { signed: SignedMessage },
+    /// Запись общих данных сайта (JS API; author = signed.signer). Как и
+    /// поручительство, дальше её пересылает backend — только если она изменила
+    /// его базу.
+    SiteRecord { signed: SignedMessage },
+    /// Пачка записей для соседа, которому их не хватало (по дайджесту).
+    /// Точка-точка, не пересылается.
+    SiteRecordSync { records: Vec<SignedMessage> },
+    /// Дайджест записей сайтов: сосед досылает то, чего у нас нет.
+    SiteDigest { items: Vec<SiteDigestItem> },
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -188,6 +197,23 @@ pub struct VouchGossip {
     pub signed: SignedMessage,
     pub from: NodeId,
 }
+
+/// Входящие данные сайтов (JS API) с соседом-источником. Чат лишь проверяет
+/// подпись и лимит частоты; хранит, пересылает и досылает backend.
+#[derive(Debug, Clone)]
+pub enum SiteDataGossip {
+    /// Живая запись (её стоит переслать, если она новая).
+    Record { signed: SignedMessage, from: NodeId },
+    /// Досылка по дайджесту (не пересылается).
+    Sync { records: Vec<SignedMessage>, from: NodeId },
+    /// Дайджест соседа — сравнить со своим и дослать недостающее.
+    Digest { items: Vec<SiteDigestItem>, from: NodeId },
+}
+
+/// Сколько записей в одном пакете досылки.
+pub const SITE_SYNC_BATCH: usize = 200;
+/// Сколько строк дайджеста принимаем от соседа.
+pub const MAX_SITE_DIGEST_ITEMS: usize = 20_000;
 
 // ─── Состояние ───────────────────────────────────────────────────────────────
 
@@ -251,6 +277,8 @@ struct PublicChatInner {
     vote_tx:     broadcast::Sender<VoteGossip>,
     /// Входящие поручительства → backend (он проверяет и решает о пересылке)
     vouch_tx:    broadcast::Sender<VouchGossip>,
+    /// Входящие данные сайтов → backend (он хранит, пересылает, досылает)
+    site_data_tx: broadcast::Sender<SiteDataGossip>,
     /// Новая связь с соседом → backend (передать ему свои данные, например граф доверия)
     link_tx:     broadcast::Sender<NodeId>,
     /// Ограничитель частоты пакетов (флуд-защита на релее). None = выключен.
@@ -295,6 +323,7 @@ impl PublicChat {
         let (vote_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let (vouch_tx, _)    = broadcast::channel(4 * BROADCAST_BUFFER);
         let (link_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
+        let (site_data_tx, _) = broadcast::channel(4 * BROADCAST_BUFFER);
         let (spam_tx, _)     = broadcast::channel(BROADCAST_BUFFER);
         let noise = NoiseIdentity::new(&signing_kp);
         PublicChat {
@@ -318,6 +347,7 @@ impl PublicChat {
                 dns_tx,
                 vote_tx,
                 vouch_tx,
+                site_data_tx,
                 link_tx,
                 rate_limiter,
                 spam_tx,
@@ -836,6 +866,66 @@ impl PublicChat {
         self.forward(ChatPacket::Vouch { signed }, except).await;
     }
 
+    // ─── Данные сайтов (JS API) ───────────────────────────────────────────────
+
+    /// Живая запись сайта: дубликаты гасим, незнакомцев ограничиваем по
+    /// частоте, остальное отдаём backend'у (он решит, пересылать ли).
+    async fn handle_site_record(&self, signed: SignedMessage, from: &NodeId) {
+        if !self.first_seen_gossip(&signed).await {
+            return;
+        }
+        if !self.admit_signed(&signed, Kind::SiteRecord) {
+            self.unsee_gossip(&signed).await;
+            return;
+        }
+        if signed.verify().is_err() {
+            return;
+        }
+        let _ = self.inner.site_data_tx.send(SiteDataGossip::Record { signed, from: from.clone() });
+    }
+
+    /// Досылка от соседа: подписи проверит backend (с лимитами хранения).
+    async fn handle_site_sync(&self, records: Vec<SignedMessage>, from: &NodeId) {
+        let mut fresh = Vec::with_capacity(records.len().min(SITE_SYNC_BATCH));
+        for signed in records.into_iter().take(SITE_SYNC_BATCH) {
+            if self.first_seen_gossip(&signed).await {
+                fresh.push(signed);
+            }
+        }
+        if !fresh.is_empty() {
+            let _ = self.inner.site_data_tx.send(SiteDataGossip::Sync { records: fresh, from: from.clone() });
+        }
+    }
+
+    /// Рассылает запись сайта соседям, кроме `except` (своя — `None`).
+    pub async fn relay_site_record(&self, signed: SignedMessage, except: Option<&NodeId>) {
+        self.first_seen_gossip(&signed).await;
+        self.forward(ChatPacket::SiteRecord { signed }, except).await;
+    }
+
+    /// Досылает записи одному соседу пачками (через очередь связи с ожиданием).
+    pub async fn push_site_records(&self, peer: &NodeId, records: Vec<SignedMessage>) {
+        let Some(tx) = self.inner.links.lock().await.get(peer).map(|l| l.tx.clone()) else { return };
+        tokio::spawn(async move {
+            for batch in records.chunks(SITE_SYNC_BATCH) {
+                if tx.send(ChatPacket::SiteRecordSync { records: batch.to_vec() }).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Отправляет соседу наш дайджест записей сайтов.
+    pub async fn send_site_digest(&self, peer: &NodeId, items: Vec<SiteDigestItem>) {
+        let Some(tx) = self.inner.links.lock().await.get(peer).map(|l| l.tx.clone()) else { return };
+        let _ = tx.send(ChatPacket::SiteDigest { items }).await;
+    }
+
+    /// Текущие соседи.
+    pub async fn neighbors(&self) -> Vec<NodeId> {
+        self.inner.links.lock().await.keys().cloned().collect()
+    }
+
     // ─── Карта соединений ─────────────────────────────────────────────────────
 
     /// Свежая карта соединений: узел → его соседи (наш список — тоже здесь).
@@ -1218,6 +1308,12 @@ async fn read_loop<R: AsyncReadExt + Unpin>(
             }
             ChatPacket::Vouch { signed } => chat.handle_vouch(signed, &peer).await,
             ChatPacket::Links { signed } => chat.handle_links(signed, src).await,
+            ChatPacket::SiteRecord { signed } => chat.handle_site_record(signed, &peer).await,
+            ChatPacket::SiteRecordSync { records } => chat.handle_site_sync(records, &peer).await,
+            ChatPacket::SiteDigest { mut items } => {
+                items.truncate(MAX_SITE_DIGEST_ITEMS);
+                let _ = chat.inner.site_data_tx.send(SiteDataGossip::Digest { items, from: peer.clone() });
+            }
             ChatPacket::Ping => {
                 let _ = tx.try_send(ChatPacket::Pong);
             }
@@ -1349,7 +1445,8 @@ fn gossip_signature(pkt: &ChatPacket) -> Option<&SignedMessage> {
         | ChatPacket::VoteAnnounce { signed }
         | ChatPacket::SiteRevoke { signed }
         | ChatPacket::Vouch { signed }
-        | ChatPacket::Links { signed } => Some(signed),
+        | ChatPacket::Links { signed }
+        | ChatPacket::SiteRecord { signed } => Some(signed),
         _ => None,
     }
 }
@@ -1695,6 +1792,21 @@ impl ChatHandle {
     pub async fn push_vouches(&self, peer: &NodeId, vouches: Vec<SignedMessage>) {
         self.chat.push_vouches(peer, vouches).await
     }
+    /// Входящие данные сайтов (записи, досылки, дайджесты) с соседом-источником.
+    pub fn subscribe_site_data(&self) -> broadcast::Receiver<SiteDataGossip> {
+        self.chat.inner.site_data_tx.subscribe()
+    }
+    pub async fn relay_site_record(&self, signed: SignedMessage, except: Option<&NodeId>) {
+        self.chat.relay_site_record(signed, except).await
+    }
+    pub async fn push_site_records(&self, peer: &NodeId, records: Vec<SignedMessage>) {
+        self.chat.push_site_records(peer, records).await
+    }
+    pub async fn send_site_digest(&self, peer: &NodeId, items: Vec<SiteDigestItem>) {
+        self.chat.send_site_digest(peer, items).await
+    }
+    /// Текущие соседи по общему чату.
+    pub async fn neighbors(&self) -> Vec<NodeId> { self.chat.neighbors().await }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -2798,6 +2910,53 @@ mod tests {
         let got = timeout(Duration::from_secs(5), vouches_b.recv()).await.unwrap().unwrap();
         assert_eq!(got.signed.signature, rec2.signature, "дубликат rec1 погашен, rec2 дошёл");
         assert!(timeout(Duration::from_millis(300), vouches_b.recv()).await.is_err());
+    }
+
+    /// Записи сайтов: живая доходит до соседа с источником, досылка — пачкой,
+    /// дайджест — как есть; повтор живой записи гасится.
+    #[tokio::test]
+    async fn site_data_reaches_neighbor() {
+        let (ka, a) = mesh_peer(1);
+        let (kb, b) = mesh_peer(2);
+        let node_b = start_mesh_node(kb, &b, &[]).await;
+        let mut data_b = node_b.subscribe_site_data();
+        let node_a = start_mesh_node(ka.clone(), &a, &[&b]).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while node_a.link_count().await == 0 || node_b.link_count().await == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "нет связи");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(node_a.neighbors().await, vec![b.id.clone()]);
+
+        let rec = SignedMessage::sign(b"record-1".to_vec(), &ka).unwrap();
+        node_a.relay_site_record(rec.clone(), None).await;
+        match timeout(Duration::from_secs(5), data_b.recv()).await.unwrap().unwrap() {
+            SiteDataGossip::Record { signed, from } => {
+                assert_eq!(signed.signature, rec.signature);
+                assert_eq!(from, a.id);
+            }
+            other => panic!("ожидалась запись: {other:?}"),
+        }
+
+        let rec2 = SignedMessage::sign(b"record-2".to_vec(), &ka).unwrap();
+        node_a.push_site_records(&b.id, vec![rec2.clone()]).await;
+        match timeout(Duration::from_secs(5), data_b.recv()).await.unwrap().unwrap() {
+            SiteDataGossip::Sync { records, .. } => assert_eq!(records[0].signature, rec2.signature),
+            other => panic!("ожидалась досылка: {other:?}"),
+        }
+
+        let item = SiteDigestItem { site: "tube".into(), author: a.id.0.clone(), count: 1, max_ts: 5, sum_ts: 5 };
+        node_a.send_site_digest(&b.id, vec![item.clone()]).await;
+        match timeout(Duration::from_secs(5), data_b.recv()).await.unwrap().unwrap() {
+            SiteDataGossip::Digest { items, from } => {
+                assert_eq!(items, vec![item]);
+                assert_eq!(from, a.id);
+            }
+            other => panic!("ожидался дайджест: {other:?}"),
+        }
+
+        node_a.relay_site_record(rec.clone(), None).await;
+        assert!(timeout(Duration::from_millis(300), data_b.recv()).await.is_err(), "повтор погашен");
     }
 
     /// Собирает тексты сообщений из приёмника за `ms` миллисекунд.
