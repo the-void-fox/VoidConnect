@@ -39,7 +39,14 @@ pub use api::{NodeView, PublicProfile, SiteApi, SiteApiParts, TrustTag};
 pub use consent::{ConsentBroker, ConsentKind, ConsentRequest};
 pub use permissions::{Permission, PermissionStore};
 pub use records::SiteRecord;
-pub use server::{router, router_with_api, serve, serve_with_api, PeerSnapshot};
+pub use server::{
+    router, router_with_api, router_with_options, serve, serve_with_api, MissingFiles, PeerSnapshot,
+    ServerOptions,
+};
+
+/// Предел файлов в сайте (совпадает с `void_chat::public_chat::MAX_SITE_ENTRIES`:
+/// сайт с большим числом файлов другие узлы отбросят).
+pub const MAX_SITE_FILES: usize = 5000;
 
 /// Публикует каталог как сайт: каждый файл уходит в хранилище, из путей и
 /// `file_id` собирается манифест. Имя — без зоны (`blog`, не `blog.void`).
@@ -64,6 +71,12 @@ pub async fn publish_site(
     collect_files(dir, dir, &mut files)?;
     if files.is_empty() {
         return Err(WebError::Invalid(format!("в каталоге нет файлов: {}", dir.display())));
+    }
+    if files.len() > MAX_SITE_FILES {
+        return Err(WebError::Invalid(format!(
+            "в сайте {} файлов — узлы принимают не больше {MAX_SITE_FILES}",
+            files.len()
+        )));
     }
 
     let mut entries = Vec::with_capacity(files.len());

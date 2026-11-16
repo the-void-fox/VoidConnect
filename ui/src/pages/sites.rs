@@ -34,6 +34,8 @@ pub struct SitesPage {
     pick_job: crate::bg::Job<Option<PathBuf>>,
     /// Разрешения сайтов (JS API) — показ и отзыв.
     pub permissions: Option<void_web::PermissionStore>,
+    /// «Переспросить соседей».
+    pub resync: Option<crate::widgets::resync::Resync>,
 }
 
 /// Новичку другие узлы принимают не больше 10 публикаций в час (лимит по
@@ -153,13 +155,25 @@ impl SitesPage {
         }
 
         ui.add_space(8.0);
+        let mut resync_note = None;
         ui.horizontal(|ui| {
+            let reserve = if self.resync.is_some() {
+                crate::widgets::resync::BUTTON_WIDTH + ui.spacing().item_spacing.x
+            } else {
+                0.0
+            };
             ui.add(
                 TextEdit::singleline(&mut self.search)
                     .hint_text("󰍉  Поиск сайтов...")
-                    .desired_width(ui.available_width()),
+                    .desired_width((ui.available_width() - reserve - 8.0).max(120.0)),
             );
+            if let Some(r) = &self.resync {
+                resync_note = crate::widgets::resync::button(ui, r);
+            }
         });
+        if let Some((text, color)) = resync_note {
+            ui.label(RichText::new(text).size(12.5).color(color));
+        }
         ui.add_space(8.0);
 
         // ── Список сайтов ───────────────────────────────────────────────────

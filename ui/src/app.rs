@@ -179,6 +179,12 @@ impl VoidApp {
         sites.site_http_port = backend.site_http_port;
         sites.dns_names      = Some(std::sync::Arc::clone(&backend.dns_names));
         sites.permissions    = Some(backend.site_access.permissions.clone());
+        let resync = crate::widgets::resync::Resync {
+            tx:     backend.resync_tx.clone(),
+            status: std::sync::Arc::clone(&backend.resync_status),
+        };
+        sites.resync         = Some(resync.clone());
+        storage.resync       = Some(resync);
 
         // Страница голосований: снимок предложений + каналы создания/голоса.
         let mut votes = VotesPage::default();

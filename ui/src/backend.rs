@@ -498,6 +498,22 @@ fn author_tier(snapshot: &Mutex<void_trust::TrustMap>, id: &NodeId) -> AuthorTie
     }
 }
 
+/// «Переспросить соседей»: что показать в интерфейсе.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ResyncStatus {
+    #[default]
+    Idle,
+    /// Запросы отправлены, ждём ответов.
+    Running,
+    /// Не с кем говорить.
+    NoNeighbors,
+    /// Ответы собраны: сколько соседей спросили и сколько нового пришло.
+    Done { neighbors: usize, new_files: i64, new_sites: i64, at: std::time::Instant },
+}
+
+/// Сколько ждём ответов соседей после «переспросить».
+const RESYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// Команда GUI → backend для зеркалирования (кэширования) чужого сайта.
 #[derive(Clone, Debug)]
 pub enum MirrorCmd {
@@ -705,6 +721,9 @@ pub struct BackendHandle {
     pub snapshot_gen: Arc<AtomicU64>,
     /// JS API сайтов: выданные разрешения и вопросы к пользователю.
     pub site_access: crate::site_api::SiteAccess,
+    /// «Переспросить соседей»: команда и её итог.
+    pub resync_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    pub resync_status: Arc<Mutex<ResyncStatus>>,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
     /// командами `TrustCmd::{Allow, Block, Unblock}`).
     pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
@@ -828,6 +847,9 @@ pub fn start_backend(
     let snapshot_gen_bg = Arc::clone(&snapshot_gen);
     let site_access = crate::site_api::SiteAccess::load(&data_dir);
     let site_access_bg = site_access.clone();
+    let (resync_tx, resync_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let resync_status: Arc<Mutex<ResyncStatus>> = Arc::new(Mutex::new(ResyncStatus::Idle));
+    let resync_status_bg = Arc::clone(&resync_status);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -853,6 +875,7 @@ pub fn start_backend(
                 bytes_uploaded_bg, bytes_downloaded_bg,
                 trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg, trust_details_bg,
                 chat_links_bg, topology_bg, snapshot_gen_bg, site_access_bg,
+                resync_rx, resync_status_bg,
             ).await;
         });
     });
@@ -909,6 +932,8 @@ pub fn start_backend(
         topology,
         snapshot_gen,
         site_access,
+        resync_tx,
+        resync_status,
     }
 }
 
@@ -964,6 +989,8 @@ async fn backend_main(
     topology_out: Arc<Mutex<TopologyMap>>,
     snapshot_gen: Arc<AtomicU64>,
     site_access: crate::site_api::SiteAccess,
+    resync_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    resync_out: Arc<Mutex<ResyncStatus>>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1721,6 +1748,7 @@ async fn backend_main(
                         manager.clone(), my_peer.id.clone(), site_http_port,
                         chat.clone(), Arc::clone(&sites_peers), dns.clone(),
                         site_kp, publish_site_rx, sites_out, mirror_rx, Some(site_api),
+                        Arc::clone(&removed_files), resync_rx, resync_out,
                     );
                     start_storage_tasks(
                         manager, pool, chat.clone(), peer_list.clone(),
@@ -1761,8 +1789,13 @@ fn start_site_tasks(
     sites_out:  Arc<Mutex<Vec<SiteInfo>>>,
     mut mirror_rx: tokio::sync::mpsc::UnboundedReceiver<MirrorCmd>,
     site_api:   Option<void_web::SiteApi>,
+    removed_files: Arc<Mutex<HashSet<String>>>,
+    mut resync_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    resync_out: Arc<Mutex<ResyncStatus>>,
 ) {
     let my_key = my_id.as_str().to_string();
+    // Недостающие файлы сайтов (от HTTP-сервера и при обнаружении сайта).
+    let (missing_tx, mut missing_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
 
     // Набор зеркалируемых (кэшируемых нами) сайтов — переживает перезапуск.
     let mirrored_set = load_mirrored_sites();
@@ -1784,14 +1817,50 @@ fn start_site_tasks(
     let mirror_kp    = Arc::clone(&keypair); // для подписи надгробия
     let pub_kp       = keypair;              // для подписи манифестов публикуемых сайтов
 
+    // Недостающие файлы сайтов: сначала из памяти чата (манифест мог не дойти до
+    // базы), остальное спрашиваем у соседей. Один и тот же файл — не чаще раза
+    // в 10 с (страница с десятком картинок не шлёт десяток одинаковых запросов).
+    let heal_chat = chat.clone();
+    let heal_mgr = manager.clone();
+    let heal_removed = Arc::clone(&removed_files);
+    tokio::spawn(async move {
+        let mut recent: HashMap<String, std::time::Instant> = HashMap::new();
+        while let Some(ids) = missing_rx.recv().await {
+            let now = std::time::Instant::now();
+            recent.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(10));
+            let mut fresh: Vec<String> = ids.into_iter().filter(|id| !recent.contains_key(id)).collect();
+            fresh.sort();
+            fresh.dedup();
+            if fresh.is_empty() {
+                continue;
+            }
+            for id in &fresh {
+                recent.insert(id.clone(), now);
+            }
+            reconcile_manifests(&heal_chat, &heal_mgr, &heal_removed, Some(&fresh)).await;
+            let mut still = Vec::new();
+            for id in fresh {
+                if !heal_mgr.knows_file(&id).await.unwrap_or(true) {
+                    still.push(id);
+                }
+            }
+            if !still.is_empty() {
+                let n = heal_chat.request_manifests(still.clone()).await;
+                tracing::info!("Сайтам не хватает {} файлов — спросили {} соседей", still.len(), n);
+            }
+        }
+    });
+
     // HTTP-сервер сайтов (peers — источник для докачки файлов сетевых сайтов).
     let srv_reg = registry.clone();
     let srv_mgr = manager.clone();
+    let srv_missing = missing_tx.clone();
     tokio::spawn(async move {
         // Только loopback: страницы сайтов нужны своему браузеру. Открытый в сеть
         // порт позволял бы любому заставить узел скачивать произвольные файлы.
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], http_port));
-        if let Err(e) = void_web::serve_with_api(addr, srv_reg, srv_mgr, peers, site_api).await {
+        let opts = void_web::ServerOptions { api: site_api, missing: Some(srv_missing) };
+        if let Err(e) = void_web::serve_with_api(addr, srv_reg, srv_mgr, peers, opts).await {
             tracing::error!("Site HTTP server failed on {}: {}", http_port, e);
         }
     });
@@ -1802,6 +1871,7 @@ fn start_site_tasks(
     let disc_out  = Arc::clone(&sites_out);
     let disc_key  = my_key.clone();
     let disc_mirror = Arc::clone(&mirrored);
+    let disc_missing = missing_tx.clone();
     let mut site_rx = chat.subscribe_sites();
     tokio::spawn(async move {
         loop {
@@ -1810,6 +1880,12 @@ fn start_site_tasks(
                     tracing::info!("Обнаружен сайт в сети: '{}' ({} файлов)",
                         manifest.name, manifest.entries.len());
                     let old = disc_reg.get(&manifest.name).await;
+                    // Файлы сайта, которых у нас нет (манифест мог отсечь лимит или
+                    // потеряться), — сразу спрашиваем, не дожидаясь открытия сайта.
+                    let missing = missing_site_files(&disc_mgr, std::slice::from_ref(&manifest)).await;
+                    if !missing.is_empty() {
+                        let _ = disc_missing.send(missing);
+                    }
                     disc_reg.register(manifest).await;
                     // Новая версия чужого сайта: кэш файлов прошлой версии (зеркало
                     // или открытые страницы) больше не нужен — стираем.
@@ -1865,6 +1941,52 @@ fn start_site_tasks(
         }
     });
 
+    // «Переспросить соседей»: соседи присылают всё заново (как при новой
+    // связи), а мы чиним своё — манифесты, застрявшие в памяти чата, и
+    // недостающие файлы известных сайтов. Через несколько секунд считаем,
+    // сколько пришло нового.
+    let rs_chat = chat.clone();
+    let rs_mgr = manager.clone();
+    let rs_reg = registry.clone();
+    let rs_removed = Arc::clone(&removed_files);
+    let rs_missing = missing_tx;
+    tokio::spawn(async move {
+        while resync_rx.recv().await.is_some() {
+            while resync_rx.try_recv().is_ok() {} // нажали несколько раз — один запрос
+            *resync_out.lock().unwrap() = ResyncStatus::Running;
+            let files0 = rs_mgr.known_file_count().await.unwrap_or(0) as i64;
+            let sites0 = rs_reg.list().await.len() as i64;
+            let neighbors = rs_chat.request_resync().await;
+            if neighbors == 0 {
+                *resync_out.lock().unwrap() = ResyncStatus::NoNeighbors;
+                continue;
+            }
+            tracing::info!("Переспрашиваю соседей ({neighbors})");
+            let fixed = reconcile_manifests(&rs_chat, &rs_mgr, &rs_removed, None).await;
+            if fixed > 0 {
+                tracing::info!("Из памяти чата восстановлено манифестов: {fixed}");
+            }
+            let missing = missing_site_files(&rs_mgr, &rs_reg.list().await).await;
+            if !missing.is_empty() {
+                let _ = rs_missing.send(missing);
+            }
+            tokio::time::sleep(RESYNC_WAIT).await;
+            // Сайты, пришедшие за это время, тоже могли прийти без части файлов.
+            let missing = missing_site_files(&rs_mgr, &rs_reg.list().await).await;
+            if !missing.is_empty() {
+                let _ = rs_missing.send(missing);
+            }
+            let files1 = rs_mgr.known_file_count().await.unwrap_or(0) as i64;
+            let sites1 = rs_reg.list().await.len() as i64;
+            *resync_out.lock().unwrap() = ResyncStatus::Done {
+                neighbors,
+                new_files: files1 - files0,
+                new_sites: sites1 - sites0,
+                at: std::time::Instant::now(),
+            };
+        }
+    });
+
     // Публикация сайтов из GUI: публикуем файлы, объявляем их манифесты
     // (чтобы пиры могли докачать), затем объявляем сам сайт.
     let pub_chat = chat.clone();
@@ -1886,12 +2008,6 @@ fn start_site_tasks(
                 Ok(manifest) => {
                     tracing::info!("Опубликован сайт '{}' ({} файлов) → http://{}.localhost:{}/",
                         manifest.name, manifest.entries.len(), manifest.name, http_port);
-                    // Объявляем каждый файл сайта (мульти-сидинг + докачка у пиров).
-                    for entry in &manifest.entries {
-                        if let Ok(Some(fm)) = manager.file_manifest(&entry.file_id).await {
-                            pub_chat.announce_file(fm).await;
-                        }
-                    }
                     let site_name = manifest.name.clone();
                     let old = registry.get(&site_name).await;
                     registry.register(manifest.clone()).await;
@@ -1903,8 +2019,16 @@ fn start_site_tasks(
                             let _ = manager.delete_file(&file_id).await;
                         }
                     }
-                    // Объявляем сайт сети.
+                    // Объявляем сайт сети, затем его файлы (мульти-сидинг + докачка у
+                    // пиров). Именно в таком порядке: файлы уже известного соседу
+                    // сайта не упираются в его лимит публикаций.
+                    let entries: Vec<String> = manifest.entries.iter().map(|e| e.file_id.clone()).collect();
                     pub_chat.announce_site(manifest).await;
+                    for file_id in entries {
+                        if let Ok(Some(fm)) = manager.file_manifest(&file_id).await {
+                            pub_chat.announce_file(fm).await;
+                        }
+                    }
                     refresh_sites(&registry, &my_key, http_port, &pub_mirror, &sites_out).await;
                     // Заявляем DNS-имя сайта (.void) — владение + резолв.
                     dns.claim(DnsKind::Site, &site_name, None, Some(http_port)).await;
@@ -2225,6 +2349,7 @@ fn start_storage_tasks(
     // приём манифестов файлов из сети → регистрация файла локально
     let ann_mgr = manager.clone();
     let ann_removed = Arc::clone(&removed_files);
+    let ann_chat = chat.clone();
     let mut manifest_rx = chat.subscribe_manifests();
     tokio::spawn(async move {
         loop {
@@ -2244,7 +2369,11 @@ fn start_storage_tasks(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(k)) => {
-                    tracing::warn!("Manifest stream lagged by {}", k);
+                    // Чат уже запомнил эти манифесты и второй раз их не пришлёт —
+                    // дочитываем пропущенное из его памяти.
+                    tracing::warn!("Очередь манифестов переполнилась ({k}) — дочитываю из памяти чата");
+                    let n = reconcile_manifests(&ann_chat, &ann_mgr, &ann_removed, None).await;
+                    tracing::info!("Восстановлено манифестов: {n}");
                 }
                 Err(_) => break,
             }
@@ -2797,6 +2926,49 @@ fn db_msg_to_chat(m: void_db::messages::PublicMessage) -> ChatMessage {
         signature: if m.signature.is_empty() { None } else { Some(m.signature) },
         channel:   m.channel,
     }
+}
+
+
+/// Манифесты, которые чат знает, а в базе их нет: потерялись в переполненной
+/// очереди к backend (чат второй раз их не пришлёт). `only` — проверить только
+/// эти файлы. Возвращает, сколько записано.
+async fn reconcile_manifests(
+    chat: &ChatHandle,
+    manager: &StorageManager,
+    removed: &Arc<Mutex<HashSet<String>>>,
+    only: Option<&[String]>,
+) -> usize {
+    let manifests = match only {
+        Some(ids) => chat.known_manifests(ids).await,
+        None => chat.get_manifests().await,
+    };
+    let mut fixed = 0;
+    for m in manifests {
+        if removed.lock().unwrap().contains(&m.file_id) {
+            continue; // удалён голосованием
+        }
+        if manager.knows_file(&m.file_id).await.unwrap_or(true) {
+            continue;
+        }
+        match manager.handle_manifest(&m).await {
+            Ok(()) => fixed += 1,
+            Err(e) => tracing::warn!("Манифест '{}' не принят: {}", m.name, e),
+        }
+    }
+    fixed
+}
+
+/// Файлы сайтов, которых узел не знает (нет манифеста).
+async fn missing_site_files(manager: &StorageManager, sites: &[void_core::site::SiteManifest]) -> Vec<String> {
+    let mut out = Vec::new();
+    for site in sites {
+        for e in &site.entries {
+            if !manager.knows_file(&e.file_id).await.unwrap_or(true) && !out.contains(&e.file_id) {
+                out.push(e.file_id.clone());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

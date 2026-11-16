@@ -98,6 +98,8 @@ pub struct StoragePage {
     pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Открытый системный диалог выбора файла (в фоновом потоке).
     pick_job: crate::bg::Job<Option<PathBuf>>,
+    /// «Переспросить соседей».
+    pub resync: Option<crate::widgets::resync::Resync>,
 }
 
 
@@ -331,12 +333,26 @@ impl StoragePage {
         // === Заголовок ===
         crate::theme::page_header(ui, "\u{F02CA}", "Хранилище", Some("Файлы, которыми делятся узлы сети"));
 
-        // === Поиск ===
-        ui.add(
-            TextEdit::singleline(&mut self.search)
-                .hint_text("󰍉  Поиск по файлам и пользователям…")
-                .desired_width(f32::INFINITY),
-        );
+        // === Поиск + «Переспросить соседей» ===
+        let mut resync_note = None;
+        ui.horizontal(|ui| {
+            let reserve = if self.resync.is_some() {
+                crate::widgets::resync::BUTTON_WIDTH + ui.spacing().item_spacing.x
+            } else {
+                0.0
+            };
+            ui.add(
+                TextEdit::singleline(&mut self.search)
+                    .hint_text("󰍉  Поиск по файлам и пользователям…")
+                    .desired_width((ui.available_width() - reserve - 8.0).max(120.0)),
+            );
+            if let Some(r) = &self.resync {
+                resync_note = crate::widgets::resync::button(ui, r);
+            }
+        });
+        if let Some((text, color)) = resync_note {
+            ui.label(RichText::new(text).size(12.5).color(color));
+        }
 
         ui.add_space(6.0);
 

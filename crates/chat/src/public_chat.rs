@@ -142,6 +142,12 @@ pub enum ChatPacket {
     SiteRecordSync { records: Vec<SignedMessage> },
     /// Дайджест записей сайтов: сосед досылает то, чего у нас нет.
     SiteDigest { items: Vec<SiteDigestItem> },
+    /// «Пришли манифесты этих файлов, если знаешь» — узел не нашёл у себя
+    /// файлы сайта. Ответ — обычные `FileAnnounce` только спросившему.
+    ManifestRequest { file_ids: Vec<String> },
+    /// «Переспросить соседей»: сосед заново присылает всё, что шлёт при новой
+    /// связи (файлы, сайты, имена, поручительства, дайджест записей сайтов).
+    ResyncRequest,
     Ping,
     Pong,
     /// Неизвестный тип пакета — игнорируется для совместимости версий
@@ -212,6 +218,14 @@ pub enum SiteDataGossip {
 
 /// Сколько записей в одном пакете досылки.
 pub const SITE_SYNC_BATCH: usize = 200;
+/// Сколько файлов можно спросить одним `ManifestRequest`.
+pub const MAX_MANIFEST_REQUEST: usize = 1000;
+/// Предел файлов в одном сайте: файлы принятого сайта проходят без лимита
+/// публикаций (см. `merge_manifest`), поэтому их число ограничено.
+pub const MAX_SITE_ENTRIES: usize = 5000;
+/// Как часто сосед может просить нас «переспросить» (полная пересылка
+/// известного — не дешёвая операция).
+const RESYNC_MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// Сколько строк дайджеста принимаем от соседа.
 pub const MAX_SITE_DIGEST_ITEMS: usize = 20_000;
 
@@ -304,6 +318,8 @@ struct PublicChatInner {
     topology:    Mutex<Topology>,
     /// Связи изменились — разослать наш список соседей.
     links_changed: Notify,
+    /// Когда сосед последний раз просил «переспросить» (лимит частоты).
+    resync_asked: Mutex<HashMap<NodeId, Instant>>,
 }
 
 impl PublicChat {
@@ -360,6 +376,7 @@ impl PublicChat {
                 dns_cache:   Mutex::new(HashMap::new()),
                 topology:    Mutex::new(Topology::default()),
                 links_changed: Notify::new(),
+                resync_asked: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -577,7 +594,11 @@ impl PublicChat {
                     warn!("Отброшен манифест файла {} без верной подписи публикатора", incoming.file_id);
                     return None;
                 }
-                if src.is_some() {
+                // Файл уже принятого сайта — не отдельная публикация: сайт прошёл
+                // лимит целиком. Иначе сайт незнакомца из десятка файлов упирался
+                // в «10 публикаций в час»: описание сайта доходило, а часть его
+                // файлов — нет («файл недоступен» у всех, кто открыл сайт).
+                if src.is_some() && !self.site_references(&incoming.file_id).await {
                     let publisher = incoming.publisher.as_ref()?;
                     if !self.admit(publisher, Kind::Publish) {
                         return None;
@@ -587,6 +608,93 @@ impl PublicChat {
                 Some(incoming)
             }
         }
+    }
+
+    /// Файл входит в один из известных сайтов.
+    async fn site_references(&self, file_id: &str) -> bool {
+        self.inner.sites.lock().await.values().any(|m| m.entries.iter().any(|e| e.file_id == file_id))
+    }
+
+    /// Известные манифесты из списка (чат помнит больше, чем успел записать backend).
+    pub async fn known_manifests(&self, file_ids: &[String]) -> Vec<FileManifest> {
+        let map = self.inner.manifests.lock().await;
+        file_ids.iter().filter_map(|id| map.get(id).cloned()).collect()
+    }
+
+    /// Просит соседей прислать манифесты файлов. Возвращает, скольких спросили.
+    pub async fn request_manifests(&self, file_ids: Vec<String>) -> usize {
+        let links = self.inner.links.lock().await;
+        for chunk in file_ids.chunks(MAX_MANIFEST_REQUEST) {
+            for link in links.values() {
+                let _ = link.tx.try_send(ChatPacket::ManifestRequest { file_ids: chunk.to_vec() });
+            }
+        }
+        links.len()
+    }
+
+    /// Ответ на `ManifestRequest`: известные манифесты — только спросившему.
+    async fn handle_manifest_request(&self, file_ids: Vec<String>, from: &NodeId) {
+        let Some(tx) = self.inner.links.lock().await.get(from).map(|l| l.tx.clone()) else { return };
+        let mut file_ids = file_ids;
+        file_ids.truncate(MAX_MANIFEST_REQUEST);
+        let found = self.known_manifests(&file_ids).await;
+        if found.is_empty() {
+            return;
+        }
+        debug!("Сосед {} спросил {} манифестов, знаем {}", short(from), file_ids.len(), found.len());
+        tokio::spawn(async move {
+            for m in found {
+                if tx.send(ChatPacket::FileAnnounce(m)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// «Переспросить соседей»: просим всех соседей прислать известное заново.
+    /// Возвращает, скольких спросили.
+    ///
+    /// Сигнал новой связи уходит и нашему backend'у: он передаст соседям свой
+    /// дайджест записей сайтов (в ответ они дошлют то, чего нет у нас) и
+    /// поручительства — обмен получается в обе стороны, как при подключении.
+    pub async fn request_resync(&self) -> usize {
+        let peers: Vec<NodeId> = {
+            let links = self.inner.links.lock().await;
+            for link in links.values() {
+                let _ = link.tx.try_send(ChatPacket::ResyncRequest);
+            }
+            links.keys().cloned().collect()
+        };
+        for peer in &peers {
+            let _ = self.inner.link_tx.send(peer.clone());
+        }
+        peers.len()
+    }
+
+    /// Сосед просит прислать всё заново: то же, что при новой связи. Не чаще
+    /// раза в [`RESYNC_MIN_INTERVAL`] от одного соседа.
+    async fn handle_resync_request(&self, from: &NodeId) {
+        {
+            let mut asked = self.inner.resync_asked.lock().await;
+            let now = Instant::now();
+            if asked.get(from).is_some_and(|t| now.duration_since(*t) < RESYNC_MIN_INTERVAL) {
+                return;
+            }
+            asked.insert(from.clone(), now);
+        }
+        let Some(tx) = self.inner.links.lock().await.get(from).map(|l| l.tx.clone()) else { return };
+        info!("Сосед {} попросил прислать всё заново", short(from));
+        let packets = self.sync_packets().await;
+        tokio::spawn(async move {
+            for pkt in packets {
+                if tx.send(pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // Backend передаст то, что хранит сам (поручительства, дайджест записей
+        // сайтов), — как для новой связи.
+        let _ = self.inner.link_tx.send(from.clone());
     }
 
     // ─── Сайты (обнаружение в сети) ───────────────────────────────────────────
@@ -621,6 +729,11 @@ impl PublicChat {
         // принимаем только нормализованную метку `[a-z0-9-]` (как при публикации).
         if !is_normalized_site_name(&incoming.name) {
             warn!("Отброшен анонс сайта с недопустимым именем {:?}", incoming.name);
+            return None;
+        }
+        // Файлы принятого сайта идут без лимита публикаций — их число ограничено.
+        if incoming.entries.len() > MAX_SITE_ENTRIES {
+            warn!("Отброшен сайт '{}': {} файлов (предел {})", incoming.name, incoming.entries.len(), MAX_SITE_ENTRIES);
             return None;
         }
         // Владелец подписывает манифест: подменить файлы сайта «от его имени» нельзя.
@@ -1310,6 +1423,8 @@ async fn read_loop<R: AsyncReadExt + Unpin>(
             ChatPacket::Links { signed } => chat.handle_links(signed, src).await,
             ChatPacket::SiteRecord { signed } => chat.handle_site_record(signed, &peer).await,
             ChatPacket::SiteRecordSync { records } => chat.handle_site_sync(records, &peer).await,
+            ChatPacket::ManifestRequest { file_ids } => chat.handle_manifest_request(file_ids, &peer).await,
+            ChatPacket::ResyncRequest => chat.handle_resync_request(&peer).await,
             ChatPacket::SiteDigest { mut items } => {
                 items.truncate(MAX_SITE_DIGEST_ITEMS);
                 let _ = chat.inner.site_data_tx.send(SiteDataGossip::Digest { items, from: peer.clone() });
@@ -1379,12 +1494,14 @@ impl PublicChat {
             out.push(ChatPacket::ProfileUpdate(mine));
         }
         out.extend(self.inner.profiles.lock().await.values().cloned().map(ChatPacket::ProfileUpdate));
-        out.extend(self.inner.manifests.lock().await.values().cloned().map(ChatPacket::FileAnnounce));
+        // Сайты — раньше файлов: файлы известного сайта соседа идут без лимита
+        // публикаций (см. `merge_manifest`).
         out.extend(self.inner.sites.lock().await.values().cloned().map(ChatPacket::SiteAnnounce));
         out.extend(
             self.inner.site_tombstones.lock().await.values()
                 .map(|(_, signed)| ChatPacket::SiteRevoke { signed: signed.clone() }),
         );
+        out.extend(self.inner.manifests.lock().await.values().cloned().map(ChatPacket::FileAnnounce));
         out.extend(
             self.inner.dns_cache.lock().await.values()
                 .map(|(_, signed)| ChatPacket::DnsAnnounce { signed: signed.clone() }),
@@ -1807,6 +1924,16 @@ impl ChatHandle {
     }
     /// Текущие соседи по общему чату.
     pub async fn neighbors(&self) -> Vec<NodeId> { self.chat.neighbors().await }
+    /// Манифесты из списка, которые чат знает (мог не успеть отдать backend'у).
+    pub async fn known_manifests(&self, file_ids: &[String]) -> Vec<FileManifest> {
+        self.chat.known_manifests(file_ids).await
+    }
+    /// Спросить у соседей манифесты файлов. Возвращает число соседей.
+    pub async fn request_manifests(&self, file_ids: Vec<String>) -> usize {
+        self.chat.request_manifests(file_ids).await
+    }
+    /// «Переспросить соседей»: все соседи присылают известное заново.
+    pub async fn request_resync(&self) -> usize { self.chat.request_resync().await }
 }
 
 // ─── Сериализация ────────────────────────────────────────────────────────────
@@ -2957,6 +3084,127 @@ mod tests {
 
         node_a.relay_site_record(rec.clone(), None).await;
         assert!(timeout(Duration::from_millis(300), data_b.recv()).await.is_err(), "повтор погашен");
+    }
+
+    /// Манифест файла `id` от `kp` (содержимое не важно — важна подпись).
+    fn file_of(id: &str, kp: &SigningKeypair, owner: &NodeId) -> FileManifest {
+        sign_file(FileManifest {
+            file_id: id.into(),
+            name: format!("{id}.bin"),
+            size_bytes: 10,
+            mime_type: None,
+            owners: vec![owner.clone()],
+            chunks: vec![ChunkMeta { hash: "b".repeat(64), index: 0, size: 10 }],
+            publisher: None,
+            signature: None,
+        }, kp)
+    }
+
+    fn site_of(name: &str, files: &[String], kp: &SigningKeypair, owner: &NodeId, at: i64) -> SiteManifest {
+        sign_site(SiteManifest {
+            site_id: format!("{name}-{at}"),
+            name: name.into(),
+            owner: owner.clone(),
+            entries: files.iter().map(|f| void_core::site::SiteEntry {
+                path: format!("{f}.html"), file_id: f.clone(), size_bytes: 10,
+            }).collect(),
+            created_at: at,
+            signature: None,
+        }, kp)
+    }
+
+    /// Сколько манифестов придёт за `ms` миллисекунд.
+    async fn count_manifests(rx: &mut broadcast::Receiver<FileManifest>, ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        while let Ok(Ok(m)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            out.push(m.file_id);
+        }
+        out
+    }
+
+    async fn linked(a: &ChatHandle, b: &ChatHandle) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while a.link_count().await == 0 || b.link_count().await == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "нет связи");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Сайт незнакомца из 15 файлов доходит целиком: его файлы — не отдельные
+    /// публикации. Те же 15 файлов без сайта упираются в лимит публикаций.
+    #[tokio::test]
+    async fn stranger_site_files_are_not_rate_limited() {
+        let (ka, a) = mesh_peer(1);
+        let (kb, b) = mesh_peer(2);
+        let node_b = start_mesh_node(kb, &b, &[]).await;
+        let stranger = a.id.clone();
+        node_b.set_author_tiers(Arc::new(move |id: &NodeId| {
+            if *id == stranger { AuthorTier::Stranger } else { AuthorTier::Trusted }
+        }));
+        let mut files_b = node_b.subscribe_manifests();
+        let node_a = start_mesh_node(ka.clone(), &a, &[&b]).await;
+        linked(&node_a, &node_b).await;
+
+        let site_files: Vec<String> = (0..15).map(|i| format!("site{i:02}")).collect();
+        node_a.announce_site(site_of("big", &site_files, &ka, &a.id, 100)).await;
+        for f in &site_files {
+            node_a.announce_file(file_of(f, &ka, &a.id)).await;
+        }
+        let got = count_manifests(&mut files_b, 1500).await;
+        assert_eq!(got.len(), 15, "все файлы сайта: {got:?}");
+
+        for i in 0..15 {
+            node_a.announce_file(file_of(&format!("loose{i:02}"), &ka, &a.id)).await;
+        }
+        let got = count_manifests(&mut files_b, 1500).await;
+        assert_eq!(got.len(), 9, "отдельные файлы — в пределах лимита (10 минус сайт): {got:?}");
+    }
+
+    /// Пропавший файл сайта узел запрашивает у соседа; «переспросить» доходит
+    /// до соседа и не чаще раза в 15 с.
+    #[tokio::test]
+    async fn missing_manifest_can_be_requested_and_resync_is_rate_limited() {
+        use std::sync::atomic::AtomicBool;
+        let (ka, a) = mesh_peer(1);
+        let (kb, b) = mesh_peer(2);
+        let node_b = start_mesh_node(kb, &b, &[]).await;
+        let trusted = Arc::new(AtomicBool::new(false));
+        let (who, flag) = (a.id.clone(), Arc::clone(&trusted));
+        node_b.set_author_tiers(Arc::new(move |id: &NodeId| {
+            if *id == who && !flag.load(Ordering::SeqCst) { AuthorTier::Stranger } else { AuthorTier::Trusted }
+        }));
+        let mut files_b = node_b.subscribe_manifests();
+        let mut sites_b = node_b.subscribe_sites();
+        let node_a = start_mesh_node(ka.clone(), &a, &[&b]).await;
+        let mut links_a = node_a.subscribe_links();
+        linked(&node_a, &node_b).await;
+        let _ = timeout(Duration::from_secs(2), links_a.recv()).await; // сигнал самой связи
+
+        // Лимит исчерпан: файл X, объявленный до сайта, B отбрасывает.
+        for i in 0..10 {
+            node_a.announce_file(file_of(&format!("loose{i}"), &ka, &a.id)).await;
+        }
+        node_a.announce_file(file_of("x", &ka, &a.id)).await;
+        let got = count_manifests(&mut files_b, 1500).await;
+        assert!(!got.contains(&"x".to_string()), "X отброшен лимитом: {got:?}");
+
+        // Потом B стал доверять A и принял сайт с X — но самого X у него нет.
+        trusted.store(true, Ordering::SeqCst);
+        node_a.announce_site(site_of("s", &["x".to_string()], &ka, &a.id, 200)).await;
+        let site = timeout(Duration::from_secs(5), sites_b.recv()).await.unwrap().unwrap();
+        assert_eq!(site.name, "s");
+        assert!(node_b.known_manifests(&["x".to_string()]).await.is_empty());
+
+        assert_eq!(node_b.request_manifests(vec!["x".into(), "unknown".into()]).await, 1);
+        let got = count_manifests(&mut files_b, 2000).await;
+        assert_eq!(got, vec!["x".to_string()], "сосед прислал известный ему манифест");
+
+        assert_eq!(node_b.request_resync().await, 1);
+        let resynced = timeout(Duration::from_secs(5), links_a.recv()).await;
+        assert!(matches!(resynced, Ok(Ok(ref id)) if *id == b.id), "A передаёт B всё заново: {resynced:?}");
+        assert_eq!(node_b.request_resync().await, 1);
+        assert!(timeout(Duration::from_millis(500), links_a.recv()).await.is_err(), "повтор чаще 15 с — мимо");
     }
 
     /// Собирает тексты сообщений из приёмника за `ms` миллисекунд.

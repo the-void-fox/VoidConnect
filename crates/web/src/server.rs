@@ -46,6 +46,24 @@ pub(crate) struct AppState {
     pub(crate) peers: PeerSnapshot,
     /// JS API (без него сайты — только статика).
     pub(crate) api: Option<SiteApi>,
+    /// Куда сообщать о файлах сайта, которых нет у узла (backend спросит соседей).
+    pub(crate) missing: Option<MissingFiles>,
+}
+
+/// Канал «у сайта не хватает этих файлов»: backend достаёт их манифесты из
+/// памяти чата или просит у соседей.
+pub type MissingFiles = tokio::sync::mpsc::UnboundedSender<Vec<String>>;
+
+/// Сколько страница ждёт, пока недостающий файл сайта придёт от соседей.
+pub const MISSING_FILE_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Дополнительные возможности сервера сайтов.
+#[derive(Default)]
+pub struct ServerOptions {
+    /// JS API (без него сайты — только статика).
+    pub api: Option<SiteApi>,
+    /// Сообщать о недостающих файлах сайтов.
+    pub missing: Option<MissingFiles>,
 }
 
 /// Собирает роутер раздачи сайтов без JS API (только статика).
@@ -60,7 +78,17 @@ pub fn router_with_api(
     peers: PeerSnapshot,
     api: Option<SiteApi>,
 ) -> Router {
-    let state = AppState { registry, storage, peers, api };
+    router_with_options(registry, storage, peers, ServerOptions { api, missing: None })
+}
+
+/// Собирает роутер раздачи сайтов со всеми возможностями.
+pub fn router_with_options(
+    registry: SiteRegistry,
+    storage: StorageManager,
+    peers: PeerSnapshot,
+    opts: ServerOptions,
+) -> Router {
+    let state = AppState { registry, storage, peers, api: opts.api, missing: opts.missing };
     let json_limit = DefaultBodyLimit::max(api::MAX_JSON_BYTES);
     Router::new()
         .route("/.void/sdk.js", get(api::sdk))
@@ -93,7 +121,7 @@ pub async fn serve(
     storage: StorageManager,
     peers: PeerSnapshot,
 ) -> std::io::Result<()> {
-    serve_with_api(addr, registry, storage, peers, None).await
+    serve_with_api(addr, registry, storage, peers, ServerOptions::default()).await
 }
 
 /// Запускает HTTP-сервер сайтов с JS API (блокирует задачу).
@@ -102,11 +130,11 @@ pub async fn serve_with_api(
     registry: SiteRegistry,
     storage: StorageManager,
     peers: PeerSnapshot,
-    api: Option<SiteApi>,
+    opts: ServerOptions,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Site server listening on http://{}", addr);
-    axum::serve(listener, router_with_api(registry, storage, peers, api)).await
+    axum::serve(listener, router_with_options(registry, storage, peers, opts)).await
 }
 
 /// Заголовки безопасности на каждом ответе (см. [`crate::security`]).
@@ -249,6 +277,21 @@ async fn serve_file(s: &AppState, site: &str, path: &str, headers: &HeaderMap) -
     };
     let layout = match s.storage.file_layout(&entry.file_id).await {
         Ok(l) => l,
+        Err(void_storage::StorageError::FileNotFound(_)) => match wait_for_missing(s, &manifest, &entry.file_id).await {
+            Some(l) => l,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Файл «{path}» сайта {site}.void ещё не пришёл от соседей.\n\n\
+                         Обновите страницу через минуту или нажмите «Переспросить соседей» \
+                         на вкладке «Сайты» в Void Connect. Если не поможет — автору сайта \
+                         стоит быть в сети, чтобы раздать файлы."
+                    ),
+                )
+                    .into_response()
+            }
+        },
         Err(e) => {
             return (StatusCode::SERVICE_UNAVAILABLE, format!("файл недоступен (нет сидеров?): {}", e))
                 .into_response()
@@ -258,4 +301,32 @@ async fn serve_file(s: &AppState, site: &str, path: &str, headers: &HeaderMap) -
     // Сайт могут обновить — браузер должен перепроверять.
     extra.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     api::serve_layout(s, layout, headers, content_type(path), extra).await
+}
+
+/// Файла сайта у узла нет (манифест потерялся или не дошёл): сообщаем backend
+/// все недостающие файлы этого сайта и ждём, пока придёт нужный.
+async fn wait_for_missing(
+    s: &AppState,
+    manifest: &void_core::site::SiteManifest,
+    file_id: &str,
+) -> Option<void_storage::FileLayout> {
+    let missing_tx = s.missing.as_ref()?;
+    let mut missing = Vec::new();
+    for e in &manifest.entries {
+        if !s.storage.knows_file(&e.file_id).await.unwrap_or(true) {
+            missing.push(e.file_id.clone());
+        }
+    }
+    if missing.is_empty() {
+        missing.push(file_id.to_string());
+    }
+    let _ = missing_tx.send(missing);
+    let deadline = tokio::time::Instant::now() + MISSING_FILE_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(l) = s.storage.file_layout(file_id).await {
+            return Some(l);
+        }
+    }
+    None
 }

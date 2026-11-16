@@ -533,6 +533,16 @@ impl StorageManager {
         }
     }
 
+    /// Знаем ли мы файл (есть его манифест), независимо от того, скачан ли он.
+    pub async fn knows_file(&self, file_id: &str) -> Result<bool, StorageError> {
+        Ok(db_chunks::get_file(&self.pool, file_id).await?.is_some())
+    }
+
+    /// Сколько файлов знает узел (свои, скачанные и известные из сети).
+    pub async fn known_file_count(&self) -> Result<usize, StorageError> {
+        Ok(db_chunks::list_files(&self.pool).await?.len())
+    }
+
     /// Возвращает процент скачанности файла (0.0 – 1.0).
     pub async fn download_progress(&self, file_id: &str) -> Result<f64, StorageError> {
         Ok(db_chunks::local_completion(&self.pool, file_id).await?)
