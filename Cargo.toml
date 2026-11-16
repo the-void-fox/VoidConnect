@@ -66,3 +66,9 @@ tempfile = "3"
 eframe = { version = "0.27", features = ["default"] }
 egui = "0.27"
 egui_extras = { version = "0.27", features = ["image"] }
+
+# Ctrl+V / Ctrl+C / Ctrl+X не работали в текстовых полях при русской раскладке
+# (egui 0.27). Копия egui-winit с переносом исправления из egui 0.28 — см.
+# third_party/egui-winit/VOID-PATCH.md. Удалить при переходе на egui 0.28+.
+[patch.crates-io]
+egui-winit = { path = "third_party/egui-winit" }
