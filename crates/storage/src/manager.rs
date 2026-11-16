@@ -12,14 +12,13 @@
 //! manager.download_file(&file_id, Path::new("/tmp/output/photo.jpg")).await?;
 //! ```
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use void_core::identity::NodeId;
 use void_core::manifest::{ChunkMeta, FileManifest};
 use void_core::peer::PeerInfo;
@@ -30,11 +29,11 @@ use void_crypto::sign::SignedMessage;
 use void_network::secure::NoiseIdentity;
 
 use crate::chunk_store::ChunkStore;
-use crate::chunker::{split_file, assemble_file};
+use crate::chunker::CHUNK_SIZE;
 use crate::error::StorageError;
 use crate::events::ChunkEvent;
 use crate::index::ChunkIndex;
-use crate::integrity::{validate_manifest, verify_publisher};
+use crate::integrity::{compute_file_id, hash_chunk, validate_manifest, verify_publisher};
 use crate::transfer::{fetch_chunk_from_peer, run_chunk_server};
 
 /// Параллельность при скачивании (одновременно N чанков)
@@ -141,40 +140,69 @@ impl StorageManager {
     ///
     /// Возвращает `file_id` — SHA-256 от манифеста чанков.
     pub async fn publish_file(&self, path: &Path) -> Result<String, StorageError> {
-        let result = split_file(path).await?;
-        let file_id = result.file_id.clone();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        self.publish_file_as(path, &name).await
+    }
+
+    /// Публикует файл под именем `name` (загрузка с сайта: байты лежат во
+    /// временном файле со служебным именем).
+    ///
+    /// Файл читается потоково, по чанку: раньше он целиком загружался в память
+    /// (и ещё раз копировался по кускам) — видео на гигабайт съедало два.
+    pub async fn publish_file_as(&self, path: &Path, name: &str) -> Result<String, StorageError> {
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut metas: Vec<(String, usize)> = Vec::new();
+        let mut total_size: u64 = 0;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            let n = read_full(&mut file, &mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let data = &buf[..n];
+            let hash = hash_chunk(data);
+            self.store.put(&hash, data).await?;
+            metas.push((hash, n));
+            total_size += n as u64;
+            if n < CHUNK_SIZE {
+                break;
+            }
+        }
+        let hashes: Vec<String> = metas.iter().map(|(h, _)| h.clone()).collect();
+        let file_id = compute_file_id(&hashes);
 
         // Регистрируем метаданные файла
         let file_record = void_db::chunks::FileRecord {
             file_id: file_id.clone(),
-            name: result.file_name.clone(),
-            size_bytes: result.total_size as i64,
-            total_chunks: result.chunks.len() as i64,
+            name: name.to_string(),
+            size_bytes: total_size as i64,
+            total_chunks: metas.len() as i64,
             owner_key: self.my_id.as_str().to_string(),
-            mime_type: mime_type_from_name(&result.file_name),
+            mime_type: mime_type_from_name(name),
             created_at: chrono::Utc::now(),
         };
         db_chunks::insert_file(&self.pool, &file_record).await?;
 
-        // Сохраняем каждый чанк
-        for (meta, data) in result.chunks.iter().zip(result.data.iter()) {
-            self.store.put(&meta.hash, data).await?;
-
+        for (index, (hash, size)) in metas.iter().enumerate() {
             let chunk_record = void_db::chunks::Chunk {
-                hash: meta.hash.clone(),
+                hash: hash.clone(),
                 file_id: file_id.clone(),
-                chunk_index: meta.index as i64,
-                size_bytes: meta.size as i64,
+                chunk_index: index as i64,
+                size_bytes: *size as i64,
                 is_local: true,
-                local_path: Some(
-                    self.store.chunk_path(&meta.hash)
-                        .to_string_lossy()
-                        .to_string()
-                ),
+                local_path: Some(self.store.chunk_path(hash).to_string_lossy().to_string()),
             };
             db_chunks::upsert_chunk(&self.pool, &chunk_record).await?;
-            db_chunks::add_chunk_owner(&self.pool, &meta.hash, self.my_id.as_str()).await?;
-            self.index.add_owner(&meta.hash, self.my_id.clone()).await;
+            // Тот же блок мог ждать скачивания в чужом файле — теперь он есть.
+            if let Some(path) = &chunk_record.local_path {
+                db_chunks::mark_local(&self.pool, hash, path).await?;
+            }
+            db_chunks::add_chunk_owner(&self.pool, hash, self.my_id.as_str()).await?;
+            self.index.add_owner(hash, self.my_id.clone()).await;
         }
 
         // Подписываем манифест как публикатор — если этот контент ещё не
@@ -190,9 +218,9 @@ impl StorageManager {
 
         info!(
             "Published '{}': file_id={}, {} chunks",
-            result.file_name,
+            name,
             &file_id[..8],
-            result.chunks.len()
+            metas.len()
         );
 
         Ok(file_id)
@@ -281,26 +309,19 @@ impl StorageManager {
             db_chunks::save_file_signature(&self.pool, &manifest.file_id, &owner_key, signature).await?;
         }
 
-        // Хэши уже имеющихся локально чанков — их не перезаписываем в remote.
-        let existing = db_chunks::get_chunks_for_file(&self.pool, &manifest.file_id).await?;
-        let local_hashes: HashSet<&str> = existing
-            .iter()
-            .filter(|c| c.is_local)
-            .map(|c| c.hash.as_str())
-            .collect();
-
         for cm in &manifest.chunks {
-            if !local_hashes.contains(cm.hash.as_str()) {
-                let chunk = void_db::chunks::Chunk {
-                    hash: cm.hash.clone(),
-                    file_id: manifest.file_id.clone(),
-                    chunk_index: cm.index,
-                    size_bytes: cm.size,
-                    is_local: false,
-                    local_path: None,
-                };
-                db_chunks::upsert_chunk(&self.pool, &chunk).await?;
-            }
+            // Блок мог уже лежать на диске (из другого файла с тем же блоком) —
+            // тогда он сразу локальный. Уже скачанное upsert не «забывает».
+            let have = self.store.has(&cm.hash);
+            let chunk = void_db::chunks::Chunk {
+                hash: cm.hash.clone(),
+                file_id: manifest.file_id.clone(),
+                chunk_index: cm.index,
+                size_bytes: cm.size,
+                is_local: have,
+                local_path: have.then(|| self.store.chunk_path(&cm.hash).to_string_lossy().to_string()),
+            };
+            db_chunks::upsert_chunk(&self.pool, &chunk).await?;
             // Регистрируем всех заявленных владельцев чанка (мульти-сидинг).
             for owner in &manifest.owners {
                 db_chunks::add_chunk_owner(&self.pool, &cm.hash, owner.as_str()).await?;
@@ -356,11 +377,11 @@ impl StorageManager {
 
         info!("Downloading '{}'...", file_meta.name);
 
-        // Скачиваем все чанки в локальное хранилище (с поддержкой паузы).
-        let flat = self.fetch_all_chunks(file_id, peers, &cancel).await?;
+        // Скачиваем недостающие чанки в локальное хранилище (с поддержкой паузы).
+        let chunks = self.fetch_missing_chunks(file_id, peers, &cancel).await?;
 
-        // Все чанки получены — собираем файл на диск.
-        assemble_file(&flat, dest_path).await?;
+        // Все чанки получены — собираем файл на диск по одному чанку.
+        self.assemble_to(&chunks, dest_path).await?;
 
         // Теперь все чанки локально — объявляем себя их владельцем, чтобы другие
         // узлы могли качать у нас (мульти-сидинг).
@@ -370,90 +391,84 @@ impl StorageManager {
         Ok(())
     }
 
-    /// Скачивает все чанки файла в локальное хранилище и возвращает их данные в
-    /// порядке индексов. Уже локальные чанки читаются с диска. Между батчами
-    /// проверяется флаг `cancel` (для паузы) → [`StorageError::Cancelled`].
-    async fn fetch_all_chunks(
+    /// Собирает файл из локальных чанков на диск, держа в памяти один чанк.
+    /// Пишет во временный файл и переименовывает: оборванная сборка не
+    /// оставит «скачанный» обрубок.
+    async fn assemble_to(&self, chunks: &[void_db::chunks::Chunk], dest_path: &Path) -> Result<(), StorageError> {
+        use tokio::io::AsyncWriteExt;
+        if let Some(parent) = dest_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = dest_path.with_extension("part");
+        let mut out = tokio::fs::File::create(&tmp).await?;
+        for c in chunks {
+            out.write_all(&self.store.get(&c.hash).await?).await?;
+        }
+        out.flush().await?;
+        drop(out);
+        tokio::fs::rename(&tmp, dest_path).await?;
+        Ok(())
+    }
+
+    /// Докачивает все недостающие чанки файла в локальное хранилище и
+    /// возвращает список чанков в порядке индексов. Данные чанков в памяти не
+    /// копятся (раньше весь файл собирался в `Vec`). Между батчами проверяется
+    /// флаг `cancel` (для паузы) → [`StorageError::Cancelled`].
+    async fn fetch_missing_chunks(
         &self,
         file_id: &str,
         peers: &[PeerInfo],
         cancel: &Arc<AtomicBool>,
-    ) -> Result<Vec<Vec<u8>>, StorageError> {
+    ) -> Result<Vec<void_db::chunks::Chunk>, StorageError> {
         let chunks = db_chunks::get_chunks_for_file(&self.pool, file_id).await?;
-        let total = chunks.len();
+        check_contiguous(&chunks, file_id)?;
+        let missing: Vec<&void_db::chunks::Chunk> = chunks.iter().filter(|c| !c.is_local).collect();
 
-        // Скачиваем параллельно батчами
-        let mut ordered_data: Vec<Option<Vec<u8>>> = vec![None; total];
-
-        for batch in chunks.chunks(DOWNLOAD_CONCURRENCY) {
+        for batch in missing.chunks(DOWNLOAD_CONCURRENCY) {
             if cancel.load(Ordering::Relaxed) {
                 info!("Download cancelled: {}", &file_id[..8.min(file_id.len())]);
                 return Err(StorageError::Cancelled);
             }
             let mut handles = Vec::new();
-
             for chunk in batch {
-                // Если уже есть локально — читаем с диска
-                if chunk.is_local {
-                    let data = self.store.get(&chunk.hash).await?;
-                    ordered_data[chunk.chunk_index as usize] = Some(data);
-                    continue;
-                }
-
-                let owners = self.index.get_owners(&chunk.hash).await;
-                if owners.is_empty() {
-                    warn!("No peers for chunk {}", &chunk.hash[..8]);
-                    return Err(StorageError::NoPeersForChunk(chunk.hash.clone()));
-                }
-
-                let chunk_hash = chunk.hash.clone();
-                let chunk_index = chunk.chunk_index as usize;
-                let noise = self.noise.clone();
-                let peers = peers.to_vec();
-                let owners_clone = owners.clone();
-                let pool = self.pool.clone();
-                let store = self.store.clone();
-                let events = self.events.clone();
-
-                handles.push(tokio::spawn(async move {
-                    fetch_chunk_with_fallback(
-                        &chunk_hash,
-                        chunk_index,
-                        &owners_clone,
-                        &peers,
-                        &noise,
-                        &store,
-                        &pool,
-                        events.as_ref(),
-                    )
-                    .await
-                }));
+                handles.push(self.spawn_fetch(&chunk.hash, chunk.chunk_index as usize, peers).await?);
             }
-
             for handle in handles {
                 match handle.await {
-                    Ok(Ok((index, data))) => {
-                        // Учёт принятого по сети трафика (локальные чанки сюда не
-                        // попадают — они читаются с диска ветвью `is_local` выше).
+                    // Учёт принятого по сети трафика (локальные чанки сюда не попадают).
+                    Ok(Ok((_, data))) => {
                         self.bytes_downloaded.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        ordered_data[index] = Some(data);
                     }
                     Ok(Err(e)) => return Err(e),
-                    Err(e) => {
-                        return Err(StorageError::Network(format!("task panic: {}", e)));
-                    }
+                    Err(e) => return Err(StorageError::Network(format!("task panic: {}", e))),
                 }
             }
         }
+        Ok(chunks)
+    }
 
-        Ok(ordered_data
-            .into_iter()
-            .enumerate()
-            .map(|(i, opt)| opt.unwrap_or_else(|| {
-                error!("BUG: chunk {} missing after download loop", i);
-                Vec::new()
-            }))
-            .collect())
+    /// Запускает скачивание одного чанка у его известных владельцев.
+    async fn spawn_fetch(
+        &self,
+        hash: &str,
+        index: usize,
+        peers: &[PeerInfo],
+    ) -> Result<tokio::task::JoinHandle<Result<(usize, Vec<u8>), StorageError>>, StorageError> {
+        let owners = self.index.get_owners(hash).await;
+        if owners.is_empty() {
+            warn!("No peers for chunk {}", &hash[..8.min(hash.len())]);
+            return Err(StorageError::NoPeersForChunk(hash.to_string()));
+        }
+        let chunk_hash = hash.to_string();
+        let noise = self.noise.clone();
+        let peers = peers.to_vec();
+        let pool = self.pool.clone();
+        let store = self.store.clone();
+        let events = self.events.clone();
+        Ok(tokio::spawn(async move {
+            fetch_chunk_with_fallback(&chunk_hash, index, &owners, &peers, &noise, &store, &pool, events.as_ref())
+                .await
+        }))
     }
 
     /// Объявляет нас владельцем всех чанков файла (после полного скачивания) —
@@ -564,11 +579,110 @@ impl StorageManager {
             return Ok(data);
         }
         // Иначе докачиваем недостающие чанки и собираем файл в память.
-        let flat = self
-            .fetch_all_chunks(file_id, peers, &Arc::new(AtomicBool::new(false)))
+        let chunks = self
+            .fetch_missing_chunks(file_id, peers, &Arc::new(AtomicBool::new(false)))
             .await?;
         self.register_self_as_owner(file_id).await;
-        Ok(flat.concat())
+        let mut data = Vec::new();
+        for c in &chunks {
+            data.extend_from_slice(&self.store.get(&c.hash).await?);
+        }
+        Ok(data)
+    }
+
+    // ─── Чтение по частям (видео, большие файлы) ─────────────────────────────
+
+    /// Раскладка файла по чанкам: смещения, размеры, что уже есть локально.
+    /// Нужна для HTTP Range (перемотка видео) и потоковой отдачи — без чтения
+    /// файла целиком в память.
+    pub async fn file_layout(&self, file_id: &str) -> Result<FileLayout, StorageError> {
+        let file = db_chunks::get_file(&self.pool, file_id)
+            .await?
+            .ok_or_else(|| StorageError::FileNotFound(file_id.to_string()))?;
+        let chunks = db_chunks::get_chunks_for_file(&self.pool, file_id).await?;
+        check_contiguous(&chunks, file_id)?;
+        if chunks.len() as i64 != file.total_chunks {
+            return Err(StorageError::InvalidManifest(format!(
+                "у файла {} известно {} чанков из {}",
+                &file_id[..8.min(file_id.len())], chunks.len(), file.total_chunks,
+            )));
+        }
+        let mut offset = 0u64;
+        let slots = chunks
+            .into_iter()
+            .map(|c| {
+                let slot = ChunkSlot { hash: c.hash, offset, size: c.size_bytes.max(0) as u64, is_local: c.is_local };
+                offset += slot.size;
+                slot
+            })
+            .collect();
+        Ok(FileLayout {
+            file_id: file.file_id,
+            name: file.name,
+            mime_type: file.mime_type,
+            size: offset,
+            chunks: slots,
+        })
+    }
+
+    /// Байты `[start, end]` (включительно) файла. Недостающие чанки этого
+    /// диапазона докачиваются у пиров; остальной файл не трогается. Когда файл
+    /// оказывается у нас целиком — регистрируемся его сидером.
+    pub async fn read_range(
+        &self,
+        layout: &FileLayout,
+        start: u64,
+        end: u64,
+        peers: &[PeerInfo],
+    ) -> Result<Vec<u8>, StorageError> {
+        if start > end || end >= layout.size {
+            return Err(StorageError::InvalidManifest("диапазон вне файла".into()));
+        }
+        let wanted: Vec<(usize, &ChunkSlot)> = layout
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.offset <= end && c.offset + c.size > start)
+            .collect();
+
+        // Недостающие — параллельно, батчами.
+        let missing: Vec<(usize, &ChunkSlot)> = wanted.iter().copied().filter(|(_, c)| !c.is_local).collect();
+        let mut fetched: std::collections::HashMap<usize, Vec<u8>> = Default::default();
+        for batch in missing.chunks(DOWNLOAD_CONCURRENCY) {
+            let mut handles = Vec::new();
+            for (i, c) in batch {
+                handles.push(self.spawn_fetch(&c.hash, *i, peers).await?);
+            }
+            for handle in handles {
+                match handle.await {
+                    Ok(Ok((i, data))) => {
+                        self.bytes_downloaded.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        fetched.insert(i, data);
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(StorageError::Network(format!("task panic: {}", e))),
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity((end - start + 1) as usize);
+        for (i, c) in wanted {
+            let data = match fetched.remove(&i) {
+                Some(d) => d,
+                None => self.store.get(&c.hash).await?,
+            };
+            let from = start.saturating_sub(c.offset) as usize;
+            let to = ((end - c.offset + 1) as usize).min(data.len());
+            if from >= to {
+                return Err(StorageError::ChunkNotFound(c.hash.clone()));
+            }
+            out.extend_from_slice(&data[from..to]);
+        }
+
+        if !missing.is_empty() && db_chunks::local_completion(&self.pool, &layout.file_id).await? >= 1.0 {
+            self.register_self_as_owner(&layout.file_id).await;
+        }
+        Ok(out)
     }
 
     /// Удаляет файл из раздачи: стирает локальные блобы чанков с диска и все
@@ -623,19 +737,11 @@ async fn fetch_chunk_with_fallback(
                     warn!("Failed to store chunk {}: {}", &hash[..8], e);
                 }
 
-                // Обновляем БД
-                let record = void_db::chunks::Chunk {
-                    hash: hash.to_string(),
-                    file_id: String::new(), // file_id неизвестен здесь, обновится через upsert
-                    chunk_index: index as i64,
-                    size_bytes: data.len() as i64,
-                    is_local: true,
-                    local_path: Some(
-                        store.chunk_path(hash).to_string_lossy().to_string()
-                    ),
-                };
-                // Только обновляем is_local и local_path для существующей записи
-                let _ = db_chunks::upsert_chunk(pool, &record).await;
+                // Блоб общий для всех файлов с этим хэшем — помечаем все места.
+                let path = store.chunk_path(hash).to_string_lossy().to_string();
+                if let Err(e) = db_chunks::mark_local(pool, hash, &path).await {
+                    warn!("Не удалось отметить чанк {} локальным: {}", &hash[..8], e);
+                }
 
                 // Репутация: пир отдал валидный чанк.
                 if let Some(tx) = events {
@@ -671,6 +777,54 @@ async fn fetch_chunk_with_fallback(
     Err(StorageError::NoPeersForChunk(hash.to_string()))
 }
 
+/// Раскладка файла по чанкам (см. [`StorageManager::file_layout`]).
+#[derive(Debug, Clone)]
+pub struct FileLayout {
+    pub file_id: String,
+    /// Имя как подписано публикатором (для показа — через `safe_file_name`).
+    pub name: String,
+    pub mime_type: Option<String>,
+    /// Полный размер в байтах (сумма размеров чанков).
+    pub size: u64,
+    pub chunks: Vec<ChunkSlot>,
+}
+
+/// Один чанк в раскладке файла.
+#[derive(Debug, Clone)]
+pub struct ChunkSlot {
+    pub hash: String,
+    pub offset: u64,
+    pub size: u64,
+    pub is_local: bool,
+}
+
+/// Читает до заполнения буфера или конца файла.
+async fn read_full(file: &mut tokio::fs::File, buf: &mut [u8]) -> Result<usize, StorageError> {
+    use tokio::io::AsyncReadExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Индексы чанков идут подряд с нуля. Иначе часть строк потеряна (таблица
+/// `chunks` хранит чанк по хэшу: одинаковый блок в двух файлах — одна строка),
+/// и сборка дала бы файл с дырой.
+fn check_contiguous(chunks: &[void_db::chunks::Chunk], file_id: &str) -> Result<(), StorageError> {
+    if chunks.iter().enumerate().any(|(i, c)| c.chunk_index != i as i64) {
+        return Err(StorageError::InvalidManifest(format!(
+            "у файла {} пропущены чанки",
+            &file_id[..8.min(file_id.len())],
+        )));
+    }
+    Ok(())
+}
+
 /// Простое определение MIME типа по расширению файла.
 fn mime_type_from_name(name: &str) -> Option<String> {
     let ext = name.rsplit('.').next()?.to_lowercase();
@@ -678,8 +832,18 @@ fn mime_type_from_name(name: &str) -> Option<String> {
         "jpg" | "jpeg" => "image/jpeg",
         "png"          => "image/png",
         "gif"          => "image/gif",
-        "mp4"          => "video/mp4",
+        "webp"         => "image/webp",
+        "mp4" | "m4v"  => "video/mp4",
+        "webm"         => "video/webm",
         "mkv"          => "video/x-matroska",
+        "mov"          => "video/quicktime",
+        "ogv"          => "video/ogg",
+        "mp3"          => "audio/mpeg",
+        "ogg" | "oga"  => "audio/ogg",
+        "opus"         => "audio/opus",
+        "wav"          => "audio/wav",
+        "flac"         => "audio/flac",
+        "m4a"          => "audio/mp4",
         "pdf"          => "application/pdf",
         "zip"          => "application/zip",
         "txt"          => "text/plain",
@@ -893,6 +1057,117 @@ mod tests {
             assert!(owners.iter().any(|o| o == node(2).as_str()),
                 "после скачивания B должен быть владельцем чанка {}", &c.hash[..8]);
         }
+    }
+
+    /// Публикация потоковая: файл ровно в N чанков и с остатком даёт тот же
+    /// file_id, что и разбивка целиком в памяти (совместимость с сетью).
+    #[tokio::test]
+    async fn streaming_publish_matches_in_memory_split() {
+        let (dir, _pool, mgr) = make_node(1).await;
+        for len in [0usize, 1, CHUNK_SIZE, CHUNK_SIZE * 2, CHUNK_SIZE * 2 + 17] {
+            let content: Vec<u8> = (0..len as u32).map(|i| (i % 253) as u8).collect();
+            let path = dir.path().join(format!("f{len}.bin"));
+            std::fs::write(&path, &content).unwrap();
+            let expected = crate::chunker::split_file(&path).await.unwrap().file_id;
+            assert_eq!(mgr.publish_file(&path).await.unwrap(), expected, "длина {len}");
+            if len > 0 {
+                assert_eq!(mgr.read_file(&expected).await.unwrap(), content);
+            }
+        }
+    }
+
+    /// Общий блок у двух файлов: оба собираются, удаление одного не стирает
+    /// блоб, нужный другому (раньше чанк хранился по хэшу и второй файл ломался).
+    #[tokio::test]
+    async fn files_sharing_a_chunk_stay_intact() {
+        let (dir, _pool, mgr) = make_node(1).await;
+        let a: Vec<u8> = (0..CHUNK_SIZE as u32 * 2).map(|i| (i % 253) as u8).collect();
+        let b: Vec<u8> = a[..CHUNK_SIZE].iter().copied().chain(std::iter::repeat_n(7u8, 1000)).collect();
+        std::fs::write(dir.path().join("a.bin"), &a).unwrap();
+        std::fs::write(dir.path().join("b.bin"), &b).unwrap();
+        let ida = mgr.publish_file(&dir.path().join("a.bin")).await.unwrap();
+        let idb = mgr.publish_file(&dir.path().join("b.bin")).await.unwrap();
+        assert_eq!(mgr.read_file(&ida).await.unwrap(), a);
+        assert_eq!(mgr.read_file(&idb).await.unwrap(), b);
+        mgr.delete_file(&ida).await.unwrap();
+        assert_eq!(mgr.read_file(&idb).await.unwrap(), b, "общий блоб не должен стереться");
+        mgr.delete_file(&idb).await.unwrap();
+        assert!(mgr.store.list_all().await.unwrap().is_empty(), "после удаления обоих блобов не остаётся");
+    }
+
+    /// Имя при публикации задаётся отдельно от пути (загрузка с сайта).
+    #[tokio::test]
+    async fn publish_as_keeps_given_name() {
+        let (dir, pool, mgr) = make_node(1).await;
+        let path = dir.path().join("upload-1234.tmp");
+        std::fs::write(&path, b"hello").unwrap();
+        let id = mgr.publish_file_as(&path, "clip.webm").await.unwrap();
+        let frec = void_db::chunks::get_file(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(frec.name, "clip.webm");
+        assert_eq!(frec.mime_type.as_deref(), Some("video/webm"));
+    }
+
+    /// Диапазоны локального файла: внутри чанка, через границу, последний байт.
+    #[tokio::test]
+    async fn read_range_local_across_chunk_boundaries() {
+        let (dir, _pool, mgr) = make_node(1).await;
+        let content = sample_content();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let id = mgr.publish_file(&path).await.unwrap();
+        let layout = mgr.file_layout(&id).await.unwrap();
+        assert_eq!(layout.size, content.len() as u64);
+        assert_eq!(layout.chunks.len(), 3);
+        let c = CHUNK_SIZE as u64;
+        for (a, b) in [(0, 0), (10, 99), (c - 5, c + 5), (c - 1, 2 * c), (0, layout.size - 1), (layout.size - 1, layout.size - 1)] {
+            let got = mgr.read_range(&layout, a, b, &[]).await.unwrap();
+            assert_eq!(got, &content[a as usize..=b as usize], "диапазон {a}-{b}");
+        }
+        assert!(mgr.read_range(&layout, 5, layout.size, &[]).await.is_err());
+        assert!(mgr.read_range(&layout, 9, 3, &[]).await.is_err());
+    }
+
+    /// Диапазон чужого файла докачивает только нужные чанки; полный файл
+    /// потом собирается и делает нас сидером.
+    #[tokio::test]
+    async fn read_range_fetches_only_needed_chunks_from_peer() {
+        let (dir_a, _pool_a, mgr_a) = make_node(1).await;
+        let content = sample_content();
+        let path = dir_a.path().join("data.bin");
+        std::fs::write(&path, &content).unwrap();
+        let file_id = mgr_a.publish_file(&path).await.unwrap();
+        let manifest = mgr_a.file_manifest(&file_id).await.unwrap().unwrap();
+        let a_port = free_port();
+        let srv = mgr_a.clone();
+        tokio::spawn(async move { let _ = srv.start_server(a_port).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (_dir_b, pool_b, mgr_b) = make_node(2).await;
+        mgr_b.handle_manifest(&manifest).await.unwrap();
+        let a_peer = PeerInfo {
+            id: node(1),
+            name: "A".into(),
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: a_port,
+            chat_port: a_port.wrapping_add(2),
+            services: vec![Service::Storage],
+            last_seen: 0,
+        };
+        let layout = mgr_b.file_layout(&file_id).await.unwrap();
+        assert!(layout.chunks.iter().all(|c| !c.is_local));
+        let c = CHUNK_SIZE as u64;
+        let got = mgr_b.read_range(&layout, c + 10, c + 20, std::slice::from_ref(&a_peer)).await.unwrap();
+        assert_eq!(got, &content[(c + 10) as usize..=(c + 20) as usize]);
+        let local: Vec<bool> = void_db::chunks::get_chunks_for_file(&pool_b, &file_id)
+            .await.unwrap().iter().map(|c| c.is_local).collect();
+        assert_eq!(local, vec![false, true, false], "скачан только второй чанк");
+
+        // Докачка остального — и B становится сидером.
+        let layout = mgr_b.file_layout(&file_id).await.unwrap();
+        let all = mgr_b.read_range(&layout, 0, layout.size - 1, &[a_peer]).await.unwrap();
+        assert_eq!(all, content);
+        let owners = void_db::chunks::get_chunk_owners(&pool_b, &manifest.chunks[0].hash).await.unwrap();
+        assert!(owners.iter().any(|o| o == node(2).as_str()));
     }
 
     /// Мульти-сидинг через merge: узел, получив манифесты одного файла от двух

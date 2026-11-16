@@ -98,79 +98,80 @@ pub async fn list_files(pool: &DbPool) -> Result<Vec<FileRecord>> {
 
 // ─── Chunks ───────────────────────────────────────────────────────────────────
 
-/// Добавляет или обновляет запись о чанке.
+/// Строка чанка из рантайм-запроса.
+fn chunk_from_row(r: sqlx::sqlite::SqliteRow) -> Chunk {
+    use sqlx::Row;
+    Chunk {
+        hash: r.get("hash"),
+        file_id: r.get("file_id"),
+        chunk_index: r.get("chunk_index"),
+        size_bytes: r.get("size_bytes"),
+        is_local: r.get::<i64, _>("is_local") != 0,
+        local_path: r.get("local_path"),
+    }
+}
+
+/// Добавляет или обновляет запись о чанке — место `(file_id, chunk_index)`.
+/// Флаг «есть локально» только поднимается: повторное объявление файла из сети
+/// (`is_local = false`) не забудет уже скачанный чанк.
+///
+/// Рантайм-запросы во всём разделе: схема чанков поменялась в миграции 0006, а
+/// `query!`-макросы потребовали бы перегенерации офлайн-кэша `.sqlx`.
 pub async fn upsert_chunk(pool: &DbPool, chunk: &Chunk) -> Result<()> {
-    let is_local = chunk.is_local as i32;
-    sqlx::query!(
+    sqlx::query(
         r#"
-        INSERT INTO chunks (hash, file_id, chunk_index, size_bytes, is_local, local_path)
+        INSERT INTO chunks (file_id, chunk_index, hash, size_bytes, is_local, local_path)
         VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT (hash) DO UPDATE SET
-            is_local   = excluded.is_local,
-            local_path = excluded.local_path
+        ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+            hash       = excluded.hash,
+            size_bytes = excluded.size_bytes,
+            is_local   = MAX(chunks.is_local, excluded.is_local),
+            local_path = COALESCE(excluded.local_path, chunks.local_path)
         "#,
-        chunk.hash,
-        chunk.file_id,
-        chunk.chunk_index,
-        chunk.size_bytes,
-        is_local,
-        chunk.local_path,
     )
+    .bind(&chunk.file_id)
+    .bind(chunk.chunk_index)
+    .bind(&chunk.hash)
+    .bind(chunk.size_bytes)
+    .bind(chunk.is_local as i64)
+    .bind(&chunk.local_path)
     .execute(pool)
     .await?;
+    Ok(())
+}
 
+/// Блоб чанка `hash` появился на диске: он общий для всех файлов, где стоит
+/// этот хэш, — помечаем все такие места.
+pub async fn mark_local(pool: &DbPool, hash: &str, local_path: &str) -> Result<()> {
+    sqlx::query("UPDATE chunks SET is_local = 1, local_path = ? WHERE hash = ?")
+        .bind(local_path)
+        .bind(hash)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
 /// Возвращает все чанки файла, отсортированные по индексу.
 pub async fn get_chunks_for_file(pool: &DbPool, file_id: &str) -> Result<Vec<Chunk>> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT hash as "hash!", file_id, chunk_index, size_bytes, is_local, local_path
-        FROM chunks
-        WHERE file_id = ?
-        ORDER BY chunk_index ASC
-        "#,
-        file_id,
+    let rows = sqlx::query(
+        "SELECT hash, file_id, chunk_index, size_bytes, is_local, local_path
+         FROM chunks WHERE file_id = ? ORDER BY chunk_index ASC",
     )
+    .bind(file_id)
     .fetch_all(pool)
     .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| Chunk {
-            hash: r.hash,
-            file_id: r.file_id,
-            chunk_index: r.chunk_index,
-            size_bytes: r.size_bytes,
-            is_local: r.is_local != 0,
-            local_path: r.local_path,
-        })
-        .collect())
+    Ok(rows.into_iter().map(chunk_from_row).collect())
 }
 
 /// Только локально хранящиеся чанки (которые мы можем раздавать).
 pub async fn get_local_chunks(pool: &DbPool) -> Result<Vec<Chunk>> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT hash as "hash!", file_id, chunk_index, size_bytes, is_local, local_path
-        FROM chunks WHERE is_local = 1
-        "#
+    let rows = sqlx::query(
+        "SELECT hash, file_id, chunk_index, size_bytes, is_local, local_path
+         FROM chunks WHERE is_local = 1",
     )
     .fetch_all(pool)
     .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| Chunk {
-            hash: r.hash,
-            file_id: r.file_id,
-            chunk_index: r.chunk_index,
-            size_bytes: r.size_bytes,
-            is_local: true,
-            local_path: r.local_path,
-        })
-        .collect())
+    Ok(rows.into_iter().map(chunk_from_row).collect())
 }
 
 // ─── Chunk owners ─────────────────────────────────────────────────────────────
@@ -234,12 +235,9 @@ pub async fn remove_peer_chunks(pool: &DbPool, peer_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Полностью удаляет файл: его чанки (каскадом — и владельцев из `chunk_owners`)
-/// и метаданные из `files`. Возвращает хэши чанков, которые были локальными —
-/// чтобы вызывающий удалил блобы с диска.
-///
-/// Runtime-запросы (`sqlx::query`), а не макросы — чтобы не перегенерировать
-/// offline-кэш `.sqlx` ради двух DELETE.
+/// Полностью удаляет файл: его чанки и метаданные. Возвращает хэши локальных
+/// блобов, которые больше не нужны ни одному файлу, — их вызывающий стирает с
+/// диска (блоб общий: тот же блок может стоять и в другом файле).
 pub async fn delete_file(pool: &DbPool, file_id: &str) -> Result<Vec<String>> {
     let local: Vec<String> = get_chunks_for_file(pool, file_id)
         .await?
@@ -260,8 +258,22 @@ pub async fn delete_file(pool: &DbPool, file_id: &str) -> Result<Vec<String>> {
         .bind(file_id)
         .execute(pool)
         .await?;
+    // Владельцы чанков, которых не осталось ни в одном файле.
+    sqlx::query("DELETE FROM chunk_owners WHERE chunk_hash NOT IN (SELECT hash FROM chunks)")
+        .execute(pool)
+        .await?;
 
-    Ok(local)
+    let mut orphaned = Vec::new();
+    for hash in local {
+        let still_used: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE hash = ?")
+            .bind(&hash)
+            .fetch_one(pool)
+            .await?;
+        if still_used == 0 && !orphaned.contains(&hash) {
+            orphaned.push(hash);
+        }
+    }
+    Ok(orphaned)
 }
 
 /// Сохраняет подпись публикатора манифеста. Первая принятая подпись остаётся
@@ -294,22 +306,13 @@ pub async fn get_file_signature(pool: &DbPool, file_id: &str) -> Result<Option<(
 
 /// Процент скачанности файла (сколько чанков уже локально).
 pub async fn local_completion(pool: &DbPool, file_id: &str) -> Result<f64> {
-    let row = sqlx::query!(
-        r#"
-        SELECT
-            COUNT(*) as total,
-            SUM(is_local) as local_count
-        FROM chunks
-        WHERE file_id = ?
-        "#,
-        file_id,
-    )
-    .fetch_one(pool)
-    .await?;
-
-    let total = row.total as f64;
-    if total == 0.0 {
+    let (total, local): (i64, Option<i64>) =
+        sqlx::query_as("SELECT COUNT(*), SUM(is_local) FROM chunks WHERE file_id = ?")
+            .bind(file_id)
+            .fetch_one(pool)
+            .await?;
+    if total == 0 {
         return Ok(0.0);
     }
-    Ok(row.local_count.unwrap_or(0) as f64 / total)
+    Ok(local.unwrap_or(0) as f64 / total as f64)
 }

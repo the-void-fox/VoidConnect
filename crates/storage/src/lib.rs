@@ -35,5 +35,5 @@ pub mod transfer;
 pub use chunk_store::ChunkStore;
 pub use error::StorageError;
 pub use events::ChunkEvent;
-pub use manager::StorageManager;
+pub use manager::{ChunkSlot, FileLayout, StorageManager};
 pub use transfer::{ChunkRequest, ChunkResponse, ChunkResponseStatus};
