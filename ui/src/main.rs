@@ -4,6 +4,7 @@
 mod app;
 mod avatar;
 mod backend;
+mod bg;
 mod boot;
 mod device_lock;
 mod dm_access;
@@ -125,12 +126,19 @@ fn main() -> eframe::Result<()> {
         saved,
     };
 
+    // vsync выключен намеренно. На Wayland (Hyprland, GNOME, KDE) композитор не
+    // присылает кадры скрытому окну (другой рабочий стол, свёрнуто), и с vsync
+    // `eglSwapBuffers` ждёт такой кадр бесконечно: UI-поток стоит, ping
+    // композитора остаётся без ответа — окно помечается «не отвечает».
+    // Проверено на Hyprland 0.57: с vsync за 20 с скрытия ни одного кадра,
+    // без vsync — ровно 20 кадров/с. Частоту и так держит `request_repaint_after`.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([800.0, 600.0])
             .with_title("Void Connect")
             .with_icon(app_icon()),
+        vsync: false,
         ..Default::default()
     };
 
@@ -168,6 +176,7 @@ fn run_locked_ui(
             .with_min_inner_size([460.0, 300.0])
             .with_title("Void Connect — доступ заблокирован")
             .with_icon(app_icon()),
+        vsync: false,
         ..Default::default()
     };
     eframe::run_native(

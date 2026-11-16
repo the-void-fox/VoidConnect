@@ -32,8 +32,13 @@ pub struct LaunchParams {
 }
 
 enum Phase {
-    /// Ждём пароль для расшифровки ключей.
-    Unlock { password: String, error: Option<String> },
+    /// Ждём пароль для расшифровки ключей. `job` — идущая проверка пароля
+    /// (PBKDF2 считается в фоне, чтобы окно не «зависало»).
+    Unlock {
+        password: String,
+        error: Option<String>,
+        job: crate::bg::Job<Result<void_crypto::Identity, String>>,
+    },
     /// Разблокировано — основное приложение.
     Running(Box<VoidApp>),
 }
@@ -57,26 +62,33 @@ impl BootApp {
                 // Маловероятно (кейстор без пароля, но не открылся) — покажем ввод.
                 Err(e) => return Self {
                     params,
-                    phase: Phase::Unlock { password: String::new(), error: Some(e) },
+                    phase: Phase::Unlock { password: String::new(), error: Some(e), job: Default::default() },
                 },
             }
         }
 
-        Self { params, phase: Phase::Unlock { password: String::new(), error: None } }
+        Self { params, phase: Phase::Unlock { password: String::new(), error: None, job: Default::default() } }
     }
 
     /// Загружает личность (с паролем при необходимости), стартует бэкенд, строит
     /// `VoidApp`. Возвращает понятный текст ошибки для экрана ввода.
     fn launch(params: &mut LaunchParams, password: Option<&str>) -> Result<VoidApp, String> {
-        let identity = void_crypto::Identity::load_or_create_with_password(
-            &params.data_dir,
-            password,
-        )
-        .map_err(|e| match e {
-            void_crypto::CryptoError::WrongPassword => "Неверный пароль".to_string(),
-            other => format!("Не удалось загрузить ключи: {other}"),
-        })?;
+        let identity = Self::load_identity(&params.data_dir, password)?;
+        Ok(Self::start(params, identity))
+    }
 
+    /// Расшифровывает ключи. С паролем это PBKDF2 на 600 тыс. итераций —
+    /// поэтому при вводе пароля вызывается из фонового потока.
+    fn load_identity(data_dir: &std::path::Path, password: Option<&str>) -> Result<void_crypto::Identity, String> {
+        void_crypto::Identity::load_or_create_with_password(data_dir, password)
+            .map_err(|e| match e {
+                void_crypto::CryptoError::WrongPassword => "Неверный пароль".to_string(),
+                other => format!("Не удалось загрузить ключи: {other}"),
+            })
+    }
+
+    /// Стартует бэкенд с уже расшифрованной личностью и строит `VoidApp`.
+    fn start(params: &mut LaunchParams, identity: void_crypto::Identity) -> VoidApp {
         let node_id = NodeId(identity.id.as_str().to_string());
         // Держим node_id в profile.json в синхроне с криптографическим ID.
         params.saved.node_id = identity.id.as_str().to_string();
@@ -97,10 +109,10 @@ impl BootApp {
             params.data_dir.clone(),
         );
 
-        Ok(VoidApp::new(backend))
+        VoidApp::new(backend)
     }
 
-    fn show_unlock(ctx: &egui::Context, password: &mut String, error: &Option<String>) -> bool {
+    fn show_unlock(ctx: &egui::Context, password: &mut String, error: &Option<String>, busy: bool) -> bool {
         use crate::theme;
         let mut submit = false;
         egui::CentralPanel::default()
@@ -148,9 +160,10 @@ impl BootApp {
                             }
 
                             ui.add_space(10.0);
-                            let unlock = theme::primary_button("\u{F0FC6}  Разблокировать")
+                            let label = if busy { "Проверяю пароль…" } else { "\u{F0FC6}  Разблокировать" };
+                            let unlock = theme::primary_button(label)
                                 .min_size(egui::vec2(ui.available_width(), 36.0));
-                            if ui.add(unlock).clicked() {
+                            if ui.add_enabled(!busy, unlock).clicked() {
                                 submit = true;
                             }
 
@@ -174,27 +187,28 @@ impl eframe::App for BootApp {
             return;
         }
 
-        // Экран ввода пароля. Намерение собираем без удержания заимствования
-        // self.phase на время launch (который трогает self.params).
-        let mut submit = false;
-        let mut pw = String::new();
-        if let Phase::Unlock { password, error } = &mut self.phase {
-            submit = Self::show_unlock(ctx, password, error);
-            if submit {
-                pw = password.clone();
+        // Экран ввода пароля. Проверка пароля идёт в фоне; бэкенд стартуем
+        // здесь же, в UI-потоке, когда личность расшифрована.
+        let mut unlocked = None;
+        if let Phase::Unlock { password, error, job } = &mut self.phase {
+            match job.poll() {
+                Some(Ok(identity)) => unlocked = Some(identity),
+                Some(Err(e)) => {
+                    password.clear();
+                    *error = Some(e);
+                }
+                None => {}
+            }
+            let busy = job.running();
+            if Self::show_unlock(ctx, password, error, busy) && !busy && !password.is_empty() {
+                let pw = password.clone();
+                let dir = self.params.data_dir.clone();
+                *error = None;
+                job.start(ctx, move || Self::load_identity(&dir, Some(&pw)));
             }
         }
-
-        if submit {
-            match Self::launch(&mut self.params, Some(&pw)) {
-                Ok(app) => self.phase = Phase::Running(Box::new(app)),
-                Err(e) => {
-                    if let Phase::Unlock { password, error } = &mut self.phase {
-                        password.clear();
-                        *error = Some(e);
-                    }
-                }
-            }
+        if let Some(identity) = unlocked {
+            self.phase = Phase::Running(Box::new(Self::start(&mut self.params, identity)));
         }
     }
 }

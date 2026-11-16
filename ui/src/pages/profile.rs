@@ -36,6 +36,10 @@ pub struct ProfilePage {
     tcp_test_result:     Option<Result<String, String>>,
     tcp_test_running:    bool,
     tcp_test_rx:         Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Выбор и обработка аватара в фоне: `None` — диалог закрыт без выбора,
+    /// `Some(None)` — картинку не удалось прочитать, `Some(Some(b64))` — готово.
+    avatar_job:          crate::bg::Job<Option<Option<String>>>,
+    avatar_error:        bool,
 }
 
 impl Default for ProfilePage {
@@ -64,6 +68,8 @@ impl Default for ProfilePage {
             tcp_test_result:   None,
             tcp_test_running:  false,
             tcp_test_rx:       None,
+            avatar_job:        crate::bg::Job::default(),
+            avatar_error:      false,
         }
     }
 }
@@ -142,19 +148,32 @@ impl ProfilePage {
                 let fill = crate::theme::SURFACE_3;
                 crate::avatar::show_avatar(ui, self.avatar_png.as_deref(), &self.name, fill, 72.0);
                 ui.add_space(4.0);
-                if ui.add_sized([72.0, 22.0],
-                    egui::Button::new(egui::RichText::new("󰏫 Сменить").size(11.0))).clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
-                        .set_title("Выбор аватара")
-                        .pick_file()
-                    {
-                        if let Some(b64) = crate::avatar::process_image_file(&path) {
-                            self.avatar_png = Some(b64);
-                            self.send_profile();
-                        }
+                // Диалог и масштабирование большой фотографии — в фоне: и то и
+                // другое может занять секунды, а UI-поток должен отвечать.
+                match self.avatar_job.poll() {
+                    Some(Some(Some(b64))) => {
+                        self.avatar_png = Some(b64);
+                        self.avatar_error = false;
+                        self.send_profile();
                     }
+                    Some(Some(None)) => self.avatar_error = true,
+                    _ => {}
+                }
+                let busy = self.avatar_job.running();
+                let label = if busy { "󰔟 …" } else { "󰏫 Сменить" };
+                if ui.add_enabled(!busy,
+                    egui::Button::new(egui::RichText::new(label).size(11.0)).min_size(egui::vec2(72.0, 22.0))).clicked()
+                {
+                    crate::bg::pick_in_background(&mut self.avatar_job, ui.ctx(), || {
+                        let path = rfd::FileDialog::new()
+                            .add_filter("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+                            .set_title("Выбор аватара")
+                            .pick_file()?;
+                        Some(crate::avatar::process_image_file(&path))
+                    });
+                }
+                if self.avatar_error {
+                    ui.label(egui::RichText::new("Не удалось\nпрочитать").size(10.0).color(crate::theme::ERR));
                 }
                 if self.avatar_png.is_some()
                     && ui.add_sized([72.0, 18.0],

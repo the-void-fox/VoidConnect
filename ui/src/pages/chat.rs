@@ -10,6 +10,9 @@ use void_trust::TrustLevel;
 use crate::theme;
 use crate::widgets::peer_popup::{status_colors, show_peer_profile};
 
+/// Сколько сообщений общего чата держать в памяти интерфейса (все каналы).
+const MAX_CHAT_MESSAGES: usize = 2000;
+
 /// Каналы («доски») общего чата: (id, иконка Nerd Font, название).
 /// `id` хранится в каждом сообщении и в БД; глобальный канал — "global".
 pub const CHANNELS: &[(&str, &str, &str)] = &[
@@ -780,6 +783,7 @@ impl ChatPage {
             seq:     0,
             may_drop,
         });
+        self.trim_messages();
         self.input.clear();
         if self.was_at_bottom { self.scroll_to_bottom = true; }
 
@@ -790,6 +794,17 @@ impl ChatPage {
 
     pub fn receive_message(&mut self, msg: ChatMessage) {
         self.messages.push(msg);
+        self.trim_messages();
         if self.was_at_bottom { self.scroll_to_bottom = true; }
+    }
+
+    /// Держит в памяти не больше [`MAX_CHAT_MESSAGES`]: все строки
+    /// перерисовываются каждый кадр, и бесконечно растущий чат постепенно
+    /// замедлял весь интерфейс. История остаётся в БД.
+    fn trim_messages(&mut self) {
+        if self.messages.len() > MAX_CHAT_MESSAGES {
+            let extra = self.messages.len() - MAX_CHAT_MESSAGES + MAX_CHAT_MESSAGES / 10;
+            self.messages.drain(..extra);
+        }
     }
 }

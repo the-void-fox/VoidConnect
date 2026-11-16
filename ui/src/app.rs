@@ -65,6 +65,8 @@ pub struct VoidApp {
     peer_count:       usize,
     /// Подгружена ли уже история общего чата из БД (делается один раз).
     history_loaded:   bool,
+    /// Номер снимка пиров/профилей, уже переданного во вкладки.
+    snapshot_seen:    Option<u64>,
     // ── Окна меню (настройки / о программе / документация) ────────────────
     show_settings:    bool,
     show_about:       bool,
@@ -81,6 +83,8 @@ pub struct VoidApp {
     pw_confirm:       String,
     /// Результат последней операции с паролем: (это_ошибка, текст).
     pw_msg:           Option<(bool, String)>,
+    /// Смена пароля в фоне (PBKDF2 — сотни миллисекунд в release, секунды в debug).
+    pw_job:           crate::bg::Job<Result<&'static str, String>>,
     /// Один раз спросить, публиковать ли старые локальные отметки «проверен».
     trust_prompt:     bool,
 }
@@ -199,10 +203,12 @@ impl VoidApp {
             backend,
             peer_count: 0,
             history_loaded: false,
+            snapshot_seen: None,
             pw_current: String::new(),
             pw_new: String::new(),
             pw_confirm: String::new(),
             pw_msg: None,
+            pw_job: crate::bg::Job::default(),
             trust_prompt,
             show_settings: false,
             show_about: false,
@@ -216,6 +222,7 @@ impl VoidApp {
 
 impl eframe::App for VoidApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
         self.load_chat_history_once();
         self.poll_chat();
         self.poll_private_chat();
@@ -291,6 +298,13 @@ impl eframe::App for VoidApp {
         self.show_dialogs(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        // Долгий кадр — это подвисание окна; пишем в лог, чтобы по жалобе
+        // «тормозит» было видно, на какой вкладке и насколько.
+        let took = frame_start.elapsed();
+        if took > std::time::Duration::from_millis(200) {
+            tracing::warn!("Медленный кадр: {} мс (вкладка «{}»)", took.as_millis(), self.current_page.label());
+        }
     }
 }
 
@@ -411,6 +425,22 @@ impl VoidApp {
 
     /// Обновляем пиры и профили — дедупликация по IP (или IP:порт в local mode).
     fn refresh_peers(&mut self) {
+        // Свой аватар может меняться в рантайме — обновляем его во всех вкладках.
+        if self.chat.my_avatar != self.profile.avatar_png {
+            self.chat.my_avatar    = self.profile.avatar_png.clone();
+            self.private.my_avatar = self.profile.avatar_png.clone();
+        }
+        self.graph.update_me(&self.profile.name, self.profile.avatar_png.as_deref());
+        self.refresh_status();
+
+        // Пиры и профили (с аватарами по ~24 КБ) бэкенд обновляет раз в 2 с —
+        // копируем их только при новом снимке, а не 20 раз в секунду.
+        let gen = self.backend.snapshot_gen.load(std::sync::atomic::Ordering::Acquire);
+        if self.snapshot_seen == Some(gen) {
+            return;
+        }
+        self.snapshot_seen = Some(gen);
+
         let peers    = self.backend.peers.lock().unwrap().clone();
         let profiles = self.backend.peer_profiles.lock().unwrap().clone();
         let local    = self.backend.local_mode;
@@ -428,14 +458,13 @@ impl VoidApp {
 
         self.peer_count = unique.len();
         let peer_vec: Vec<_> = unique.iter().map(|p| (*p).clone()).collect();
-        // Свой аватар может меняться в рантайме — обновляем его во всех вкладках.
-        self.chat.my_avatar    = self.profile.avatar_png.clone();
-        self.private.my_avatar = self.profile.avatar_png.clone();
         self.chat.update_context(peer_vec.clone(), profiles.clone());
         self.private.update_context(peer_vec.clone(), profiles.clone());
-        self.graph.update_me(&self.profile.name, self.profile.avatar_png.as_deref());
         self.graph.update_peers(peer_vec, profiles);
+    }
 
+    /// Дешёвые поля статуса — каждый кадр.
+    fn refresh_status(&mut self) {
         // Доступность наших портов извне (по обратной пробе bootstrap-узла).
         use void_discovery::bootstrap::Reachability;
         self.profile.port_reachable = match *self.backend.reachability.lock().unwrap() {
@@ -819,9 +848,27 @@ impl VoidApp {
         } else {
             "\u{F0BC4}  Установить пароль"
         };
-        if ui.button(btn_label).clicked() {
-            self.apply_password_change(&data_dir, has_pw);
+        if let Some(res) = self.pw_job.poll() {
+            self.pw_msg = Some(match res {
+                Ok(what) => {
+                    self.pw_current.clear();
+                    self.pw_new.clear();
+                    self.pw_confirm.clear();
+                    (false, what.into())
+                }
+                Err(e) => (true, e),
+            });
         }
+        let busy = self.pw_job.running();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!busy, egui::Button::new(btn_label)).clicked() {
+                self.apply_password_change(ui.ctx(), &data_dir, has_pw);
+            }
+            if busy {
+                ui.spinner();
+                ui.label(egui::RichText::new("Шифрую ключи…").color(theme::TEXT_DIM));
+            }
+        });
 
         if let Some((is_err, msg)) = &self.pw_msg {
             ui.add_space(6.0);
@@ -834,38 +881,31 @@ impl VoidApp {
         }
     }
 
-    /// Валидирует поля и применяет смену пароля (блокирующий вызов: PBKDF2).
-    fn apply_password_change(&mut self, data_dir: &std::path::Path, has_pw: bool) {
+    /// Валидирует поля и запускает смену пароля в фоне (PBKDF2 — см. `pw_job`).
+    fn apply_password_change(&mut self, ctx: &egui::Context, data_dir: &std::path::Path, has_pw: bool) {
         if self.pw_new != self.pw_confirm {
             self.pw_msg = Some((true, "Пароли не совпадают".into()));
             return;
         }
-        let new = if self.pw_new.is_empty() { None } else { Some(self.pw_new.as_str()) };
+        let new = if self.pw_new.is_empty() { None } else { Some(self.pw_new.clone()) };
         if !has_pw && new.is_none() {
             self.pw_msg = Some((true, "Введите новый пароль".into()));
             return;
         }
-        let current = if has_pw { Some(self.pw_current.as_str()) } else { None };
-
-        match void_crypto::Identity::set_password(data_dir, current, new) {
-            Ok(()) => {
-                let what = match (has_pw, new.is_some()) {
-                    (false, _)      => "Пароль установлен",
-                    (true, true)    => "Пароль изменён",
-                    (true, false)   => "Пароль снят",
-                };
-                self.pw_current.clear();
-                self.pw_new.clear();
-                self.pw_confirm.clear();
-                self.pw_msg = Some((false, what.into()));
+        let current = if has_pw { Some(self.pw_current.clone()) } else { None };
+        let data_dir = data_dir.to_path_buf();
+        self.pw_msg = None;
+        self.pw_job.start(ctx, move || {
+            match void_crypto::Identity::set_password(&data_dir, current.as_deref(), new.as_deref()) {
+                Ok(()) => Ok(match (has_pw, new.is_some()) {
+                    (false, _)    => "Пароль установлен",
+                    (true, true)  => "Пароль изменён",
+                    (true, false) => "Пароль снят",
+                }),
+                Err(void_crypto::CryptoError::WrongPassword) => Err("Неверный текущий пароль".into()),
+                Err(e) => Err(format!("Ошибка: {e}")),
             }
-            Err(void_crypto::CryptoError::WrongPassword) => {
-                self.pw_msg = Some((true, "Неверный текущий пароль".into()));
-            }
-            Err(e) => {
-                self.pw_msg = Some((true, format!("Ошибка: {e}")));
-            }
-        }
+        });
     }
 
     fn show_about_window(&mut self, ctx: &egui::Context) {

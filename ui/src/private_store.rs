@@ -49,7 +49,7 @@ fn conv_path(peer_id: &str) -> Option<std::path::PathBuf> {
 
 // ── Загрузка / сохранение ─────────────────────────────────────────────────────
 
-pub fn load_conv(peer_id: &str) -> StoredConv {
+fn load_conv(peer_id: &str) -> StoredConv {
     conv_path(peer_id)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -60,24 +60,73 @@ pub fn load_conv(peer_id: &str) -> StoredConv {
         })
 }
 
-pub fn save_conv(conv: &StoredConv) {
+/// Записывает беседу атомарно: во временный файл, затем rename — обрыв
+/// посреди записи не оставит полупустой JSON вместо всей переписки.
+fn save_conv(conv: &StoredConv) {
     let Some(path) = conv_path(&conv.peer_id) else { return };
-    if let Ok(json) = serde_json::to_string_pretty(conv) {
-        let _ = std::fs::write(path, json);
+    let Ok(json) = serde_json::to_vec(conv) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
-/// Добавляет одно сообщение к сохранённой беседе (инкрементально).
+/// Добавляет одно сообщение к сохранённой беседе.
+///
+/// Запись идёт в отдельном потоке: раньше каждое сообщение в UI-потоке
+/// перечитывало и переписывало весь файл переписки, и на длинной беседе это
+/// заметно подтормаживало окно. Поток держит беседы в памяти и пишет на диск
+/// только новое состояние.
 pub fn append_msg(peer_id: &str, peer_name: &str, msg: StoredMsg) {
-    let mut conv = load_conv(peer_id);
+    let _ = writer().send((peer_id.to_string(), peer_name.to_string(), msg));
+}
+
+type WriteOp = (String, String, StoredMsg);
+
+fn writer() -> &'static std::sync::mpsc::Sender<WriteOp> {
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<WriteOp>> = std::sync::OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WriteOp>();
+        std::thread::Builder::new()
+            .name("dm-store".into())
+            .spawn(move || {
+                let mut cache: std::collections::HashMap<String, StoredConv> = Default::default();
+                while let Ok(op) = rx.recv() {
+                    // Пачка подряд пришедших сообщений — одна запись на беседу.
+                    let mut dirty = std::collections::HashSet::new();
+                    dirty.extend(apply_append(&mut cache, op));
+                    while let Ok(op) = rx.try_recv() {
+                        dirty.extend(apply_append(&mut cache, op));
+                    }
+                    for id in dirty {
+                        if let Some(conv) = cache.get(&id) {
+                            save_conv(conv);
+                        }
+                    }
+                }
+            })
+            .expect("поток записи личных сообщений");
+        tx
+    })
+}
+
+/// Применяет добавление к кэшу беседы. Возвращает ID беседы, если её надо
+/// записать на диск (сообщение новое).
+fn apply_append(
+    cache: &mut std::collections::HashMap<String, StoredConv>,
+    (peer_id, peer_name, msg): WriteOp,
+) -> Option<String> {
+    conv_path(&peer_id)?;
+    let conv = cache.entry(peer_id.clone()).or_insert_with(|| load_conv(&peer_id));
     if !peer_name.is_empty() {
-        conv.peer_name = peer_name.to_string();
+        conv.peer_name = peer_name;
     }
     // Дедупликация по message_id
-    if !conv.messages.iter().any(|m| m.message_id == msg.message_id) {
-        conv.messages.push(msg);
-        save_conv(&conv);
+    if conv.messages.iter().any(|m| m.message_id == msg.message_id) {
+        return None;
     }
+    conv.messages.push(msg);
+    Some(peer_id)
 }
 
 /// Возвращает список всех сохранённых бесед (отсортированных по последнему сообщению).

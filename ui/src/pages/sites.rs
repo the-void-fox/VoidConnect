@@ -30,6 +30,8 @@ pub struct SitesPage {
     confirm_delete: Option<String>,
     /// Сколько узлов поручились за нас (0 — подсказка про лимит публикаций).
     pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Открытый системный диалог выбора каталога (в фоновом потоке).
+    pick_job: crate::bg::Job<Option<PathBuf>>,
 }
 
 /// Новичку другие узлы принимают не больше 10 публикаций в час (лимит по
@@ -120,14 +122,15 @@ impl SitesPage {
                         .hint_text("󰉓  Каталог сайта…")
                         .desired_width(path_w - 4.0),
                 );
-                // Нативный выбор каталога
-                if ui.add_sized([browse_w, 26.0], Button::new("󰉕  Обзор")).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title("Каталог сайта")
-                        .pick_folder()
-                    {
-                        self.publish_path = dir.display().to_string();
-                    }
+                // Нативный выбор каталога — в фоне (см. crate::bg).
+                if let Some(Some(dir)) = self.pick_job.poll() {
+                    self.publish_path = dir.display().to_string();
+                }
+                let picking = self.pick_job.running();
+                if ui.add_enabled(!picking, Button::new("󰉕  Обзор").min_size(egui::vec2(browse_w, 26.0))).clicked() {
+                    crate::bg::pick_in_background(&mut self.pick_job, ui.ctx(), || {
+                        rfd::FileDialog::new().set_title("Каталог сайта").pick_folder()
+                    });
                 }
                 let enabled = self.publish_tx.is_some()
                     && !self.publish_path.trim().is_empty()

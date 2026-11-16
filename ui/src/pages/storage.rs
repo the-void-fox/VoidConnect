@@ -96,6 +96,8 @@ pub struct StoragePage {
     pub pending_report: Option<(NodeId, ReportReason)>,
     /// Сколько узлов поручились за нас (0 — подсказка про лимит публикаций).
     pub my_vouchers: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Открытый системный диалог выбора файла (в фоновом потоке).
+    pick_job: crate::bg::Job<Option<PathBuf>>,
 }
 
 
@@ -354,14 +356,16 @@ impl StoragePage {
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 do_publish = true;
             }
-            // Нативный выбор файла
-            if ui.add_sized([browse_w, 28.0], Button::new("󰉕  Обзор")).clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Файл для публикации")
-                    .pick_file()
-                {
-                    self.publish_path = path.display().to_string();
-                }
+            // Нативный выбор файла — в фоне, иначе окно «не отвечает», пока
+            // открыт диалог.
+            if let Some(Some(path)) = self.pick_job.poll() {
+                self.publish_path = path.display().to_string();
+            }
+            let picking = self.pick_job.running();
+            if ui.add_enabled(!picking, Button::new("󰉕  Обзор").min_size(egui::vec2(browse_w, 28.0))).clicked() {
+                crate::bg::pick_in_background(&mut self.pick_job, ui.ctx(), || {
+                    rfd::FileDialog::new().set_title("Файл для публикации").pick_file()
+                });
             }
             let enabled = self.publish_tx.is_some() && !self.publish_path.trim().is_empty();
             if ui.add_enabled(enabled, crate::theme::primary_button("󰐕  Опубликовать").min_size(egui::vec2(pub_w, 28.0))).clicked() {

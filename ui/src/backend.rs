@@ -698,6 +698,9 @@ pub struct BackendHandle {
     pub chat_links: Arc<AtomicUsize>,
     /// Карта соединений сети: узел → его соседи (из рассылки списков соседей).
     pub topology: Arc<Mutex<TopologyMap>>,
+    /// Номер снимка пиров/профилей: растёт, когда бэкенд обновил `peers` и
+    /// `peer_profiles`. UI копирует их только при смене номера, а не каждый кадр.
+    pub snapshot_gen: Arc<AtomicU64>,
     /// Доступ к личке: разрешённые, заблокированные мной, запросы (меняется
     /// командами `TrustCmd::{Allow, Block, Unblock}`).
     pub dm_access: Arc<Mutex<crate::dm_access::DmAccess>>,
@@ -817,6 +820,8 @@ pub fn start_backend(
     let chat_links_bg = Arc::clone(&chat_links);
     let topology: Arc<Mutex<TopologyMap>> = Arc::new(Mutex::new(HashMap::new()));
     let topology_bg = Arc::clone(&topology);
+    let snapshot_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let snapshot_gen_bg = Arc::clone(&snapshot_gen);
 
     let downloads_dir = data_dir.join("downloads");
 
@@ -841,7 +846,7 @@ pub fn start_backend(
                 blocklist_bg, voted_channels_bg,
                 bytes_uploaded_bg, bytes_downloaded_bg,
                 trust_bg, private_bg, trust_rx, my_vouchers_bg, dm_access_bg, trust_details_bg,
-                chat_links_bg, topology_bg,
+                chat_links_bg, topology_bg, snapshot_gen_bg,
             ).await;
         });
     });
@@ -896,6 +901,7 @@ pub fn start_backend(
         trust_details,
         chat_links,
         topology,
+        snapshot_gen,
     }
 }
 
@@ -949,6 +955,7 @@ async fn backend_main(
     trust_details: Arc<Mutex<TrustDetails>>,
     chat_links: Arc<AtomicUsize>,
     topology_out: Arc<Mutex<TopologyMap>>,
+    snapshot_gen: Arc<AtomicU64>,
 ) {
     // Открываем БД для персистентности истории общего чата.
     // При ошибке работаем без персистентности — это не критично для чата.
@@ -1474,6 +1481,7 @@ async fn backend_main(
                     map.insert(p.node_id.clone(), p);
                 }
             }
+            snapshot_gen.fetch_add(1, Ordering::Release);
 
             // Динамическая регистрация на relay узлов, объявивших себя
             // bootstrap'ами (узнаны по gossip профилей). Без этого fallback-DM

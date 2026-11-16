@@ -169,8 +169,12 @@ impl Graph {
     }
 
     pub fn update_me(&mut self, name: &str, avatar: Option<&str>) {
-        self.my_name = name.to_string();
-        self.my_avatar = avatar.map(str::to_owned);
+        if self.my_name != name {
+            self.my_name = name.to_string();
+        }
+        if self.my_avatar.as_deref() != avatar {
+            self.my_avatar = avatar.map(str::to_owned);
+        }
     }
 
     /// Обновляет кэш текстур аватаров для узлов на графе: декодирует новые и
@@ -668,7 +672,9 @@ impl Graph {
         }
 
         if self.layout.is_moving() || self.drag.is_some() {
-            ui.ctx().request_repaint();
+            // Без vsync голый request_repaint() крутил бы кадры без паузы —
+            // ~60 кадров/с для анимации раскладки достаточно.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 

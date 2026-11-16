@@ -64,14 +64,6 @@ fn checked_avatar_bytes(b64: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Строит egui-картинку из base64-PNG. URI содержит хэш содержимого, поэтому
-/// смена аватара инвалидирует кэш текстур egui.
-pub fn image_from_b64(b64: &str) -> Option<egui::Image<'static>> {
-    let bytes = checked_avatar_bytes(b64)?;
-    let uri = format!("bytes://avatar/{:016x}.png", avatar_hash(b64));
-    Some(egui::Image::from_bytes(uri, bytes))
-}
-
 /// Декодирует base64-PNG в [`egui::ColorImage`] (RGBA). Нужен для отрисовки
 /// аватара в произвольном `Painter` (например, узлы графа), где виджет
 /// [`egui::Image`] неприменим. `None` — битые данные.
@@ -118,6 +110,61 @@ pub fn paint_circle_avatar(
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// Сколько разных аватаров держим декодированными; больше — кэш сбрасывается
+/// целиком (так проще, а пересчитать десяток видимых аватаров дёшево).
+const CACHE_CAP: usize = 512;
+
+/// Проверенный и декодированный из base64 аватар: URI для egui + байты PNG.
+type Decoded = Option<(String, std::sync::Arc<[u8]>)>;
+
+/// Корзины кэша: отпечаток → (исходная строка, результат).
+type Buckets = std::collections::HashMap<u64, Vec<(Box<str>, Decoded)>>;
+
+thread_local! {
+    /// Кэш аватаров UI-потока. Ключ — дешёвый отпечаток (длина + края строки),
+    /// внутри корзины строка сравнивается целиком (memcmp), так что совпадение
+    /// отпечатков не подменит чужой аватар.
+    static CACHE: std::cell::RefCell<Buckets> = Default::default();
+}
+
+/// Отпечаток для корзины кэша: длина + первые и последние 64 байта.
+fn quick_key(b64: &str) -> u64 {
+    let b = b64.as_bytes();
+    let mut h: u64 = 0xcbf29ce484222325 ^ b.len() as u64;
+    let head = &b[..b.len().min(64)];
+    let tail = &b[b.len().saturating_sub(64)..];
+    for &x in head.iter().chain(tail) {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Строит egui-картинку из base64-PNG. URI содержит хэш содержимого, поэтому
+/// смена аватара инвалидирует кэш текстур egui.
+///
+/// Результат кэшируется: без кэша каждая строка чата каждый кадр
+/// заново декодировала base64 и разбирала заголовок PNG (в debug-сборке — до
+/// миллисекунды на аватар, что на длинной переписке тормозило весь интерфейс).
+pub fn cached_image(b64: &str) -> Option<egui::Image<'static>> {
+    let key = quick_key(b64);
+    let decoded = CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(hit) = cache.get(&key).and_then(|bucket| bucket.iter().find(|(src, _)| &**src == b64)) {
+            return hit.1.clone();
+        }
+        if cache.values().map(Vec::len).sum::<usize>() >= CACHE_CAP {
+            cache.clear();
+        }
+        let decoded: Decoded = checked_avatar_bytes(b64).map(|bytes| {
+            (format!("bytes://avatar/{:016x}.png", avatar_hash(b64)), bytes.into())
+        });
+        cache.entry(key).or_default().push((b64.into(), decoded.clone()));
+        decoded
+    });
+    decoded.map(|(uri, bytes)| egui::Image::from_bytes(uri, bytes))
+}
+
 /// Рисует круглый аватар размера `size`. Если PNG нет или он битый — рисует
 /// цветной кружок с первой буквой имени (как было до аватарок).
 pub fn show_avatar(
@@ -127,7 +174,7 @@ pub fn show_avatar(
     fill: egui::Color32,
     size: f32,
 ) {
-    if let Some(img) = b64.and_then(image_from_b64) {
+    if let Some(img) = b64.and_then(cached_image) {
         ui.add(img.fit_to_exact_size(egui::vec2(size, size)).rounding(size / 2.0));
         return;
     }
@@ -176,7 +223,37 @@ mod tests {
         let bomb = png_b64(1024, 1024);
         assert!(bomb.len() <= MAX_AVATAR_B64, "бомба должна пролезать в лимит по байтам");
         assert!(color_image_from_b64(&bomb).is_none());
-        assert!(image_from_b64(&bomb).is_none());
+        assert!(cached_image(&bomb).is_none());
+    }
+
+    #[test]
+    fn cache_distinguishes_same_fingerprint() {
+        // Одинаковые длина и края, разная середина — отпечаток совпадает,
+        // но кэш обязан различить строки.
+        use image::ImageEncoder;
+        // Шумная картинка: base64 длиннее 128 символов, середина вне краёв.
+        let raw: Vec<u8> = (0..64u32 * 64 * 4).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&raw, 64, 64, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let a = base64::engine::general_purpose::STANDARD.encode(&png);
+        assert!(a.len() > 1000);
+        let mut b = a.clone().into_bytes();
+        let mid = b.len() / 2;
+        b[mid] = if b[mid] == b'A' { b'B' } else { b'A' };
+        let b = String::from_utf8(b).unwrap();
+        assert_eq!(quick_key(&a), quick_key(&b));
+        let ia = cached_image(&a);
+        let ib = cached_image(&b);
+        assert!(ia.is_some());
+        // Испорченная середина либо не декодируется, либо даёт другой URI.
+        if let (Some(ia), Some(ib)) = (ia, ib) {
+            assert_ne!(ia.source().uri(), ib.source().uri());
+        }
+        // Повторный запрос берётся из кэша и указывает на тот же PNG.
+        let uri = format!("bytes://avatar/{:016x}.png", avatar_hash(&a));
+        assert_eq!(cached_image(&a).unwrap().source().uri(), Some(uri.as_str()));
     }
 
     #[test]
